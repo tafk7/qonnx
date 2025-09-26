@@ -86,7 +86,6 @@ def getCustomOp(node, onnx_opset_version=get_preferred_onnx_opset()):
     Lookup order:
     1. Direct attribute lookup in module namespace
     2. Legacy custom_op dictionary (backward compatibility)
-    3. Search all CustomOp subclasses (fallback)
     """
     op_type = node.op_type
     domain = node.domain
@@ -110,48 +109,25 @@ def getCustomOp(node, onnx_opset_version=get_preferred_onnx_opset()):
                 cls = module.custom_op[op_type]
                 return cls(node, onnx_opset_version=onnx_opset_version)
         
-        # Strategy 3: Search module for CustomOp subclasses (fallback)
-        # Useful for debugging and error messages
-        custom_ops = {}
-        for name, obj in inspect.getmembers(module):
-            if (inspect.isclass(obj) and 
-                issubclass(obj, CustomOp) and 
-                obj is not CustomOp and
-                not name.startswith('_')):  # Skip private classes
-                custom_ops[name] = obj
-        
-        # Try case-insensitive match as last resort
-        for name, cls in custom_ops.items():
-            if name.lower() == op_type.lower():
-                return cls(node, onnx_opset_version=onnx_opset_version)
-        
-        # Not found - provide helpful error
-        available = list(custom_ops.keys())
+        # Not found - provide clear error
         raise KeyError(
             f"Op '{op_type}' not found in domain '{domain}' (module: {module_path}). "
-            f"Available ops: {available}"
+            f"Register it using add_op_to_domain() or ensure it's exported in the module."
         )
         
-    except ModuleNotFoundError:
-        raise Exception(
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
             f"Could not load module '{module_path}' for domain '{domain}'. "
             f"Ensure the module is installed and on your PYTHONPATH."
-        )
+        ) from e
 
 
 # Legacy functions for backward compatibility
 def hasCustomOp(domain, op_type):
     """Check if a custom op exists in the domain's module namespace."""
+    module_path = DOMAIN_MODULES.get(domain, domain)
+    
     try:
-        # Create a dummy node to test
-        class DummyNode:
-            pass
-        node = DummyNode()
-        node.op_type = op_type
-        node.domain = domain
-        
-        # Try to get the op class
-        module_path = DOMAIN_MODULES.get(domain, domain)
         module = importlib.import_module(module_path)
         
         # Check namespace first
@@ -165,16 +141,16 @@ def hasCustomOp(domain, op_type):
             return op_type in module.custom_op
             
         return False
-    except:
+    except ModuleNotFoundError:
         return False
 
 
 def get_ops_in_domain(domain):
     """Get all ops in a domain by inspecting the module namespace."""
     ops = []
+    module_path = DOMAIN_MODULES.get(domain, domain)
     
     try:
-        module_path = DOMAIN_MODULES.get(domain, domain)
         module = importlib.import_module(module_path)
         
         # Check module namespace
@@ -192,7 +168,12 @@ def get_ops_in_domain(domain):
                     ops.append((name, cls))
         
         return ops
-    except:
+    except ModuleNotFoundError:
+        return []
+    except Exception as e:
+        # Log the error but return empty list for backward compatibility
+        import warnings
+        warnings.warn(f"Error inspecting domain '{domain}': {e}")
         return []
 
 
