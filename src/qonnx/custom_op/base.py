@@ -67,6 +67,13 @@ class CustomOp(ABC):
                 pass  # Version 4, covers opset v4+
     """
 
+    # Class-level opt-in for graph context. Default False => this op answers all
+    # queries from its own node attributes and needs no ModelWrapper. An op that
+    # derives shapes/datatypes/widths from graph context (tensor shapes, datatypes,
+    # or initializer VALUES) sets this True and overrides attach_model. The default
+    # keeps every existing op byte-for-byte unchanged.
+    wants_model: bool = False
+
     def __init__(
         self,
         onnx_node: NodeProto,
@@ -75,6 +82,19 @@ class CustomOp(ABC):
         super().__init__()
         self.onnx_node: NodeProto = onnx_node
         self.onnx_opset_version: int = onnx_opset_version
+
+    def attach_model(self, model: "ModelWrapper") -> "CustomOp":
+        """Give this op the ModelWrapper it belongs to, so context-dependent queries
+        can be answered from live graph facts rather than baked node attributes. The
+        default stores the reference and returns self; context-dependent ops override
+        to (re)build and cache derived state.
+
+        Contract: attach_model and every query getter MUST NOT mutate the graph --
+        attach BORROWS a read reference. Idempotent; a later attach with a different
+        model must invalidate any cached derived state. A no-op trigger for ops with
+        wants_model=False (they never call it)."""
+        self._model = model
+        return self
 
     def get_nodeattr_def(
         self, name: str

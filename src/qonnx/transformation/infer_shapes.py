@@ -28,7 +28,6 @@
 
 import onnx.shape_inference as si
 
-import qonnx.custom_op.registry as registry
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
@@ -40,8 +39,10 @@ def _make_shape_compatible_op(node, model):
     assert is_custom_op(node.domain), "Node domain is not a registered custom op domain"
     op_type = node.op_type
     try:
-        # lookup op_type in registry of CustomOps
-        inst = registry.getCustomOp(node)
+        # model-aware instantiation: ops that declare wants_model=True (e.g. kernel
+        # ops that derive their shape from live graph context) receive the model;
+        # classic ops are unaffected (safe superset of getCustomOp).
+        inst = model.get_customop_wrapper(node)
         return inst.make_shape_compatible_op(model)
     except KeyError:
         # exception if op_type is not supported

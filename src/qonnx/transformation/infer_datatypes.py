@@ -26,7 +26,6 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import qonnx.custom_op.registry as registry
 from qonnx.core.datatype import DataType, ScaledIntType
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
@@ -90,8 +89,10 @@ def _infer_node_datatype(model, node, allow_scaledint_dtypes):
     if is_custom_op(node.domain):
         # handle DataType inference for CustomOp
         try:
-            # lookup op_type in registry of CustomOps
-            inst = registry.getCustomOp(node)
+            # model-aware instantiation: ops declaring wants_model=True receive the
+            # model (kernel ops derive dtypes from live graph context); classic ops
+            # are unaffected (safe superset of getCustomOp).
+            inst = model.get_customop_wrapper(node)
             inst.infer_node_datatype(model)
         except KeyError:
             # exception if op_type is not supported
