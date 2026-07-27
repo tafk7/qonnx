@@ -885,18 +885,26 @@ class ModelWrapper:
         """Return CustomOp instance for given node, respecting the
         imported opset version in the model protobuf. If the node's domain
         is not found in the model's opset imports, fallback_customop_version
-        will be used."""
+        will be used.
+
+        For ops that declare wants_model=True, this model is attached to the
+        instance (via attach_model) so they can answer graph-derived queries;
+        ops with wants_model=False are returned exactly as getCustomOp built
+        them."""
         opset_imports = self.get_opset_imports()
         try:
             opset_import = opset_imports[node.domain]
-            return getCustomOp(node, onnx_opset_version=opset_import)
+            inst = getCustomOp(node, onnx_opset_version=opset_import)
         except KeyError:
             # domain not found in imports, use fallback version
             warnings.warn(
                 f"Domain {node.domain} not found in model opset imports, "
                 f"using fallback_customop_version={fallback_customop_version}"
             )
-            return getCustomOp(node, onnx_opset_version=fallback_customop_version)
+            inst = getCustomOp(node, onnx_opset_version=fallback_customop_version)
+        if inst.wants_model:
+            inst.attach_model(self)
+        return inst
 
     def set_opset_import(self, domain, version):
         """Sets the opset version for a given domain in the model's opset imports.
