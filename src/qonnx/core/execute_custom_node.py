@@ -29,13 +29,19 @@
 import qonnx.custom_op.registry as registry
 
 
-def execute_custom_node(node, context, graph, onnx_opset_version):
+def execute_custom_node(node, context, graph, onnx_opset_version, model=None):
     """Call custom implementation to execute a single custom node.
-    Input/output provided via context."""
+    Input/output provided via context. Model-aware custom ops receive their
+    owning ModelWrapper when one is supplied by the caller."""
     op_type = node.op_type
     try:
         # lookup op_type in registry of CustomOps
-        inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
+        if model is None:
+            inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
+        else:
+            inst = model.get_customop_wrapper(
+                node, fallback_customop_version=onnx_opset_version
+            )
         inst.execute_node(context, graph)
     except KeyError:
         # exception if op_type is not supported
