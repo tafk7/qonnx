@@ -59,7 +59,13 @@ class FoldConstantsFiltered(Transformation):
             if (is_all_constant_inputs or is_const_shape) and eligible:
                 # this node has no dynamic inputs, only constant ones -- so we can
                 # do constant folding.
-                oxe.execute_node(n, execution_context, graph, opset_version=opset_version)
+                oxe.execute_node(
+                    n,
+                    execution_context,
+                    graph,
+                    opset_version=opset_version,
+                    model=model,
+                )
                 # use the execution result as an initializer
                 model.set_initializer(node_out, execution_context[node_out])
                 # remove old node
@@ -105,7 +111,13 @@ class FoldConstants(Transformation):
                 # are populated, we 'touch' the shape of all inputs first below.
                 for inp in n.input:
                     model.get_tensor_shape(inp, fix_missing_init_shape=True)
-                oxe.execute_node(n, execution_context, model.graph, opset_version=opset_version)
+                oxe.execute_node(
+                    n,
+                    execution_context,
+                    model.graph,
+                    opset_version=opset_version,
+                    model=model,
+                )
                 # use the execution result as an initializer
                 model.set_initializer(node_out, execution_context[node_out])
                 # remove old node

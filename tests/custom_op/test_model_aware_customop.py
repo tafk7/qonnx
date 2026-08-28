@@ -34,9 +34,11 @@ be indistinguishable from what getCustomOp returned before this contract existed
 context-dependent op that opts in receives the ModelWrapper only through the
 model-aware entry point (get_customop_wrapper), never through bare getCustomOp."""
 
+import numpy as np
 import onnx.parser as oprs
 
 from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.core.onnx_exec import execute_onnx
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import add_op_to_domain, getCustomOp
 
@@ -71,6 +73,10 @@ class ModelAwareTestOp(ClassicTestOp):
     def attach_model(self, model):
         self.attach_calls = getattr(self, "attach_calls", 0) + 1
         return super().attach_model(model)
+
+    def execute_node(self, context, graph):
+        assert self._model.graph is graph
+        super().execute_node(context, graph)
 
 
 def _make_model(op_type, with_domain_import=True):
@@ -144,3 +150,13 @@ def test_opset_version_selection_unchanged():
     node_no_import = model_no_import.graph.node[0]
     inst_fb = model_no_import.get_customop_wrapper(node_no_import, fallback_customop_version=1)
     assert inst_fb.onnx_opset_version == 1
+
+
+def test_onnx_execution_attaches_model_to_model_aware_custom_op():
+    add_op_to_domain("qonnx.custom_op.general", ModelAwareTestOp)
+    model = _make_model("ModelAwareTestOp")
+    input_value = np.arange(10, dtype=np.float32).reshape(1, 10)
+
+    output = execute_onnx(model, {"in0": input_value})
+
+    np.testing.assert_array_equal(output["out0"], input_value)

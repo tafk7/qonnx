@@ -39,13 +39,26 @@ from qonnx.custom_op.registry import is_custom_op
 from qonnx.util.basic import get_preferred_qonnx_opset, get_sanitize_quant_tensors, qonnx_make_model, sanitize_quant_values
 
 
-def execute_node(node, context, graph, opset_version, return_full_exec_context=False):
+def execute_node(
+    node,
+    context,
+    graph,
+    opset_version,
+    return_full_exec_context=False,
+    model=None,
+):
     """Executes a single node by using onnxruntime or with a custom function.
 
     Input/output provided via context."""
 
     if is_custom_op(node.domain, node.op_type):
-        ex_cu_node.execute_custom_node(node, context, graph, onnx_opset_version=opset_version)
+        ex_cu_node.execute_custom_node(
+            node,
+            context,
+            graph,
+            onnx_opset_version=opset_version,
+            model=model,
+        )
     else:
         # onnxruntime unfortunately does not implement run_node as defined by ONNX,
         # it can only execute entire models -- so we create a model which solely
@@ -178,7 +191,14 @@ def execute_onnx(model, input_dict, return_full_exec_context=False, start_node=N
                 opset_version = opset_imports[node.domain]
             else:
                 opset_version = get_preferred_qonnx_opset()
-            execute_node(node, execution_context, graph, opset_version, return_full_exec_context)
+            execute_node(
+                node,
+                execution_context,
+                graph,
+                opset_version,
+                return_full_exec_context,
+                model=model,
+            )
             if get_sanitize_quant_tensors() != 0:
                 # round output values to quantization annotation
                 execution_context = sanitize_quant_values(model, node.output, execution_context)

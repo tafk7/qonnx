@@ -257,7 +257,7 @@ def calc_monotonic_range(node, model, range_dict, i_channel_axis=1):
     for inps in itertools.product(*proto_vectors):
         for i in range(n_dyn_inp):
             ctx[dyn_inps[i]] = inps[i]
-        execute_node(node, ctx, model.graph, opset_version=opset_version)
+        execute_node(node, ctx, model.graph, opset_version=opset_version, model=model)
         for oind, oname in enumerate(node.output):
             # grab new output and update running min/max
             out = ctx[oname]
