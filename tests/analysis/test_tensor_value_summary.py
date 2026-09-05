@@ -35,14 +35,15 @@ from onnx import TensorProto
 from qonnx.analysis.tensor_value_summary import (
     TensorValueSummary,
     UnsupportedTensorValueError,
+    initializer_value_summaries,
+    initializer_value_summary,
     is_summarizable_dtype,
     smallest_lossless_datatype,
     summarize_tensor_values,
-    tensor_value_summaries,
-    tensor_value_summary,
 )
 from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.transformation.fold_constants import FoldConstants
 from qonnx.util.basic import qonnx_make_model
 
 
@@ -224,9 +225,35 @@ def test_supported_dtype_predicate():
 
 def test_absent_initializer_is_absent_not_zero():
     model = make_model_with_initializers({"p0": np.array([1.0, 2.0], dtype=np.float32)})
-    assert tensor_value_summary(model, "top_in") is None
-    assert tensor_value_summary(model, "no_such_tensor") is None
-    assert tensor_value_summary(model, "p0") is not None
+    assert initializer_value_summary(model, "top_in") is None
+    assert initializer_value_summary(model, "no_such_tensor") is None
+    assert initializer_value_summary(model, "p0") is not None
+
+
+def test_constant_node_value_needs_folding_first():
+    # a Constant node's output has a static value but no initializer, so only
+    # initializers are summarized until the value has been folded into one
+    top_in = oh.make_tensor_value_info("top_in", TensorProto.FLOAT, [2])
+    top_out = oh.make_tensor_value_info("top_out", TensorProto.FLOAT, [2])
+    const_value = oh.make_tensor("value", TensorProto.FLOAT, [2], [1.0, 2.0])
+    modelproto = qonnx_make_model(
+        oh.make_graph(
+            name="test",
+            inputs=[top_in],
+            outputs=[top_out],
+            value_info=[oh.make_tensor_value_info("c0", TensorProto.FLOAT, [2])],
+            nodes=[
+                oh.make_node("Constant", [], ["c0"], value=const_value),
+                oh.make_node("Add", ["top_in", "c0"], ["top_out"]),
+            ],
+        )
+    )
+    model = ModelWrapper(modelproto)
+    assert initializer_value_summary(model, "c0") is None
+    assert initializer_value_summaries(model) == {}
+    model = model.transform(FoldConstants())
+    folded = initializer_value_summary(model, "c0")
+    assert folded == summarize_tensor_values(np.array([1.0, 2.0], dtype=np.float32))
 
 
 def test_unsupported_initializer_is_reported_not_summarized():
@@ -234,36 +261,36 @@ def test_unsupported_initializer_is_reported_not_summarized():
     model = make_model_with_initializers({"p0": np.array([1.0, 2.0], dtype=np.float32)})
     model.graph.initializer[0].CopyFrom(oh.make_tensor("p0", TensorProto.BFLOAT16, [2], [1.0, 2.0]))
     with pytest.raises(UnsupportedTensorValueError):
-        tensor_value_summary(model, "p0")
+        initializer_value_summary(model, "p0")
     with pytest.raises(UnsupportedTensorValueError):
-        model.analysis(tensor_value_summaries)
+        model.analysis(initializer_value_summaries)
 
 
 def test_equal_content_under_two_names_is_one_fact():
     values = np.array([1.0, -2.0], dtype=np.float32)
     model = make_model_with_initializers({"p0": values, "p1": values.copy()})
-    assert tensor_value_summary(model, "p0") == tensor_value_summary(model, "p1")
+    assert initializer_value_summary(model, "p0") == initializer_value_summary(model, "p1")
 
 
 def test_renamed_tensor_keeps_its_summary():
     values = np.array([1.0, -2.0], dtype=np.float32)
-    before = tensor_value_summary(make_model_with_initializers({"p0": values}), "p0")
-    after = tensor_value_summary(make_model_with_initializers({"weights": values}), "weights")
+    before = initializer_value_summary(make_model_with_initializers({"p0": values}), "p0")
+    after = initializer_value_summary(make_model_with_initializers({"weights": values}), "weights")
     assert before == after
 
 
 def test_changed_content_changes_the_summary():
     model = make_model_with_initializers({"p0": np.array([1.0, 2.0], dtype=np.float32)})
-    before = tensor_value_summary(model, "p0")
+    before = initializer_value_summary(model, "p0")
     model.set_initializer("p0", np.array([1.0, 3.0], dtype=np.float32))
-    after = tensor_value_summary(model, "p0")
+    after = initializer_value_summary(model, "p0")
     assert before != after
     assert before.content_digest != after.content_digest
 
 
 def test_repeated_reads_observe_one_equal_summary():
     model = make_model_with_initializers({"p0": np.array([1.0, 2.0], dtype=np.float32)})
-    observations = [tensor_value_summary(model, "p0") for _ in range(3)]
+    observations = [initializer_value_summary(model, "p0") for _ in range(3)]
     assert observations[0] == observations[1] == observations[2]
 
 
@@ -274,9 +301,9 @@ def test_analysis_pass_summarizes_every_initializer():
             "p1": np.array([-1.0, 0.0], dtype=np.float32),
         }
     )
-    summaries = model.analysis(tensor_value_summaries)
+    summaries = model.analysis(initializer_value_summaries)
     assert set(summaries.keys()) == {"p0", "p1"}
-    assert summaries["p0"] == tensor_value_summary(model, "p0")
+    assert summaries["p0"] == initializer_value_summary(model, "p0")
     assert all(isinstance(s, TensorValueSummary) for s in summaries.values())
 
 

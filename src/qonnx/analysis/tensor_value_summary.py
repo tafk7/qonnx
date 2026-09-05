@@ -37,6 +37,11 @@ The public value is :class:`TensorValueSummary`: small, immutable, hashable
 and deterministic. Two tensors with identical dtype, shape and bytes always
 produce equal summaries, whatever their names are; any change to dtype, shape
 or bytes moves the content digest.
+
+The value is named for what it describes and not for where the array came
+from, so the same summary serves an initializer, a folded constant, or any
+in-memory array. The model-level entry points are named for what they do
+consult: initializers.
 """
 
 from __future__ import annotations
@@ -161,24 +166,31 @@ def _observed_range(
     return (int(array.min()), int(array.max()), True)
 
 
-def tensor_value_summary(model: "ModelWrapper", tensor_name: str) -> TensorValueSummary | None:
+def initializer_value_summary(model: "ModelWrapper", tensor_name: str) -> TensorValueSummary | None:
     """Summarizes the initializer values of one tensor in a model.
 
-    Returns ``None`` when the tensor has no initializer; absence is reported
-    as absence, never as a fabricated zero summary. Raises
-    :class:`UnsupportedTensorValueError` when an initializer is present but
-    its values cannot be summarized soundly."""
+    Only initializers are consulted. ``None`` is returned both when the named
+    tensor has no initializer and when no such tensor exists; absence is
+    reported as absence, never as a fabricated zero summary. In particular a
+    tensor produced by a ``Constant`` node has a static value but no
+    initializer, so it reports ``None`` until the graph has been through
+    ``FoldConstants``.
+
+    Raises :class:`UnsupportedTensorValueError` when an initializer is present
+    but its values cannot be summarized soundly."""
     array = cast(Union[npt.NDArray[Any], None], model.get_initializer(tensor_name))
     if array is None:
         return None
     return summarize_tensor_values(array)
 
 
-def tensor_value_summaries(model: "ModelWrapper") -> dict[str, TensorValueSummary]:
+def initializer_value_summaries(model: "ModelWrapper") -> dict[str, TensorValueSummary]:
     """Analysis pass: summarizes every initializer in the model in one pass.
 
     Returns a dict mapping tensor name to :class:`TensorValueSummary`. Use it
-    as ``model.analysis(tensor_value_summaries)``. Unsupported initializers
+    as ``model.analysis(initializer_value_summaries)``. Tensors without an
+    initializer are simply absent from the result; run ``FoldConstants`` first
+    if ``Constant``-node values should be included. Unsupported initializers
     raise :class:`UnsupportedTensorValueError` rather than being skipped
     silently."""
     summaries: dict[str, TensorValueSummary] = {}
