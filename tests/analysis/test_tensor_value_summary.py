@@ -202,13 +202,16 @@ def test_complex_tensor_is_refused():
         summarize_tensor_values(np.array([1 + 2j], dtype=np.complex64))
 
 
-def test_custom_encoded_float_dtypes_are_refused():
-    # bfloat16 and the float8 variants arrive from onnx.numpy_helper as view
-    # dtypes over raw bit patterns; a range over those bytes is meaningless
+def test_custom_encoded_dtypes_are_refused():
+    # bfloat16, the float8 variants and the sub-byte integers arrive from
+    # onnx.numpy_helper as view dtypes over raw bit patterns; a range over
+    # those bytes is meaningless rather than merely imprecise
     bfloat16_view = np.dtype((np.uint16, [("bfloat16", "<u2")]))
     float8_view = np.dtype((np.uint8, [("e4m3fn", "u1")]))
+    int4_view = np.dtype((np.int8, [("int4", "i1")]))
     assert not is_summarizable_dtype(bfloat16_view)
     assert not is_summarizable_dtype(float8_view)
+    assert not is_summarizable_dtype(int4_view)
     with pytest.raises(UnsupportedTensorValueError):
         summarize_tensor_values(np.zeros(4, dtype=bfloat16_view))
 
@@ -256,10 +259,17 @@ def test_constant_node_value_needs_folding_first():
     assert folded == summarize_tensor_values(np.array([1.0, 2.0], dtype=np.float32))
 
 
-def test_unsupported_initializer_is_reported_not_summarized():
-    # an unsupported initializer must not be confused with an absent one
+@pytest.mark.parametrize("onnx_dtype", ["BFLOAT16", "FLOAT8E4M3FN", "FLOAT8E5M2", "INT4", "UINT4"])
+def test_unsupported_initializer_is_reported_not_summarized(onnx_dtype):
+    # an unsupported initializer must not be confused with an absent one.
+    # INT4/UINT4 are excluded even though QONNX has INT4/UINT4 datatypes: the
+    # exclusion is about the packed bytes numpy_helper hands back, not about
+    # the datatype being inexpressible.
+    tensor_proto_dtype = getattr(TensorProto, onnx_dtype, None)
+    if tensor_proto_dtype is None:
+        pytest.skip("%s not available in this onnx version" % onnx_dtype)
     model = make_model_with_initializers({"p0": np.array([1.0, 2.0], dtype=np.float32)})
-    model.graph.initializer[0].CopyFrom(oh.make_tensor("p0", TensorProto.BFLOAT16, [2], [1.0, 2.0]))
+    model.graph.initializer[0].CopyFrom(oh.make_tensor("p0", tensor_proto_dtype, [2], [1, 1]))
     with pytest.raises(UnsupportedTensorValueError):
         initializer_value_summary(model, "p0")
     with pytest.raises(UnsupportedTensorValueError):
