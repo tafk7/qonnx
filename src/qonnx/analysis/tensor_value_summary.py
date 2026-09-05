@@ -111,7 +111,13 @@ def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
     numeric type that ``onnx.numpy_helper`` returns as a *view* dtype with
     fields (bfloat16, the float8 variants, the 4-bit types). Their raw bytes
     are bit patterns rather than numbers, so a range taken over them would be
-    meaningless rather than merely imprecise."""
+    meaningless rather than merely imprecise.
+
+    ``INT4``/``UINT4`` are excluded here even though QONNX has datatypes of
+    those names: the exclusion is a property of the packed bytes numpy hands
+    back, not of the datatype being inexpressible. Decoding those encodings
+    into ordinary arrays would lift the exclusion without changing any value
+    in this module's contract."""
     resolved = np.dtype(dtype)
     if resolved.fields is not None or resolved.subdtype is not None:
         return False
