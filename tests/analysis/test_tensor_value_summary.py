@@ -28,6 +28,8 @@
 
 import pytest
 
+import dataclasses
+import inspect
 import numpy as np
 import onnx.helper as oh
 from onnx import TensorProto
@@ -370,42 +372,34 @@ def test_bipolar_and_ternary_are_told_apart_by_zero():
     assert smallest_lossless_integer_datatype(with_zero) == DataType["TERNARY"]
 
 
-def test_declared_bipolar_is_refused_for_a_tensor_containing_zero():
-    # regression: a range check alone accepts BIPOLAR here, because zero is
+def test_bipolar_is_never_returned_for_a_tensor_containing_zero():
+    # regression: a range check alone admits BIPOLAR here, because zero is
     # inside [-1, +1] while being outside BIPOLAR's domain
     summary = summarize_tensor_values(np.array([-1.0, 0.0, 1.0], dtype=np.float32))
-    assert DataType["BIPOLAR"].allowed(0.0) is False or not DataType["BIPOLAR"].allowed(0.0)
-    assert smallest_lossless_integer_datatype(summary, DataType["BIPOLAR"]) is None
+    assert not DataType["BIPOLAR"].allowed(0.0)
+    assert smallest_lossless_integer_datatype(summary) != DataType["BIPOLAR"]
 
 
-def test_declared_datatype_bounds_the_result():
+def test_helper_answers_from_observed_values_alone():
+    # the helper takes no declared datatype: a summary cannot soundly validate
+    # one, and the answer depends only on what the tensor actually holds
     summary = summarize_tensor_values(np.array([-3.0, 3.0], dtype=np.float32))
-    # narrowing below a wide declared type is the useful case
-    assert smallest_lossless_integer_datatype(summary, DataType["FLOAT32"]) == DataType["INT3"]
-    assert smallest_lossless_integer_datatype(summary, DataType["INT8"]) == DataType["INT3"]
-    # never wider than declared: an equal-or-wider candidate keeps the declared type
-    assert smallest_lossless_integer_datatype(summary, DataType["INT3"]) == DataType["INT3"]
-    # a declared type that does not admit the observed values is refused
-    assert smallest_lossless_integer_datatype(summary, DataType["UINT8"]) is None
-    assert smallest_lossless_integer_datatype(summary, DataType["INT2"]) is None
+    assert smallest_lossless_integer_datatype(summary) == DataType["INT3"]
+    assert list(inspect.signature(smallest_lossless_integer_datatype).parameters) == ["summary"]
 
 
-@pytest.mark.parametrize("declared", ["SCALEDINT<8>", "FLOAT<4,3>"])
-def test_undecidable_declared_datatypes_are_refused(declared):
-    # SCALEDINT defines no range; an arbitrary-precision float's exactness is
-    # per-mantissa. Neither can be decided from a summary, so neither is
-    # optimistically accepted.
-    summary = summarize_tensor_values(np.array([1.0, 2.0], dtype=np.float32))
-    assert smallest_lossless_integer_datatype(summary, DataType[declared]) is None
-
-
-def test_fixed_point_declared_datatype_is_decidable():
-    # a fixed-point scale factor is always <= 1/2, so every integer inside the
-    # bounds is representable and the range does decide admission
+def test_consumer_constrains_the_answer_against_its_declared_datatype():
+    # the comparison the helper used to make is ordinary consumer-side work,
+    # and it stays honest because it is made against real values
     summary = summarize_tensor_values(np.array([-3.0, 3.0], dtype=np.float32))
-    assert smallest_lossless_integer_datatype(summary, DataType["FIXED<8,4>"]) == DataType["INT3"]
-    out_of_range = summarize_tensor_values(np.array([-300.0, 300.0], dtype=np.float32))
-    assert smallest_lossless_integer_datatype(out_of_range, DataType["FIXED<8,4>"]) is None
+    narrowest = smallest_lossless_integer_datatype(summary)
+    for declared, expected_fits in [("INT8", True), ("INT3", True), ("INT2", False), ("UINT8", False)]:
+        declared_datatype = DataType[declared]
+        fits = declared_datatype.min() <= summary.minimum and summary.maximum <= declared_datatype.max()
+        assert fits is expected_fits
+        if fits:
+            # narrowing is worthwhile only when it actually saves bits
+            assert narrowest.bitwidth() <= declared_datatype.bitwidth()
 
 
 def test_out_of_range_integral_values_are_refused():
@@ -466,6 +460,23 @@ def test_a_combined_range_is_not_a_tensor_summary():
         ({"element_count": 0}, "empty tensor cannot have an observed range"),
         ({"minimum": 1.0, "contains_zero": True}, "zero lies outside"),
         ({"minimum": float("-inf"), "is_integral": True}, "non-finite range"),
+        # zero is an observed value whenever it is an extremum
+        ({"contains_zero": False}, "zero is an observed extremum"),
+        ({"minimum": -3.0, "maximum": 0.0, "contains_zero": False}, "zero is an observed extremum"),
+        # extrema are observed values, so integral values have integral extrema
+        ({"minimum": 0.5, "maximum": 1.5, "contains_zero": False}, "not integral"),
+        # NaN is excluded from the range by construction
+        ({"minimum": float("nan"), "is_integral": False, "contains_zero": False}, "must not be NaN"),
+        ({"maximum": float("nan"), "is_integral": False}, "must not be NaN"),
+        # no observed range means empty (vacuously integral) or all-NaN (not)
+        (
+            {"minimum": None, "maximum": None, "contains_zero": False},
+            "all-NaN, so is_integral must be False",
+        ),
+        (
+            {"element_count": 0, "minimum": None, "maximum": None, "is_integral": False, "contains_zero": False},
+            "vacuously integral",
+        ),
     ],
 )
 def test_malformed_summaries_are_rejected(kwargs, message):
@@ -500,3 +511,33 @@ def test_well_formed_edge_case_summaries_are_constructible():
         is_integral=False,
         contains_zero=False,
     )
+    # zero strictly inside the range may or may not have been observed
+    for observed in (True, False):
+        TensorValueSummary(
+            content_digest="0" * 64,
+            element_count=2,
+            minimum=-1.0,
+            maximum=1.0,
+            is_integral=True,
+            contains_zero=observed,
+        )
+
+
+def test_every_produced_summary_satisfies_its_own_invariants():
+    # the factory and the validator must agree: reconstructing each summary
+    # from its own fields is the cheapest way to keep them from drifting
+    arrays = [
+        np.zeros((0, 3), dtype=np.float32),
+        np.array([np.nan, np.nan], dtype=np.float32),
+        np.array([1.0, np.inf], dtype=np.float32),
+        np.array([0.0, 0.5], dtype=np.float32),
+        np.array([-1.0, 1.0], dtype=np.float32),
+        np.array([-1.0, 0.0, 1.0], dtype=np.float32),
+        np.array([0, 255], dtype=np.uint8),
+        np.array([-3, 0, 7], dtype=np.int8),
+        np.array([True, False]),
+        np.array([-0.0], dtype=np.float32),
+    ]
+    for array in arrays:
+        summary = summarize_tensor_values(array)
+        assert dataclasses.replace(summary) == summary
