@@ -54,16 +54,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Union, cast
 
-from qonnx.core.datatype import (
-    ArbPrecFloatType,
-    BaseDataType,
-    BipolarType,
-    DataType,
-    IntType,
-    ScaledIntType,
-    TernaryType,
-    resolve_datatype,
-)
+from qonnx.core.datatype import BaseDataType, BipolarType, DataType, IntType, TernaryType, resolve_datatype
 
 if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
@@ -142,18 +133,38 @@ class TensorValueSummary:
         if minimum is None or maximum is None:
             if self.contains_zero:
                 raise ValueError("contains_zero cannot be True without an observed range")
+            # an empty tensor is vacuously integral; a non-empty one with no
+            # comparable value is all-NaN, which is not integral
+            if self.element_count == 0 and not self.is_integral:
+                raise ValueError("an empty tensor is vacuously integral, so is_integral must be True")
+            if self.element_count > 0 and self.is_integral:
+                raise ValueError("a non-empty tensor with no observed range is all-NaN, so is_integral must be False")
             return
         for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
             if type(bound) not in (int, float):
                 raise ValueError("%s must be an int or float, got %r" % (bound_name, bound))
+            if isinstance(bound, float) and math.isnan(bound):
+                # the factory excludes NaN from the range, so a NaN bound
+                # contradicts the contract rather than reporting a fact
+                raise ValueError("%s must not be NaN" % bound_name)
         if self.element_count == 0:
             raise ValueError("an empty tensor cannot have an observed range")
         if minimum > maximum:
             raise ValueError("minimum %r exceeds maximum %r" % (minimum, maximum))
-        if self.is_integral and not (math.isfinite(minimum) and math.isfinite(maximum)):
-            raise ValueError("is_integral cannot be True for a non-finite range")
-        if self.contains_zero and not (minimum <= 0 <= maximum):
-            raise ValueError("contains_zero is True but zero lies outside [%r, %r]" % (minimum, maximum))
+        if self.is_integral:
+            if not (math.isfinite(minimum) and math.isfinite(maximum)):
+                raise ValueError("is_integral cannot be True for a non-finite range")
+            for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
+                # the extrema are themselves observed values
+                if bound != int(bound):
+                    raise ValueError("is_integral is True but %s %r is not integral" % (bound_name, bound))
+        if minimum > 0 or maximum < 0:
+            if self.contains_zero:
+                raise ValueError("contains_zero is True but zero lies outside [%r, %r]" % (minimum, maximum))
+        elif minimum == 0 or maximum == 0:
+            # zero is an extremum, so it was necessarily observed
+            if not self.contains_zero:
+                raise ValueError("contains_zero must be True when zero is an observed extremum")
 
 
 def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
@@ -280,64 +291,55 @@ def _lossless_candidates() -> list[BaseDataType]:
     Fixed-point, scaled-integer and arbitrary-precision float datatypes are
     not candidates: their losslessness depends on a scale factor or on
     individual mantissas, neither of which a value summary carries."""
-    names = DataType.get_accumulator_dt_cands()
-    candidates = [resolve_datatype(name) for name in names]
-    return sorted(candidates, key=lambda dt: (dt.bitwidth(), candidates.index(dt)))
+    candidates = [resolve_datatype(name) for name in DataType.get_accumulator_dt_cands()]
+    indexed = tuple(enumerate(candidates))
+    return [datatype for _index, datatype in sorted(indexed, key=lambda item: (item[1].bitwidth(), item[0]))]
 
 
-def _admits(datatype: BaseDataType, summary: TensorValueSummary) -> bool | None:
-    """Whether ``datatype`` represents every value the summary allows.
-
-    Returns ``None`` when the summary's facts cannot decide the question, so
-    that undecidable is never silently reported as admissible.
+def _admits(datatype: BaseDataType, summary: TensorValueSummary) -> bool:
+    """Whether an integer-valued candidate represents every observed value.
 
     Range containment alone is not the right test: ``BIPOLAR`` and ``TERNARY``
     share the range ``[-1, +1]`` but ``BIPOLAR`` excludes zero, so a tensor
     holding ``{-1, 0, +1}`` is inside ``BIPOLAR``'s range while being outside
-    its domain."""
+    its domain.
+
+    The caller has already established that the summary has a finite integral
+    range, and every candidate is integer-valued, so the question is decidable
+    here. It is not decidable for datatypes in general, which is why this stays
+    private and narrow rather than becoming a public compatibility predicate."""
     minimum, maximum = summary.minimum, summary.maximum
     if minimum is None or maximum is None or not summary.is_integral:
-        # every candidate here is integer-valued, so a range that is absent,
-        # fractional or non-finite decides nothing
-        return None
-    if isinstance(datatype, ScaledIntType):
-        # defines no range of its own
-        return None
-    if isinstance(datatype, ArbPrecFloatType):
-        # exactness depends on each value's mantissa, not on the range
-        return None
+        raise ValueError("_admits requires a summary with a finite integral range")
     if isinstance(datatype, BipolarType):
         return minimum >= -1 and maximum <= 1 and not summary.contains_zero
     if isinstance(datatype, TernaryType):
         return minimum >= -1 and maximum <= 1
     if isinstance(datatype, IntType):
-        # IntType and FixedPointType both represent every integer between
-        # their bounds: a fixed-point scale factor is always <= 1/2
+        # every integer between an IntType's bounds is representable
         return bool(datatype.min() <= minimum and maximum <= datatype.max())
-    # remaining registered types are the IEEE floats, whose QONNX semantics
-    # admit any value inside their range
-    return bool(datatype.min() <= minimum and maximum <= datatype.max())
+    raise ValueError("%s is not an integer-valued candidate datatype" % datatype)
 
 
-def smallest_lossless_integer_datatype(
-    summary: TensorValueSummary, declared_datatype: BaseDataType | None = None
-) -> BaseDataType | None:
-    """Returns the narrowest integer-valued QONNX datatype that exactly
-    represents the observed values, or ``None`` when none can be established.
+def smallest_lossless_integer_datatype(summary: TensorValueSummary) -> BaseDataType | None:
+    """Returns the narrowest integer-valued QONNX datatype that represents
+    every observed value, or ``None`` when no such datatype exists.
 
-    The name states the domain deliberately. A value summary carries a range
-    and a few membership facts, which is enough to prove losslessness for
-    integer-valued datatypes and not enough for fractional ones: no range can
-    show that a float tensor survives a narrower float or fixed-point type.
-    Rather than promise a general "smallest datatype" and quietly decline on
-    every fractional tensor, this answers the question it can actually decide.
-    (C0 calls for a smallest-lossless-QONNX-datatype helper; this is that
-    helper, named for what it proves.)
+    The answer is derived from observed values alone. It takes no declared
+    datatype, because a summary cannot soundly validate one: a value can sit
+    inside ``FLOAT16``'s range while needing more mantissa than ``FLOAT16``
+    has, so range containment would prove nothing and trusting the declaration
+    would smuggle an unchecked assumption into a value-derived fact. A
+    declared datatype that cannot hold its own tensor is a source-model
+    inconsistency for the consumer to detect, not a case for this helper.
+    Consumers constrain or validate this answer against the declared logical
+    datatype themselves.
 
-    ``declared_datatype``, when given, is the datatype the summarized tensor
-    is already declared to hold. It is validated against the summary rather
-    than assumed, and the result is never wider than it: when the narrowest
-    candidate is not narrower, the declared type is returned unchanged.
+    The name states the domain deliberately. A summary carries a range and a
+    few membership facts, which is enough to prove losslessness for
+    integer-valued datatypes and not enough for fractional ones. (C0 calls for
+    a smallest-lossless-QONNX-datatype helper; this is that helper, named for
+    what it proves.)
 
     ``None`` -- an explicit refusal rather than an optimistic approximation --
     is returned when:
@@ -345,23 +347,15 @@ def smallest_lossless_integer_datatype(
     * the tensor is empty, so no value was observed;
     * ``minimum``/``maximum`` are absent (every element is NaN);
     * the values are not all finite and integral, so no integer-valued
-      datatype represents them;
-    * the observed values exceed the 64-bit candidates; or
-    * ``declared_datatype`` is given and does not admit the observed values,
-      or its admission cannot be decided from a summary (``SCALEDINT``, and
-      the arbitrary-precision floats, whose exactness is per-mantissa)."""
+      datatype represents them; or
+    * the observed values exceed the 64-bit candidates."""
     if summary.element_count == 0:
         return None
     if summary.minimum is None or summary.maximum is None:
         return None
     if not summary.is_integral:
         return None
-    if declared_datatype is not None and not _admits(declared_datatype, summary):
-        return None
     for candidate in _lossless_candidates():
-        if not _admits(candidate, summary):
-            continue
-        if declared_datatype is not None and candidate.bitwidth() >= declared_datatype.bitwidth():
-            return declared_datatype
-        return candidate
+        if _admits(candidate, summary):
+            return candidate
     return None
