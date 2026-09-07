@@ -52,6 +52,7 @@ import numpy as np
 import numpy.typing as npt
 import re
 from dataclasses import dataclass
+from onnx import numpy_helper
 from typing import TYPE_CHECKING, Any, Union, cast
 
 from qonnx.core.datatype import BaseDataType, BipolarType, DataType, IntType, TernaryType, resolve_datatype
@@ -66,9 +67,11 @@ _DIGEST_SCHEMA = b"qonnx.tensor_value_summary.v1"
 _DIGEST_LENGTH = 64
 _DIGEST_PATTERN = re.compile("[0-9a-f]{%d}" % _DIGEST_LENGTH)
 
-# numpy dtype kinds whose values QONNX can summarize soundly:
-# signed integer, unsigned integer, floating point, boolean
-_SUPPORTED_KINDS = frozenset("iufb")
+# NumPy dtype kinds whose values QONNX can summarize soundly without further
+# restriction: signed integer, unsigned integer, boolean. Floating values need
+# an explicit width check because extrema are stored as Python ``float``.
+_SUPPORTED_NON_FLOAT_KINDS = frozenset("iub")
+_SUPPORTED_FLOAT_ITEM_SIZES = frozenset((2, 4, 8))
 
 
 class UnsupportedTensorValueError(TypeError):
@@ -170,14 +173,17 @@ class TensorValueSummary:
 def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
     """Returns whether values of this numpy dtype can be summarized soundly.
 
-    Supported: signed and unsigned integers, IEEE floating point (float16,
-    float32, float64) and booleans.
+    Supported: signed and unsigned integers, IEEE floating point with 16, 32,
+    or 64 bits, and booleans. A platform type such as ``longdouble`` is
+    supported only when it is an alias for one of those effective widths.
 
-    Unsupported: complex, string/object, and every sub-byte or custom-encoded
-    numeric type that ``onnx.numpy_helper`` returns as a *view* dtype with
-    fields (bfloat16, the float8 variants, the 4-bit types). Their raw bytes
-    are bit patterns rather than numbers, so a range taken over them would be
-    meaningless rather than merely imprecise.
+    Unsupported: wider floating types whose extrema cannot be represented
+    exactly by this summary's Python ``float`` fields, complex, string/object,
+    and every sub-byte or custom-encoded numeric type that
+    ``onnx.numpy_helper`` returns as a *view* dtype with fields (bfloat16, the
+    float8 variants, the 4-bit types). Their raw bytes are bit patterns rather
+    than numbers, so a range taken over them would be meaningless rather than
+    merely imprecise.
 
     ``INT4``/``UINT4`` are excluded here even though QONNX has datatypes of
     those names: the exclusion is a property of the packed bytes numpy hands
@@ -187,7 +193,9 @@ def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
     resolved = np.dtype(dtype)
     if resolved.fields is not None or resolved.subdtype is not None:
         return False
-    return resolved.kind in _SUPPORTED_KINDS
+    if resolved.kind == "f":
+        return resolved.itemsize in _SUPPORTED_FLOAT_ITEM_SIZES
+    return resolved.kind in _SUPPORTED_NON_FLOAT_KINDS
 
 
 def summarize_tensor_values(array: npt.NDArray[Any]) -> TensorValueSummary:
@@ -199,7 +207,7 @@ def summarize_tensor_values(array: npt.NDArray[Any]) -> TensorValueSummary:
     if not is_summarizable_dtype(array.dtype):
         raise UnsupportedTensorValueError(
             "Cannot summarize tensor values of dtype %s: only integer, "
-            "IEEE floating point and boolean tensors are supported." % str(array.dtype)
+            "16/32/64-bit IEEE floating point and boolean tensors are supported." % str(array.dtype)
         )
     contiguous = np.ascontiguousarray(array)
     hasher = hashlib.sha256()
@@ -269,11 +277,11 @@ def initializer_value_summaries(model: "ModelWrapper") -> dict[str, TensorValueS
     silently."""
     summaries: dict[str, TensorValueSummary] = {}
     for initializer in model.graph.initializer:
-        array = cast(Union[npt.NDArray[Any], None], model.get_initializer(initializer.name))
-        if array is None:
-            # not reachable for a well-formed graph, but must not become a
-            # silent skip under python -O the way an assert would
-            raise RuntimeError("initializer %r could not be read back" % initializer.name)
+        # Traverse the initializer collection once and convert the TensorProto
+        # already in hand. ModelWrapper.get_initializer rebuilds the complete
+        # initializer-name list and searches it on every call, which would make
+        # this model-level analysis quadratic in initializer count.
+        array = numpy_helper.to_array(initializer)
         summaries[initializer.name] = summarize_tensor_values(array)
     return summaries
 
