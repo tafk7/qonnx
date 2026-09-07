@@ -225,6 +225,17 @@ def test_supported_dtype_predicate():
         assert not is_summarizable_dtype(np.dtype(dtype))
 
 
+def test_distinct_wider_floating_dtype_is_refused():
+    dtype = np.dtype(np.longdouble)
+    if dtype.itemsize <= np.dtype(np.float64).itemsize:
+        pytest.skip("longdouble is not wider than float64 on this platform")
+
+    assert dtype.kind == "f"
+    assert not is_summarizable_dtype(dtype)
+    with pytest.raises(UnsupportedTensorValueError, match=str(dtype)):
+        summarize_tensor_values(np.array([np.finfo(dtype).max], dtype=dtype))
+
+
 # --- model-level analysis ----------------------------------------------------
 
 
@@ -317,6 +328,25 @@ def test_analysis_pass_summarizes_every_initializer():
     assert set(summaries.keys()) == {"p0", "p1"}
     assert summaries["p0"] == initializer_value_summary(model, "p0")
     assert all(isinstance(s, TensorValueSummary) for s in summaries.values())
+
+
+def test_analysis_pass_does_not_repeat_name_based_initializer_lookup(monkeypatch):
+    model = make_model_with_initializers(
+        {
+            "p0": np.array([1.0, 2.0], dtype=np.float32),
+            "p1": np.array([-1.0, 0.0], dtype=np.float32),
+            "p2": np.array([3, 4], dtype=np.int8),
+        }
+    )
+
+    def refuse_name_based_lookup(*_args, **_kwargs):
+        raise AssertionError("bulk analysis must convert each encountered TensorProto directly")
+
+    monkeypatch.setattr(model, "get_initializer", refuse_name_based_lookup)
+    summaries = initializer_value_summaries(model)
+
+    assert set(summaries) == {"p0", "p1", "p2"}
+    assert summaries["p2"] == summarize_tensor_values(np.array([3, 4], dtype=np.int8))
 
 
 # --- smallest lossless datatype ----------------------------------------------
