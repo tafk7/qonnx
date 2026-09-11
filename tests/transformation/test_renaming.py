@@ -39,6 +39,24 @@ import qonnx.core.onnx_exec as oxe
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.general import GiveReadableTensorNames, GiveUniqueNodeNames
 from qonnx.transformation.infer_shapes import InferShapes
+from qonnx.util.basic import qonnx_make_model
+from qonnx.util.cleanup import cleanup_model
+
+
+def make_shared_input_model():
+    graph_input = onnx.helper.make_tensor_value_info("B_source", onnx.TensorProto.FLOAT, [4])
+    graph_output = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [4])
+    shared_value = onnx.helper.make_tensor_value_info("B", onnx.TensorProto.FLOAT, [4])
+    source = onnx.helper.make_node("Identity", inputs=["B_source"], outputs=["B"], name="Source")
+    add = onnx.helper.make_node("Add", inputs=["B", "B"], outputs=["Y"], name="AddSharedTwice")
+    graph = onnx.helper.make_graph(
+        nodes=[source, add],
+        name="shared-input-model",
+        inputs=[graph_input],
+        outputs=[graph_output],
+        value_info=[shared_value],
+    )
+    return ModelWrapper(qonnx_make_model(graph, producer_name="qonnx-tests"))
 
 
 def test_renaming():
@@ -94,3 +112,29 @@ def test_rename_multi_io_tinyyolov3():
     assert model.graph.output[1].name == "global_out_1"
     assert model.graph.output[2].name == "global_out_2"
     os.remove(export_onnx_path)
+
+
+@pytest.mark.parametrize(
+    "rename",
+    [
+        pytest.param(
+            lambda model: model.transform(GiveReadableTensorNames()),
+            id="readable-tensor-names",
+        ),
+        pytest.param(cleanup_model, id="cleanup-model"),
+    ],
+)
+def test_renaming_preserves_repeated_input_graph(rename):
+    values = np.asarray([3, 1, 7, 2], dtype=np.float32)
+    model = make_shared_input_model().transform(GiveUniqueNodeNames())
+    expected = next(iter(oxe.execute_onnx(model, {"B_source": values}).values()))
+
+    renamed = rename(model)
+
+    onnx.checker.check_model(renamed.model)
+    renamed_input = renamed.graph.input[0].name
+    actual = next(iter(oxe.execute_onnx(renamed, {renamed_input: values}).values()))
+    assert np.array_equal(actual, expected)
+    add = renamed.get_nodes_by_op_type("Add")[0]
+    assert len(add.input) == 2
+    assert add.input[0] == add.input[1]

@@ -485,10 +485,12 @@ class ModelWrapper:
             quant_annotation.tensor_name = new_name
         # sweep over node i/o
         for n in graph.node:
-            if old_name in n.input:
-                n.input[list(n.input).index(old_name)] = new_name
-            if old_name in n.output:
-                n.output[list(n.output).index(old_name)] = new_name
+            for node_input_index, node_input in enumerate(n.input):
+                if node_input == old_name:
+                    n.input[node_input_index] = new_name
+            for node_output_index, node_output in enumerate(n.output):
+                if node_output == old_name:
+                    n.output[node_output_index] = new_name
 
     def get_initializer(
         self, tensor_name: str, return_dtype: bool = False

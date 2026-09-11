@@ -233,6 +233,32 @@ def test_modelwrapper_set_tensor_shape_multiple_inputs():
     assert model.graph.input[1].name == "in2"
 
 
+def test_modelwrapper_rename_tensor_updates_all_node_inputs():
+    shared = onnx.helper.make_tensor_value_info("shared", onnx.TensorProto.FLOAT, [1, 4])
+    sum_output = onnx.helper.make_tensor_value_info("sum_output", onnx.TensorProto.FLOAT, [1, 4])
+    product_output = onnx.helper.make_tensor_value_info(
+        "product_output", onnx.TensorProto.FLOAT, [1, 4]
+    )
+    add_node = onnx.helper.make_node("Add", inputs=["shared", "shared"], outputs=["sum_output"])
+    mul_node = onnx.helper.make_node(
+        "Mul", inputs=["shared", "sum_output"], outputs=["product_output"]
+    )
+    graph = onnx.helper.make_graph(
+        nodes=[add_node, mul_node],
+        name="shared_input_graph",
+        inputs=[shared],
+        outputs=[product_output],
+        value_info=[sum_output],
+    )
+    model = ModelWrapper(qonnx_make_model(graph, producer_name="rename-test"))
+
+    model.rename_tensor("shared", "renamed_shared")
+
+    assert model.graph.input[0].name == "renamed_shared"
+    assert list(model.graph.node[0].input) == ["renamed_shared", "renamed_shared"]
+    assert list(model.graph.node[1].input) == ["renamed_shared", "sum_output"]
+
+
 def test_modelwrapper_set_opset_import():
     # Create a simple model
     in1 = onnx.helper.make_tensor_value_info("in1", onnx.TensorProto.FLOAT, [4, 4])
