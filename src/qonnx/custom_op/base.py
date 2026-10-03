@@ -49,10 +49,18 @@ class CustomOp(ABC):
 
     Opset Version Support:
         CustomOp classes use "since version" semantics matching ONNX operators.
-        Version is determined by the class name using _vN suffix convention:
+        A class's op type and version come from the name its domain module
+        exports it under, by one rule (``registry.split_versioned_name``):
 
-        - No suffix (e.g., IntQuant): Version 1 (default)
-        - _vN suffix (e.g., IntQuant_v2): Version N
+        - ``OpType_vN``, N a positive integer without leading zeros (e.g.,
+          IntQuant_v2): op type OpType, version N
+        - any other name (e.g., IntQuant, Thresholding_vitis): that op type,
+          version 1
+
+        A class may instead state ``op_type`` and/or ``op_version`` in its own
+        body (``op_type = "MatMul"``, ``op_version = 6``). A stated identity is
+        not inherited: a subclass (a backend of a kernel op, say) is identified
+        by its own name unless it states its own.
 
         The registry automatically selects the highest version <= requested opset.
 
