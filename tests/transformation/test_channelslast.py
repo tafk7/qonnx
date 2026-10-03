@@ -33,7 +33,7 @@ import numpy as np
 import qonnx.core.onnx_exec as oxe
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.channels_last.base_wrapped_op import to_channels_last_args
-from qonnx.custom_op.registry import get_ops_in_domain, getCustomOp, is_custom_op
+from qonnx.custom_op.registry import get_ops_in_domain, is_custom_op
 from qonnx.transformation.channels_last import (
     AbsorbChanFirstIntoMatMul,
     InsertChannelsLastDomainsAndTrafos,
@@ -125,7 +125,7 @@ def verify_all_nodes(model):
     result = dict()
     for n in model.graph.node:
         if is_custom_op(n.domain):
-            n_instance = getCustomOp(n)
+            n_instance = model.get_customop_wrapper(n)
             verify_result = n_instance.verify_node()
             result[n.name] = verify_result
     return result

@@ -26,8 +26,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Op identity in the custom-op registry: one rule for versioned names, and an
-op_type/op_version stated in a class's own body, not inherited."""
+"""Op identity in the custom-op registry: one rule for versioned names, an
+op_type/op_version stated in a class's own body (not inherited), and registered
+and exported versions merged, a duplicate refused."""
 
 import pytest
 
@@ -39,6 +40,7 @@ from onnx import helper
 
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import (
+    add_op_to_domain,
     get_ops_in_domain,
     get_supported_versions,
     getCustomOp,
@@ -138,3 +140,57 @@ def test_stated_and_named_identities_in_one_domain():
     assert type(inst) is MatMulOp
     with pytest.raises(KeyError):
         getCustomOp(helper.make_node("MatMulOp", ["x"], ["y"], domain=domain))
+
+
+def test_registering_a_version_keeps_the_exported_ones():
+    Foo = type("Foo", (_Op,), {})
+    Foo_v2 = type("Foo_v2", (_Op,), {})
+    Foo_v3 = type("Foo_v3", (_Op,), {})
+    domain = _domain(Foo=Foo, Foo_v2=Foo_v2)
+    add_op_to_domain(domain, Foo_v3)
+    assert get_supported_versions(domain, "Foo") == [1, 2, 3]
+
+
+def test_a_registered_class_replaces_an_exported_one_for_its_version_only():
+    Foo = type("Foo", (_Op,), {})
+    Foo_v2 = type("Foo_v2", (_Op,), {})
+    Patched = type("Patched", (_Op,), {})
+    domain = _domain(Foo=Foo, Foo_v2=Foo_v2)
+    add_op_to_domain(domain, Patched, op_type="Foo", op_version=2)
+    node = helper.make_node("Foo", ["x"], ["y"], domain=domain)
+    assert type(getCustomOp(node, onnx_opset_version=1)) is Foo
+    assert type(getCustomOp(node, onnx_opset_version=2)) is Patched
+    with pytest.raises(ValueError):
+        add_op_to_domain(domain, Patched, op_type="Foo", op_version=0)
+
+
+def test_two_classes_exported_for_one_version_are_refused():
+    A = type("Bar", (_Op,), {})
+    B = type("Bar2", (_Op,), {"op_type": "Bar"})
+    domain = _domain(Bar=A, Bar2=B)
+    with pytest.raises(ValueError, match="exported twice"):
+        get_supported_versions(domain, "Bar")
+
+
+def test_one_class_exported_twice_is_not_a_duplicate():
+    """__all__ and a legacy custom_op dict naming the same class, and the same
+    class registered again at run time."""
+    Baz = type("Baz", (_Op,), {})
+    domain = _domain(Baz=Baz)
+    sys.modules[domain].custom_op = {"Baz": Baz}
+    add_op_to_domain(domain, Baz)
+    add_op_to_domain(domain, Baz)
+    assert get_supported_versions(domain, "Baz") == [1]
+
+
+def test_a_bare_lookup_of_a_multi_version_op_warns():
+    Qux = type("Qux", (_Op,), {})
+    Qux_v2 = type("Qux_v2", (_Op,), {})
+    Single = type("Single", (_Op,), {})
+    domain = _domain(Qux=Qux, Qux_v2=Qux_v2, Single=Single)
+    with pytest.warns(UserWarning, match="without the model's opset import"):
+        assert type(getCustomOp(helper.make_node("Qux", ["x"], ["y"], domain=domain))) is Qux_v2
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        getCustomOp(helper.make_node("Qux", ["x"], ["y"], domain=domain), onnx_opset_version=1)
+        getCustomOp(helper.make_node("Single", ["x"], ["y"], domain=domain))
