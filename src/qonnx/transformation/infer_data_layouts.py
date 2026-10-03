@@ -29,7 +29,6 @@
 import warnings
 
 import qonnx.core.data_layout as DataLayout
-import qonnx.custom_op.registry as registry
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
 from qonnx.util.basic import get_by_name
@@ -41,7 +40,7 @@ def _dims_to_layout(model, node, ndims):
     else:
         if is_custom_op(node.domain):
             if node.op_type == "MultiThreshold" or node.op_type == "QuantAvgPool2d":
-                mt_inst = registry.getCustomOp(node)
+                mt_inst = model.get_customop_wrapper(node)
                 layout = mt_inst.get_nodeattr("data_layout")
                 if layout == "NHWC" and ndims == 4:
                     return DataLayout.NHWC
