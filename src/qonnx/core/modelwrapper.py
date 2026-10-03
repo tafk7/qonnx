@@ -292,8 +292,20 @@ class ModelWrapper:
             )
         )
 
+    def has_tensor_datatype(self, tensor_name: str) -> bool:
+        """Whether the tensor with given name carries a QONNX DataType
+        annotation. get_tensor_datatype answers the container type (FLOAT32 for
+        most tensors) for a tensor without one; this tells a stated datatype
+        from that fallback."""
+        qa = util.get_by_name(self._model_proto.graph.quantization_annotation, tensor_name, "tensor_name")
+        if qa is None:
+            return False
+        return util.get_by_name(qa.quant_parameter_tensor_names, "finn_datatype", "key") is not None
+
     def get_tensor_datatype(self, tensor_name: str) -> BaseDataType:
-        """Returns the QONNX DataType of tensor with given name."""
+        """Returns the QONNX DataType of tensor with given name. A tensor without
+        a DataType annotation reads as its container type (FLOAT32 for most);
+        has_tensor_datatype tells the two apart."""
         graph = self._model_proto.graph
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
@@ -329,7 +341,8 @@ class ModelWrapper:
             return DataType["FLOAT32"]
 
     def set_tensor_datatype(self, tensor_name: str, datatype: BaseDataType | None) -> None:
-        """Sets the QONNX DataType of tensor with given name."""
+        """Sets the QONNX DataType of tensor with given name. None removes the
+        annotation (other annotations of the tensor, such as its layout, stay)."""
         graph = self._model_proto.graph
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
@@ -339,7 +352,7 @@ class ModelWrapper:
             )
             if ret_dt is not None:
                 if datatype is None:
-                    ret_dt.Clear()
+                    ret.quant_parameter_tensor_names.remove(ret_dt)
                 else:
                     ret_dt.value = datatype.name
             elif datatype is not None:

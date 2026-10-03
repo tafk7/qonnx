@@ -233,6 +233,35 @@ def test_modelwrapper_setting_unsetting_datatypes():
     assert ret == DataType["BIPOLAR"], "Tensor datatype should follow setting."
 
 
+def test_modelwrapper_has_tensor_datatype():
+    """An annotated FLOAT32 and an unannotated tensor read the same through
+    get_tensor_datatype; has_tensor_datatype tells them apart."""
+    raw_m = get_data("qonnx.data", "onnx/mnist-conv/model.onnx")
+    model = ModelWrapper(raw_m)
+    tname = model.graph.node[0].output[0]
+    assert model.has_tensor_datatype(tname) is False
+    assert model.get_tensor_datatype(tname) == DataType["FLOAT32"]
+    model.set_tensor_layout(tname, DataLayout.NCHW)
+    assert model.has_tensor_datatype(tname) is False
+    model.set_tensor_datatype(tname, DataType["FLOAT32"])
+    assert model.has_tensor_datatype(tname) is True
+    assert model.get_tensor_datatype(tname) == DataType["FLOAT32"]
+
+
+def test_modelwrapper_unsetting_a_datatype_removes_its_annotation():
+    raw_m = get_data("qonnx.data", "onnx/mnist-conv/model.onnx")
+    model = ModelWrapper(raw_m)
+    tname = model.graph.node[0].output[0]
+    model.set_tensor_layout(tname, DataLayout.NCHW)
+    model.set_tensor_datatype(tname, DataType["INT4"])
+    model.set_tensor_datatype(tname, None)
+    assert model.has_tensor_datatype(tname) is False
+    assert model.get_tensor_datatype(tname) == DataType["FLOAT32"]
+    assert model.get_tensor_layout(tname) == DataLayout.NCHW
+    annotation = next(a for a in model.graph.quantization_annotation if a.tensor_name == tname)
+    assert [e.key for e in annotation.quant_parameter_tensor_names] == ["tensor_layout"]
+
+
 def test_modelwrapper_set_tensor_shape_multiple_inputs():
     # Create a model with two inputs
     in1 = onnx.helper.make_tensor_value_info("in1", onnx.TensorProto.FLOAT, [1, 2])
