@@ -65,6 +65,27 @@ class CustomOp(ABC):
 
             class IntQuant_v4(CustomOp):
                 pass  # Version 4, covers opset v4+
+
+    Model-aware ops (opt-in):
+        An op whose answers depend on the graph around it (its input shapes,
+        datatypes or initializer values) sets ``wants_model = True``. Instances
+        obtained through ``ModelWrapper.get_customop_wrapper`` (which InferShapes,
+        InferDataTypes, FoldConstants and execute_onnx use) are then attached to
+        that ModelWrapper via ``attach_model``; bare ``getCustomOp`` never attaches.
+        Ops that do not opt in are unchanged.
+
+        - Queries read the model; they do not change it. ``infer_node_datatype``
+          is the one documented exception: it writes this node's output
+          annotations, as it always has.
+        - Lifetime: an attached instance borrows the ModelWrapper it was obtained
+          from, and its ``onnx_node`` is a node of that model. Neither follows a
+          copy: after ``model.transform(...)`` (which deep-copies by default),
+          ``copy.deepcopy`` or a reload, the instance still answers from the old
+          model. Obtain a fresh instance from the new model instead of keeping
+          one across transformations.
+        - qonnx does not cache instances: every ``get_customop_wrapper`` call
+          builds and attaches a new one, so state cached on an instance lives
+          only as long as that instance.
     """
 
     # Class-level opt-in for graph context. Default False => this op answers all
@@ -90,9 +111,15 @@ class CustomOp(ABC):
         to (re)build and cache derived state.
 
         Contract: attach_model and every query getter MUST NOT mutate the graph --
-        attach BORROWS a read reference. Idempotent; a later attach with a different
-        model must invalidate any cached derived state. A no-op trigger for ops with
-        wants_model=False (they never call it)."""
+        attach BORROWS a read reference (infer_node_datatype, which writes this
+        node's output annotations, is the exception). Idempotent; a later attach with
+        a different model must invalidate any cached derived state. A no-op trigger
+        for ops with wants_model=False (they never call it).
+
+        Lifetime: the reference is to this ModelWrapper, not to a snapshot or to its
+        copies. State derived at attach reflects the model as it was then; a caller
+        that changes or copies the model obtains a new instance from it
+        (get_customop_wrapper) rather than reusing this one."""
         self._model = model
         return self
 

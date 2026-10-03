@@ -32,7 +32,6 @@ from onnx import TensorProto
 from onnx import helper as oh
 
 from qonnx.core.datatype import DataType
-from qonnx.custom_op.registry import getCustomOp
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
@@ -87,7 +86,7 @@ class ConvertBipolarMatMulToXnorPopcount(Transformation):
                     else:
                         graph_modified = True
                         mt = mt_chain[-1]
-                        mt_inst = getCustomOp(mt)
+                        mt_inst = model.get_customop_wrapper(mt)
                         # ensure old scale/bias were correct for BIPOLAR
                         scale_ok = mt_inst.get_nodeattr("out_scale") == 2.0
                         bias_ok = mt_inst.get_nodeattr("out_bias") == -1.0

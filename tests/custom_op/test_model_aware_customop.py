@@ -34,13 +34,19 @@ be indistinguishable from what getCustomOp returned before this contract existed
 context-dependent op that opts in receives the ModelWrapper only through the
 model-aware entry point (get_customop_wrapper), never through bare getCustomOp."""
 
+import pytest
+
+import json
 import numpy as np
 import onnx.parser as oprs
+import warnings
 
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.core.onnx_exec import execute_onnx
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import add_op_to_domain, getCustomOp
+from qonnx.transformation.general import GiveUniqueNodeNames
+from qonnx.util.config import extract_model_config_to_json
 
 
 class ClassicTestOp(CustomOp):
@@ -160,3 +166,62 @@ def test_onnx_execution_attaches_model_to_model_aware_custom_op():
     output = execute_onnx(model, {"in0": input_value})
 
     np.testing.assert_array_equal(output["out0"], input_value)
+
+
+def test_unknown_op_in_imported_domain_raises_without_fallback_warning():
+    """An op that does not exist raises the registry's KeyError; the opset fallback
+    (and its warning) is only for a domain the model does not import."""
+    model = _make_model("ClassicTestOp")
+    node = model.graph.node[0]
+    missing = type(node)()
+    missing.CopyFrom(node)
+    missing.op_type = "NoSuchTestOp"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(KeyError, match="NoSuchTestOp"):
+            model.get_customop_wrapper(missing)
+
+
+class RecordingModelAwareTestOp(ModelAwareTestOp):
+    """Records every model it is attached to, across instances."""
+
+    attached_to = []
+
+    def attach_model(self, model):
+        RecordingModelAwareTestOp.attached_to.append(model)
+        return super().attach_model(model)
+
+
+def test_model_config_extraction_attaches_model(tmp_path):
+    """extract_model_config_to_json builds ops through get_customop_wrapper, so a
+    model-aware op is attached to the model it reads attributes from."""
+    add_op_to_domain("qonnx.custom_op.general", RecordingModelAwareTestOp)
+    RecordingModelAwareTestOp.attached_to = []
+    model = _make_model("RecordingModelAwareTestOp")
+    model = model.transform(GiveUniqueNodeNames())
+    cfg_file = tmp_path / "cfg.json"
+
+    extract_model_config_to_json(model, str(cfg_file), ["my_attr"])
+
+    assert RecordingModelAwareTestOp.attached_to == [model]
+    cfg = json.loads(cfg_file.read_text())
+    assert cfg[model.graph.node[0].name] == {"my_attr": 3}
+
+
+def test_attached_instance_does_not_follow_a_transformed_copy():
+    """Attach lifetime: an instance borrows the ModelWrapper it came from. After a
+    transformation (a deep copy by default) it still answers from the old model;
+    the transformed model gives a new instance attached to itself."""
+    add_op_to_domain("qonnx.custom_op.general", ModelAwareTestOp)
+    model = _make_model("ModelAwareTestOp")
+    old_inst = model.get_customop_wrapper(model.graph.node[0])
+
+    transformed = model.transform(GiveUniqueNodeNames())
+
+    assert transformed is not model
+    assert old_inst._model is model
+    assert old_inst.onnx_node is model.graph.node[0]
+    assert old_inst.onnx_node.name == ""
+    new_inst = transformed.get_customop_wrapper(transformed.graph.node[0])
+    assert new_inst._model is transformed
+    assert new_inst.onnx_node.name != ""

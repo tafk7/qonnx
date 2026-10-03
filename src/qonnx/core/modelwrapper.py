@@ -890,18 +890,23 @@ class ModelWrapper:
         For ops that declare wants_model=True, this model is attached to the
         instance (via attach_model) so they can answer graph-derived queries;
         ops with wants_model=False are returned exactly as getCustomOp built
-        them."""
+        them. Every call builds a new instance; one attached here answers from
+        this ModelWrapper only, so after a transformation (which returns a copy)
+        ask the transformed model for a new instance.
+
+        Raises the registry's KeyError if the domain has no op of this type."""
         opset_imports = self.get_opset_imports()
-        try:
-            opset_import = opset_imports[node.domain]
-            inst = getCustomOp(node, onnx_opset_version=opset_import)
-        except KeyError:
+        if node.domain in opset_imports:
+            version = opset_imports[node.domain]
+        else:
             # domain not found in imports, use fallback version
             warnings.warn(
                 f"Domain {node.domain} not found in model opset imports, "
                 f"using fallback_customop_version={fallback_customop_version}"
             )
-            inst = getCustomOp(node, onnx_opset_version=fallback_customop_version)
+            version = fallback_customop_version
+        # a KeyError from the registry (no such op) propagates as itself
+        inst = getCustomOp(node, onnx_opset_version=version)
         if inst.wants_model:
             inst.attach_model(self)
         return inst

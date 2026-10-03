@@ -28,8 +28,6 @@
 
 import json
 
-from qonnx.custom_op.registry import getCustomOp
-
 
 def extract_model_config_to_json(model, json_filename, attr_names_to_extract):
     """Create a json file with layer name -> attribute mappings extracted from the
@@ -38,7 +36,7 @@ def extract_model_config_to_json(model, json_filename, attr_names_to_extract):
     cfg = dict()
     cfg["Defaults"] = dict()
     for n in model.graph.node:
-        oi = getCustomOp(n)
+        oi = model.get_customop_wrapper(n)
         layer_dict = dict()
         for attr in attr_names_to_extract:
             try:
