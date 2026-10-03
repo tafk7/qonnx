@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import inspect
 from pathlib import Path
@@ -56,6 +57,16 @@ from qonnx.transformation.general import (
     SortCommutativeInputsInitializerLast,
     SortGraph,
 )
+
+
+def _literal_annotation(value: str, key: str, tensor_name: str) -> Any:
+    """Parse an annotation stored as a Python literal (a list, or a dict of sets,
+    as set_tensor_layout and set_tensor_sparsity write them). Only literals are
+    read: inspecting a model file must not run code from it."""
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as e:
+        raise ValueError(f"{key} annotation of tensor {tensor_name} is not a Python literal: {value!r}") from e
 
 
 class ModelWrapper:
@@ -805,7 +816,7 @@ class ModelWrapper:
                 ret.quant_parameter_tensor_names, "tensor_layout", "key"
             )
             if ret is not None:
-                return eval(ret.value)
+                return _literal_annotation(ret.value, "tensor_layout", tensor_name)
         return None
 
     def set_tensor_layout(self, tensor_name: str, data_layout: list[str]) -> None:
@@ -845,7 +856,7 @@ class ModelWrapper:
                 ret.quant_parameter_tensor_names, "tensor_sparsity", "key"
             )
             if ret is not None:
-                return eval(ret.value)
+                return _literal_annotation(ret.value, "tensor_sparsity", tensor_name)
         return None
 
     def set_tensor_sparsity(
