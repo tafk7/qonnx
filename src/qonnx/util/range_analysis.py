@@ -387,12 +387,12 @@ def range_analysis(
     for inp in model.graph.input:
         iname = inp.name
         if range_min is None or range_max is None:
-            # use idt annotation
+            # no irange given: use each input's own idt annotation
             idt = model.get_tensor_datatype(iname)
             assert idt is not None, "Could not infer irange, please specify"
-            range_min = idt.min()
-            range_max = idt.max()
-        range_dict[iname] = (range_min, range_max)
+            range_dict[iname] = (idt.min(), idt.max())
+        else:
+            range_dict[iname] = (range_min, range_max)
 
     for node in model.graph.node:
         dyn_inputs = [x for x in node.input if is_dyn_input(x, model)]
