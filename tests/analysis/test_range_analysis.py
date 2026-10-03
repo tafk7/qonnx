@@ -29,7 +29,10 @@
 import pytest
 
 import numpy as np
+import onnx.parser as oprs
 
+from qonnx.core.datatype import DataType
+from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.util.range_analysis import range_analysis
 from qonnx.util.test import download_model, test_model_details
 
@@ -111,3 +114,36 @@ def test_range_analysis(model_name):
             ret_ind, ret_val = ret_chans[i]
             assert tg_ind == ret_ind
             assert np.isclose(tg_val, ret_val)
+
+
+def _two_input_add():
+    model = ModelWrapper(
+        oprs.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 13]>
+            g (float[1,4] a, float[1,4] b) => (float[1,4] s)
+            {
+              s = Add(a, b)
+            }
+            """
+        )
+    )
+    model.set_tensor_datatype("a", DataType["INT8"])
+    model.set_tensor_datatype("b", DataType["UINT2"])
+    return model
+
+
+def test_range_analysis_each_input_takes_its_own_datatype_range():
+    """Without irange, every graph input starts from its own datatype's range,
+    not the first input's."""
+    ret = range_analysis(_two_input_add(), report_mode="range")
+    assert ret["a"] == (-128, 127)
+    assert ret["b"] == (0, 3)
+    assert ret["s"] == (-128, 130)
+
+
+def test_range_analysis_irange_applies_to_every_input():
+    ret = range_analysis(_two_input_add(), irange=(-1.0, 1.0), report_mode="range")
+    assert ret["a"] == (-1.0, 1.0)
+    assert ret["b"] == (-1.0, 1.0)
+    assert ret["s"] == (-2.0, 2.0)
