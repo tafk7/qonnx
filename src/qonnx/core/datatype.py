@@ -29,9 +29,15 @@
 
 import numpy as np
 import threading
+import warnings
 from abc import ABC, ABCMeta, abstractmethod
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Union
+
+class DataTypeWarning(DeprecationWarning):
+    """A name was resolved that denotes no datatype today but is still
+    accepted (a zero-width integer type); a later release refuses it."""
+
 
 # One value per canonical name, for the datatypes defined in this module
 _INTERNED: Dict[str, "BaseDataType"] = {}
@@ -220,11 +226,13 @@ class ArbPrecFloatType(BaseDataType):
         mantissa_bits: int,
         exponent_bias: Union[int, float, None] = None,
     ) -> None:
+        if exponent_bits < 1 or mantissa_bits < 0:
+            raise ValueError(f"FLOAT<{exponent_bits},{mantissa_bits}> needs exponent bits >= 1 and mantissa bits >= 0")
         self._exponent_bits = exponent_bits
         self._mantissa_bits = mantissa_bits
 
-        if not exponent_bias:
-            # default (IEEE-style) exponent bias
+        if exponent_bias is None:
+            # default (IEEE-style) exponent bias; an explicit 0 is a bias of 0
             exponent_bias = (2.0 ** (exponent_bits - 1)) - 1
         self._exponent_bias = exponent_bias
 
@@ -350,6 +358,8 @@ class Float16Type(BaseDataType):
 class IntType(BaseDataType):
     def __init__(self, bitwidth: int, signed: bool) -> None:
         super().__init__()
+        if bitwidth < 0:
+            raise ValueError(f"an integer datatype needs a positive bit width, not {bitwidth}")
         self._bitwidth = bitwidth
         self._signed = signed
 
@@ -473,7 +483,8 @@ class TernaryType(BaseDataType):
 class FixedPointType(IntType):
     def __init__(self, bitwidth: int, intwidth: int) -> None:
         super().__init__(bitwidth=bitwidth, signed=True)
-        assert intwidth < bitwidth, "FixedPointType violates intwidth < bitwidth"
+        if not intwidth < bitwidth:
+            raise ValueError(f"FIXED<{bitwidth},{intwidth}> violates intwidth < bitwidth")
         self._intwidth = intwidth
 
     def int_bits(self) -> int:
@@ -547,26 +558,18 @@ class ScaledIntType(IntType):
         return "SCALEDINT<%d>" % (self.bitwidth())
 
 
-def resolve_datatype(name: str) -> BaseDataType:
-    """Return the datatype value a name denotes: the one instance for its
-    canonical name."""
-    if not isinstance(name, str):
-        raise TypeError(
-            f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'"
-        )
-    interned = _INTERNED.get(name)
-    if interned is not None:
-        return interned
-
+def _construct(name: str) -> BaseDataType:
+    """Parse a datatype name and construct its value; ValueError (or TypeError,
+    OverflowError) for a name that denotes no datatype."""
     _special_types = {
-        "BINARY": IntType(1, False),
-        "BIPOLAR": BipolarType(),
-        "TERNARY": TernaryType(),
-        "FLOAT32": FloatType(),
-        "FLOAT16": Float16Type(),
+        "BINARY": lambda: IntType(1, False),
+        "BIPOLAR": BipolarType,
+        "TERNARY": TernaryType,
+        "FLOAT32": FloatType,
+        "FLOAT16": Float16Type,
     }
     if name in _special_types.keys():
-        return _special_types[name]
+        return _special_types[name]()
     elif name.startswith("UINT"):
         bitwidth = int(name.replace("UINT", ""))
         return IntType(bitwidth, False)
@@ -577,6 +580,8 @@ def resolve_datatype(name: str) -> BaseDataType:
         name = name.replace("FIXED<", "")
         name = name.replace(">", "")
         nums = name.split(",")
+        if len(nums) != 2:
+            raise ValueError("FIXED takes two parameters")
         bitwidth = int(nums[0].strip())
         intwidth = int(nums[1].strip())
         return FixedPointType(bitwidth, intwidth)
@@ -584,6 +589,8 @@ def resolve_datatype(name: str) -> BaseDataType:
         name = name.replace("SCALEDINT<", "")
         name = name.replace(">", "")
         nums = name.split(",")
+        if len(nums) != 1:
+            raise ValueError("SCALEDINT takes one parameter")
         bitwidth = int(nums[0].strip())
         return ScaledIntType(bitwidth)
     elif name.startswith("FLOAT<"):
@@ -600,14 +607,51 @@ def resolve_datatype(name: str) -> BaseDataType:
             exp_bias = int(nums[2].strip())
             return ArbPrecFloatType(exp_bits, mant_bits, exp_bias)
         else:
-            raise KeyError("Could not resolve DataType " + name)
+            raise ValueError("FLOAT takes two or three parameters")
     else:
-        raise KeyError("Could not resolve DataType " + name)
+        raise ValueError("unknown datatype family")
+
+
+
+
+def _resolve(name: str, canonical: bool, stacklevel: int) -> BaseDataType:
+    if not isinstance(name, str):
+        raise TypeError(
+            f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'"
+        )
+    value = _INTERNED.get(name)
+    if value is None:
+        try:
+            value = _construct(name)
+        except (ValueError, TypeError, OverflowError) as e:
+            raise KeyError("Could not resolve DataType " + name) from e
+    if canonical and value.name != name:
+        raise KeyError(f"{name} is not a canonical DataType name; it denotes {value.name}")
+    if isinstance(value, IntType) and value.bitwidth() == 0:
+        warnings.warn(
+            f"{value.name} denotes no datatype (zero bits); a later release refuses it",
+            DataTypeWarning,
+            stacklevel=stacklevel,
+        )
+    return value
+
+
+def resolve_datatype(name: str, canonical: bool = False) -> BaseDataType:
+    """Return the datatype value a name denotes: the one instance for its
+    canonical name. Raises KeyError for any name that denotes no datatype
+    (unknown, malformed, or with impossible parameters such as INT-3 or
+    FIXED<8,8>); a zero-width integer type (INT0, UINT0) is still returned,
+    with a DataTypeWarning.
+
+    By default the name is read as a source would spell it: ``UINT1`` is
+    ``BINARY``, ``FLOAT<5,10>`` is ``FLOAT<5,10,15>``. With ``canonical=True``
+    only the canonical spelling is accepted, as for a persisted name."""
+    return _resolve(name, canonical, stacklevel=3)
 
 
 class DataTypeMeta(EnumMeta):
     def __getitem__(self, name: str) -> BaseDataType:
-        return resolve_datatype(name)
+        return _resolve(name, False, stacklevel=3)
 
 
 class DataType(Enum, metaclass=DataTypeMeta):
