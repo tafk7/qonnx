@@ -29,6 +29,7 @@ import clize
 import numpy as np
 import os
 import urllib.request
+import uuid
 
 import qonnx.core.onnx_exec as oxe
 from qonnx.core.modelwrapper import ModelWrapper
@@ -195,17 +196,43 @@ test_model_keys = clize.parameters.mapped(
 )
 
 
+def _replace_atomically(write, dst_file):
+    """Produce dst_file by calling write(path) on a temporary file in the same
+    directory, then renaming it into place. Concurrent writers (pytest-xdist
+    workers, parallel test runs) then never expose a partially written file to
+    a reader, and the last complete one wins."""
+    # a unique name the writer creates itself, so the file gets the usual
+    # permissions (tempfile.mkstemp would create it readable by its owner only)
+    tmp_file = f"{dst_file}.{uuid.uuid4().hex}.part"
+    try:
+        write(tmp_file)
+        os.replace(tmp_file, dst_file)
+    finally:
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+
+
+def download_file(url, dl_file):
+    "Download url to dl_file atomically (see _replace_atomically)."
+    _replace_atomically(lambda tmp_file: urllib.request.urlretrieve(url, tmp_file), dl_file)
+
+
+def cleanup_file(in_file, out_file, **cleanup_kwargs):
+    "Run cleanup on in_file, writing out_file atomically (see _replace_atomically)."
+    _replace_atomically(lambda tmp_file: cleanup(in_file, out_file=tmp_file, **cleanup_kwargs), out_file)
+
+
 def download_model(test_model: test_model_keys, *, dl_dir="/tmp", do_cleanup=False, return_modelwrapper=False):
     qonnx_url = test_model_details[test_model]["url"]
     # download test data
     dl_file = dl_dir + f"/{test_model}.onnx"
     ret = dl_file
     if not os.path.isfile(dl_file):
-        urllib.request.urlretrieve(qonnx_url, dl_file)
+        download_file(qonnx_url, dl_file)
     if do_cleanup:
         # run cleanup with default settings
         out_file = dl_dir + f"/{test_model}_clean.onnx"
-        cleanup(dl_file, out_file=out_file)
+        cleanup_file(dl_file, out_file)
         ret = out_file
     if return_modelwrapper:
         ret = ModelWrapper(ret)

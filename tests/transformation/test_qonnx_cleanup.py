@@ -5,9 +5,9 @@ from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.util.cleanup import cleanup
 
 
-def test_cleanup_cnv_w2a2():
+def test_cleanup_cnv_w2a2(tmp_path):
     # download test data
-    dl_dir = "/tmp"
+    dl_dir = str(tmp_path)
     dl_file = dl_dir + "/cnv-w2a2.onnx"
     cnv_w2a2_qonnx_url = (
         "https://raw.githubusercontent.com/fastmachinelearning/"
