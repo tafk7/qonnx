@@ -30,12 +30,11 @@ import pytest
 
 import os
 import random
-import urllib.request
 
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.quantize_graph import QuantizeGraph
-from qonnx.util.cleanup import cleanup
 from qonnx.util.inference_cost import inference_cost
+from qonnx.util.test import cleanup_file, download_file
 
 random.seed(42)
 
@@ -76,10 +75,10 @@ def download_model(test_model, do_cleanup=False, return_modelwrapper=False):
     dl_file = dl_dir + f"/{test_model}.onnx"
     ret = dl_file
     if not os.path.isfile(dl_file):
-        urllib.request.urlretrieve(qonnx_url, dl_file)
+        download_file(qonnx_url, dl_file)
     if do_cleanup:
         out_file = dl_dir + f"/{test_model}_clean.onnx"
-        cleanup(dl_file, out_file=out_file, override_inpsize=1)
+        cleanup_file(dl_file, out_file, override_inpsize=1)
         ret = out_file
     if return_modelwrapper:
         ret = ModelWrapper(ret)

@@ -30,12 +30,12 @@ import pytest
 
 import numpy as np
 import os
-import urllib.request
 
 import qonnx.core.onnx_exec as oxe
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.qcdq_to_qonnx import QCDQToQuant
 from qonnx.util.cleanup import cleanup_model
+from qonnx.util.test import download_file
 
 model_details = {
     "MobileNetv2-w8a8": {
@@ -54,7 +54,7 @@ def download_model(test_model):
     # download test data
     dl_dir = "/tmp"
     dl_file = dl_dir + f"/{test_model}.onnx"
-    urllib.request.urlretrieve(qonnx_url, dl_file)
+    download_file(qonnx_url, dl_file)
     return dl_file
 
 

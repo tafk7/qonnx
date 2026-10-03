@@ -141,13 +141,13 @@ def analysis_first_node_is_transpose(model):
 
 @pytest.mark.parametrize("make_input_channels_last", [True, False])
 @pytest.mark.parametrize("test_model", model_details.keys())
-def test_channelslast_conversion_end2end(test_model, make_input_channels_last):
+def test_channelslast_conversion_end2end(test_model, make_input_channels_last, tmp_path):
     # Download an clean model
     onnx_file = download_model(test_model, do_cleanup=True)
     input_tensor, golden_result = get_golden_in_and_output(test_model)
 
     # Execute transformation
-    qonnx_all_trafos = onnx_file.split(".onnx")[0] + "_all_nhwc_trafos_test.onnx"
+    qonnx_all_trafos = str(tmp_path / "all_nhwc_trafos_test.onnx")
     to_channels_last(onnx_file, make_input_channels_last=make_input_channels_last, out_file=qonnx_all_trafos)
 
     # Check output
@@ -178,14 +178,14 @@ def test_channelslast_conversion_end2end(test_model, make_input_channels_last):
 
 
 @pytest.mark.parametrize("test_model", model_details.keys())
-def test_channelslast_conversion_step_by_step(test_model):
+def test_channelslast_conversion_step_by_step(test_model, tmp_path):
     # Download an clean model
     onnx_file = download_model(test_model, do_cleanup=True)
     input_tensor, golden_result = get_golden_in_and_output(test_model)
 
     # Execute transformation
     model = ModelWrapper(onnx_file)
-    qonnx_all_trafos = onnx_file.split(".onnx")[0] + "_all_nhwc_trafos.onnx"
+    qonnx_all_trafos = str(tmp_path / "all_nhwc_trafos.onnx")
 
     # Run trafo
     model = model.transform(InsertChannelsLastDomainsAndTrafos())
