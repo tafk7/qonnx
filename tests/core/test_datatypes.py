@@ -32,7 +32,15 @@ import copy
 import numpy as np
 import pickle
 
-from qonnx.core.datatype import BaseDataType, DataType, FixedPointType, IntType, is_datatype, resolve_datatype
+from qonnx.core.datatype import (
+    BaseDataType,
+    DataType,
+    DataTypeWarning,
+    FixedPointType,
+    IntType,
+    is_datatype,
+    resolve_datatype,
+)
 
 
 def test_datatypes():
@@ -474,3 +482,40 @@ def test_a_foreign_subclass_is_left_as_constructed():
     assert copy.copy(foreign) is not foreign and copy.copy(foreign)._note == "mutable"
     # equal by name, as before; but not the value
     assert foreign == DataType["INT8"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["INT-3", "UINT-1", "FIXED<8,8>", "FIXED<8>", "FIXED<8,2,1>", "SCALEDINT<8,2>", "FLOAT<0,3>", "FLOAT<4,-1>"]
+    + ["FLOAT<4>", "FLOAT<4,3,0,1>", "INT8 but wrong", "UINT", "NOPE", ""],
+)
+def test_resolution_refuses_names_that_denote_no_datatype(name):
+    with pytest.raises(KeyError, match="Could not resolve DataType"):
+        DataType[name]
+    with pytest.raises(KeyError):
+        resolve_datatype(name)
+
+
+@pytest.mark.parametrize("name", ["INT0", "UINT0", "SCALEDINT<0>"])
+def test_zero_widths_are_deprecated(name):
+    with pytest.warns(DataTypeWarning, match="zero bits"):
+        value = DataType[name]
+    assert value.bitwidth() == 0 and value.name == name
+    with pytest.warns(DataTypeWarning):
+        assert resolve_datatype(name) is value
+
+
+def test_an_explicit_zero_exponent_bias_is_kept():
+    assert DataType["FLOAT<4,3,0>"].name == "FLOAT<4,3,0>"
+    assert DataType["FLOAT<4,3,0>"].exponent_bias() == 0
+    assert DataType["FLOAT<4,3>"].name == "FLOAT<4,3,7>"
+    assert DataType["FLOAT<4,3>"] is not DataType["FLOAT<4,3,0>"]
+
+
+def test_canonical_resolution_refuses_other_spellings():
+    for name in ["BINARY", "INT8", "FIXED<4,2>", "FLOAT<4,3,7>", "FLOAT<4,3,0>", "SCALEDINT<8>"]:
+        assert resolve_datatype(name, canonical=True) is DataType[name]
+    for spelling in ["UINT1", "FLOAT<4,3>", "FIXED<4,2", "INT 8"]:
+        assert is_datatype(resolve_datatype(spelling))
+        with pytest.raises(KeyError, match="not a canonical"):
+            resolve_datatype(spelling, canonical=True)
