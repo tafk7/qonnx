@@ -28,6 +28,7 @@
 
 import importlib
 import inspect
+import re
 import warnings
 from threading import RLock
 from typing import Dict, List, Optional, Tuple, Type
@@ -69,93 +70,86 @@ def resolve_domain(domain: str) -> str:
     return _DOMAIN_ALIASES.get(domain, domain)
 
 
-def _get_op_type_for_class(cls: Type[CustomOp]) -> str:
-    """Extract the op_type from a CustomOp class name, stripping _vN suffix if present.
+# The one rule for a versioned name: OpType_vN, N a positive integer without
+# leading zeros; any other name is an op type of version 1 (Thresholding_vitis)
+_VERSIONED_NAME = re.compile(r"(?P<op_type>.+)_v(?P<version>[1-9][0-9]*)")
 
-    Args:
-        cls: CustomOp class
 
-    Returns:
-        op_type string (e.g., "IntQuant_v2" -> "IntQuant")
+def split_versioned_name(name: str) -> Tuple[str, int]:
+    """Split a registered name into (op_type, since-version).
+
+    "IntQuant_v2" is ("IntQuant", 2); "IntQuant", "Thresholding_vitis" and
+    "Op_v02" are op types of version 1.
     """
-    name = cls.__name__
-    # Strip _vN suffix if present
-    if "_v" in name:
-        parts = name.split("_v")
-        if len(parts) == 2 and parts[1].isdigit():
-            return parts[0]  # IntQuant_v2 -> IntQuant
-    return name
+    match = _VERSIONED_NAME.fullmatch(name)
+    if match is None:
+        return name, 1
+    return match["op_type"], int(match["version"])
+
+
+def op_identity(cls: Type[CustomOp], exported_as: Optional[str] = None) -> Tuple[str, int]:
+    """The (op_type, since-version) a CustomOp class is registered under.
+
+    A class may state either in its own body (``op_type = "MatMul"``,
+    ``op_version = 6``). A stated identity is not inherited, so a backend
+    subclass of a kernel op is not registered as the kernel op. Otherwise both
+    come from the name the domain exports the class under (``exported_as``,
+    default the class name), split by split_versioned_name.
+
+    Raises:
+        ValueError: If a stated op_type is not a nonempty string or a stated
+            op_version not a positive integer
+    """
+    own = vars(cls)
+    name_op_type, name_version = split_versioned_name(exported_as or cls.__name__)
+    op_type = own.get("op_type", name_op_type)
+    op_version = own.get("op_version", name_version)
+    if not isinstance(op_type, str) or not op_type:
+        raise ValueError(f"{cls.__name__}.op_type must be a nonempty string, not {op_type!r}")
+    if type(op_version) is not int or op_version < 1:
+        raise ValueError(f"{cls.__name__}.op_version must be a positive integer, not {op_version!r}")
+    return op_type, op_version
+
+
+def _get_op_type_for_class(cls: Type[CustomOp]) -> str:
+    """The op_type of a CustomOp class (see op_identity)."""
+    return op_identity(cls)[0]
 
 
 def _get_op_version_for_class(cls: Type[CustomOp]) -> int:
-    """Extract version from a CustomOp class name.
-
-    Args:
-        cls: CustomOp class
-
-    Returns:
-        Opset version (defaults to 1 if no _vN suffix present)
-    """
-    name = cls.__name__
-    if "_v" in name:
-        parts = name.rsplit("_v", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            return int(parts[1])
-    return 1
+    """The since-version of a CustomOp class (see op_identity)."""
+    return op_identity(cls)[1]
 
 
-def _discover_from_custom_op_dict(module, op_type: str, domain: str) -> Dict[int, Type[CustomOp]]:
-    """Extract CustomOp versions from legacy custom_op dict (backward compatibility).
+def _exported_classes(module) -> List[Tuple[str, Type[CustomOp]]]:
+    """(exported name, class) for every CustomOp class a domain module exports.
 
-    Supports the old registration pattern:
+    Its __all__ (and, for backward compatibility, a legacy ``custom_op`` dict
+    beside it), else the legacy dict alone, else every class in the module.
+    The legacy dict pattern:
         custom_op = dict()
         custom_op["IntQuant"] = IntQuant
         custom_op["IntQuant_v2"] = IntQuant_v2
-
-    Args:
-        module: The imported module to check
-        op_type: The specific op type to discover
-        domain: The domain name (for warnings)
-
-    Returns:
-        Dict mapping version -> CustomOp class
     """
-    versions = {}
-
-    if not (hasattr(module, "custom_op") and isinstance(module.custom_op, dict)):
-        return versions
-
-    # Iterate all dict entries, filter by op_type
-    for key, obj in module.custom_op.items():
-        # Check if this dict key matches the requested op_type
-        base_name = key.split("_v")[0] if "_v" in key else key
-        if base_name != op_type:
-            continue
-
-        if not (inspect.isclass(obj) and issubclass(obj, CustomOp) and obj is not CustomOp):
-            continue
-
-        try:
-            version = _get_op_version_for_class(obj)
-        except ValueError as e:
-            warnings.warn(str(e))
-            continue
-
-        if version in versions:
-            warnings.warn(
-                f"Multiple classes found for {domain}.{op_type} version {version}: "
-                f"{versions[version].__name__} and {obj.__name__}. Using {obj.__name__}."
-            )
-        versions[version] = obj
-
-    return versions
+    legacy = getattr(module, "custom_op", None)
+    if not isinstance(legacy, dict):
+        legacy = None
+    if hasattr(module, "__all__"):
+        pairs = [(name, getattr(module, name, None)) for name in module.__all__]
+        if legacy is not None:
+            pairs += list(legacy.items())
+    elif legacy is not None:
+        pairs = list(legacy.items())
+    else:
+        pairs = inspect.getmembers(module, inspect.isclass)
+    return [(name, obj) for name, obj in pairs if inspect.isclass(obj) and issubclass(obj, CustomOp) and obj is not CustomOp]
 
 
 def _discover_custom_op_versions(domain: str, op_type: str) -> Dict[int, Type[CustomOp]]:
-    """Discover all versions of a SPECIFIC custom op without loading entire domain.
+    """All versions of one custom op that a domain's module exports.
 
-    Uses __all__ when available for efficient filtering, otherwise falls back to
-    full module inspection. Only loads classes matching the requested op_type.
+    Every exported class is identified by op_identity; those whose op_type
+    matches are returned by since-version.
 
     Args:
         domain: The ONNX domain name
@@ -165,78 +159,21 @@ def _discover_custom_op_versions(domain: str, op_type: str) -> Dict[int, Type[Cu
         Dict mapping version -> CustomOp class
     """
     module_path = resolve_domain(domain)
-    versions = {}
-
+    versions: Dict[int, Type[CustomOp]] = {}
     try:
         module = importlib.import_module(module_path)
     except ModuleNotFoundError:
         return versions
-
-    # Fast path: use __all__ to find only matching classes
-    if hasattr(module, "__all__"):
-        # Filter __all__ to find all versions of THIS op_type
-        # e.g., op_type="IntQuant" matches ["IntQuant", "IntQuant_v2", "IntQuant_v4"]
-        candidates = []
-        for name in module.__all__:
-            # Strip _vN suffix to check if it matches
-            base_name = name.split("_v")[0] if "_v" in name else name
-            if base_name == op_type:
-                candidates.append(name)
-
-        # Import ONLY the matching classes (lazy loading)
-        for name in candidates:
-            try:
-                obj = getattr(module, name)
-            except AttributeError:
-                continue
-
-            if not (inspect.isclass(obj) and issubclass(obj, CustomOp) and obj is not CustomOp):
-                continue
-
-            try:
-                version = _get_op_version_for_class(obj)
-            except ValueError as e:
-                warnings.warn(str(e))
-                continue
-
-            if version in versions:
-                warnings.warn(
-                    f"Multiple classes found for {domain}.{op_type} version {version}: "
-                    f"{versions[version].__name__} and {obj.__name__}. Using {obj.__name__}."
-                )
-            versions[version] = obj
-
-        # Backward compatibility: if __all__ didn't have the op, try custom_op dict
-        if not versions:
-            versions = _discover_from_custom_op_dict(module, op_type, domain)
-
-    else:
-        # No __all__ - try legacy dict first (O(1) check, cheaper than full scan)
-        versions = _discover_from_custom_op_dict(module, op_type, domain)
-
-        # Still nothing? Fallback to full module scan (for external modules)
-        if not versions:
-            for name, obj in inspect.getmembers(module, inspect.isclass):
-                if not issubclass(obj, CustomOp) or obj is CustomOp:
-                    continue
-
-                class_op_type = _get_op_type_for_class(obj)
-                if class_op_type != op_type:
-                    continue
-
-                try:
-                    version = _get_op_version_for_class(obj)
-                except ValueError as e:
-                    warnings.warn(str(e))
-                    continue
-
-                if version in versions:
-                    warnings.warn(
-                        f"Multiple classes found for {domain}.{op_type} version {version}: "
-                        f"{versions[version].__name__} and {obj.__name__}. Using {obj.__name__}."
-                    )
-                versions[version] = obj
-
+    for name, obj in _exported_classes(module):
+        cls_op_type, version = op_identity(obj, exported_as=name)
+        if cls_op_type != op_type:
+            continue
+        if version in versions and versions[version] is not obj:
+            warnings.warn(
+                f"Multiple classes found for {domain}.{op_type} version {version}: "
+                f"{versions[version].__name__} and {obj.__name__}. Using {obj.__name__}."
+            )
+        versions[version] = obj
     return versions
 
 
@@ -478,46 +415,25 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
     """
     module_path = resolve_domain(domain)
     ops_dict = {}
+    highest: Dict[str, int] = {}
 
     with _REGISTRY_LOCK:
         # Strategy 1: Get cached ops (fast path) - use highest version
         if domain in _OP_REGISTRY:
             for op_type, versions in _OP_REGISTRY[domain].items():
                 if versions:
-                    highest_version = max(versions.keys())
-                    ops_dict[op_type] = versions[highest_version]
+                    highest[op_type] = max(versions.keys())
+                    ops_dict[op_type] = versions[highest[op_type]]
 
-        # Strategy 2: Discover from module (for uncached ops)
-        # This uses full scan since we want ALL ops
+        # Strategy 2: Discover from module (for uncached ops), keeping the
+        # highest version of each op type
         try:
             module = importlib.import_module(module_path)
-
-            # Use __all__ if available for efficiency
-            if hasattr(module, "__all__"):
-                candidates = [(name, getattr(module, name, None)) for name in module.__all__]
-                candidates = [(n, obj) for n, obj in candidates if obj is not None]
-            else:
-                candidates = inspect.getmembers(module, inspect.isclass)
-
-            for name, obj in candidates:
-                if not (inspect.isclass(obj) and issubclass(obj, CustomOp) and obj is not CustomOp):
-                    continue
-
-                op_type = _get_op_type_for_class(obj)
-                try:
-                    version = _get_op_version_for_class(obj)
-                except ValueError:
-                    continue
-
-                # Keep highest version only
-                if op_type not in ops_dict:
+            for name, obj in _exported_classes(module):
+                op_type, version = op_identity(obj, exported_as=name)
+                if version > highest.get(op_type, 0):
+                    highest[op_type] = version
                     ops_dict[op_type] = obj
-                else:
-                    # Check if this version is higher
-                    existing_version = _get_op_version_for_class(ops_dict[op_type])
-                    if version > existing_version:
-                        ops_dict[op_type] = obj
-
         except ModuleNotFoundError:
             pass  # Domain doesn't exist as module, return cached ops only
 
