@@ -28,32 +28,96 @@
 
 
 import numpy as np
-from abc import ABC, abstractmethod
+import threading
+from abc import ABC, ABCMeta, abstractmethod
 from enum import Enum, EnumMeta
-from typing import Union
+from typing import Any, Dict, Union
+
+# One value per canonical name, for the datatypes defined in this module
+_INTERNED: Dict[str, "BaseDataType"] = {}
+_INTERN_LOCK = threading.Lock()
 
 
-class BaseDataType(ABC):
-    "Base class for QONNX data types."
+class _DataTypeValueMeta(ABCMeta):
+    """Makes the datatypes defined in this module values: an instance is frozen
+    once constructed, and constructing one returns the single instance for its
+    canonical name, so ``DataType["INT8"] is IntType(8, True)``."""
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        value = super().__call__(*args, **kwargs)
+        if cls.__module__ != __name__:
+            # a subclass defined elsewhere is not one of QONNX's values: it is
+            # left as constructed (none of its methods is called here), and
+            # resolution never returns it
+            return value
+        name = value.get_canonical_name()
+        object.__setattr__(value, "_name", name)
+        object.__setattr__(value, "_frozen", True)
+        with _INTERN_LOCK:
+            return _INTERNED.setdefault(name, value)
+
+
+def is_datatype(value: object) -> bool:
+    """Whether ``value`` is one of QONNX's datatype values (the instance its
+    canonical name resolves to).
+
+    Total: it calls no method of ``value``, so a str, an arbitrary object or a
+    BaseDataType subclass defined elsewhere is answered False without running
+    its code."""
+    try:
+        name = object.__getattribute__(value, "__dict__").get("_name")
+    except (AttributeError, TypeError):
+        return False
+    return type(name) is str and _INTERNED.get(name) is value
+
+
+class BaseDataType(ABC, metaclass=_DataTypeValueMeta):
+    """Base class for QONNX data types.
+
+    The datatypes defined in this module are values: immutable once
+    constructed, one instance per canonical name (copies and unpickled values
+    included), equal to another datatype exactly when the canonical names are
+    equal. Subclasses defined elsewhere are not interned or frozen."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(f"{self.name} is an immutable datatype value; cannot set {name}")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(f"{self.name} is an immutable datatype value; cannot delete {name}")
+        object.__delattr__(self, name)
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        # pickle, copy and deepcopy of a value resolve back to the one instance
+        if is_datatype(self):
+            return (resolve_datatype, (self.name,))
+        return super().__reduce_ex__(protocol)
 
     def signed(self) -> bool:
         "Returns whether this DataType can represent negative numbers."
         return self.min() < 0
 
     def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
         if isinstance(other, BaseDataType):
-            return self.get_canonical_name() == other.get_canonical_name()
+            return self.name == other.name
         elif isinstance(other, str):
-            return self.get_canonical_name() == other
+            return self.name == other
         else:
             return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self.get_canonical_name())
+        return hash(self.name)
 
     @property
     def name(self) -> str:
-        return self.get_canonical_name()
+        try:
+            return self._name
+        except AttributeError:
+            return self.get_canonical_name()
 
     def __repr__(self) -> str:
         return self.get_canonical_name()
@@ -484,10 +548,15 @@ class ScaledIntType(IntType):
 
 
 def resolve_datatype(name: str) -> BaseDataType:
+    """Return the datatype value a name denotes: the one instance for its
+    canonical name."""
     if not isinstance(name, str):
         raise TypeError(
             f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'"
         )
+    interned = _INTERNED.get(name)
+    if interned is not None:
+        return interned
 
     _special_types = {
         "BINARY": IntType(1, False),

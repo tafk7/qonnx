@@ -28,9 +28,11 @@
 
 import pytest
 
+import copy
 import numpy as np
+import pickle
 
-from qonnx.core.datatype import DataType, resolve_datatype
+from qonnx.core.datatype import BaseDataType, DataType, FixedPointType, IntType, is_datatype, resolve_datatype
 
 
 def test_datatypes():
@@ -410,3 +412,65 @@ def test_vectorized_allowed(datatype):
     produced_out = DataType[datatype].allowed(input_values)
     assert isinstance(produced_out, np.ndarray)
     assert np.all(golden_out == produced_out)
+
+
+class _Foreign(BaseDataType):
+    """A BaseDataType subclass defined outside qonnx, naming itself INT8."""
+
+    bitwidth = min = max = allowed = get_num_possible_values = None
+    is_integer = is_fixed_point = get_hls_datatype_str = to_numpy_dt = None
+
+    def get_canonical_name(self):
+        return "INT8"
+
+
+class _Exploding(_Foreign):
+    """A foreign subclass running caller code on any attribute access."""
+
+    def __getattribute__(self, name):
+        raise RuntimeError("caller code ran")
+
+
+@pytest.mark.parametrize(
+    "spelling, canonical",
+    [("INT8", "INT8"), ("UINT1", "BINARY"), ("FLOAT<4,3>", "FLOAT<4,3,7>"), ("FIXED<4,2", "FIXED<4,2>")],
+)
+def test_a_datatype_is_one_value_per_canonical_name(spelling, canonical):
+    value = DataType[spelling]
+    assert value is DataType[canonical] is resolve_datatype(canonical)
+    assert value.name == canonical
+    assert copy.copy(value) is value
+    assert copy.deepcopy(value) is value
+    assert copy.deepcopy([value])[0] is value
+    assert pickle.loads(pickle.dumps(value)) is value
+
+
+def test_constructing_a_datatype_returns_the_value():
+    assert IntType(8, True) is DataType["INT8"]
+    assert IntType(1, False) is DataType["BINARY"]
+    assert FixedPointType(8, 3) is DataType["FIXED<8,3>"]
+
+
+def test_a_datatype_is_immutable():
+    int8 = DataType["INT8"]
+    with pytest.raises(AttributeError, match="immutable"):
+        int8._bitwidth = 3
+    with pytest.raises(AttributeError, match="immutable"):
+        del int8._signed
+    assert DataType["INT8"].bitwidth() == 8 and DataType["INT8"].signed()
+
+
+def test_is_datatype_recognizes_values_without_calling_foreign_code():
+    assert is_datatype(DataType["INT8"]) and is_datatype(DataType["FIXED<4,2>"]) and is_datatype(DataType["BIPOLAR"])
+    for other in ["INT8", 8, None, object(), DataType, IntType, _Exploding(), _Foreign()]:
+        assert is_datatype(other) is False
+
+
+def test_a_foreign_subclass_is_left_as_constructed():
+    foreign = _Foreign()
+    assert foreign is not _Foreign()
+    assert foreign is not DataType["INT8"]
+    foreign._note = "mutable"
+    assert copy.copy(foreign) is not foreign and copy.copy(foreign)._note == "mutable"
+    # equal by name, as before; but not the value
+    assert foreign == DataType["INT8"]
