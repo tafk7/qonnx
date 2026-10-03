@@ -26,8 +26,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import pytest
+
 import numpy as np
 import onnx
+import os
 from pkgutil import get_data
 
 import qonnx.core.data_layout as DataLayout
@@ -69,6 +72,31 @@ def test_modelwrapper():
     model.set_tensor_sparsity(first_conv_iname, inp_sparsity)
     assert model.get_tensor_sparsity(first_conv_iname) == inp_sparsity
     assert model.get_opset_imports() == {"": 8}
+
+
+def test_modelwrapper_annotation_round_trip_and_literals_only():
+    """Layout and sparsity annotations round-trip as Python literals (including an
+    empty set), and reading one never evaluates code stored in the model."""
+    raw_m = get_data("qonnx.data", "onnx/mnist-conv/model.onnx")
+    model = ModelWrapper(raw_m)
+    tname = model.graph.input[0].name
+    for layout in [DataLayout.NCHW, DataLayout.NHWC, DataLayout.NC, DataLayout.UNKNOWN]:
+        model.set_tensor_layout(tname, layout)
+        assert model.get_tensor_layout(tname) == layout
+    sparsity = {1: {0, 2, 3}, 0: set(), "dw": {"kernel_shape": [3, 3]}}
+    model.set_tensor_sparsity(tname, sparsity)
+    assert model.get_tensor_sparsity(tname) == sparsity
+
+    probe = "QONNX_ANNOTATION_EVAL_PROBE"
+    os.environ.pop(probe, None)
+    code = f"[__import__('os').environ.setdefault('{probe}', 'ran')]"
+    for key, getter in [("tensor_layout", model.get_tensor_layout), ("tensor_sparsity", model.get_tensor_sparsity)]:
+        annotation = next(a for a in model.graph.quantization_annotation if a.tensor_name == tname)
+        entry = next(e for e in annotation.quant_parameter_tensor_names if e.key == key)
+        entry.value = code
+        with pytest.raises(ValueError, match=f"{key} annotation of tensor {tname}"):
+            getter(tname)
+        assert probe not in os.environ
 
 
 def test_modelwrapper_set_get_rm_initializer():
