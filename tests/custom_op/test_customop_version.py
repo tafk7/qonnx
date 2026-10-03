@@ -26,6 +26,8 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import pytest
+
 import onnx.parser as oprs
 
 from qonnx.core.modelwrapper import ModelWrapper
@@ -104,7 +106,8 @@ def test_customop_version():
     # if onnx is lacking the opset import, getCustomOp with no version
     # should return the highest available version
     model = make_vertest_model(1, True)
-    inst = getCustomOp(model.graph.node[0])
+    with pytest.warns(UserWarning, match="without the model's opset import"):
+        inst = getCustomOp(model.graph.node[0])
     # With no opset_import, getCustomOp(None) uses highest version -> v3
     assert isinstance(inst, VerTestOp_v3)
     # alternatively, when using ModelWrapper.get_customop_wrapper and onnx is
@@ -127,7 +130,8 @@ def test_customop_version():
         assert inst.onnx_opset_version == ver
     # getCustomOp with no version specified uses highest available
     model = make_vertest_model(1, False)
-    inst = getCustomOp(model.graph.node[0])
+    with pytest.warns(UserWarning, match="without the model's opset import"):
+        inst = getCustomOp(model.graph.node[0])
     assert isinstance(inst, VerTestOp_v3)  # highest version
     assert inst.onnx_opset_version == 3
     # requesting v4 should return largest available version (v3 in this case)
