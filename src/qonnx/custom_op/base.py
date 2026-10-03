@@ -64,6 +64,20 @@ class CustomOp(ABC):
 
         The registry automatically selects the highest version <= requested opset.
 
+        Which version a node was written against is the model's: a model
+        declares it per domain, by its opset import of the node's domain, as
+        ONNX does for its own operators (a node carries no version).
+        ``ModelWrapper.get_customop_wrapper`` (and InferShapes, InferDataTypes,
+        FoldConstants and execute_onnx through it) resolves from that import;
+        a domain the model does not import reads as version 1, with a warning.
+        Bare ``getCustomOp(node)`` has no model and takes the highest version
+        (warning when the op has more than one). A domain's current version is
+        ``registry.get_domain_opset_version(domain)`` (a module may state it as
+        ``opset_version``). A transformation that inserts an op of a versioned
+        domain imports the domain at that version if the model does not import
+        it yet, and otherwise uses the model's version: raising an existing
+        import would reinterpret every node of the domain already in the model.
+
         Example:
             class IntQuant(CustomOp):
                 pass  # Version 1 (no suffix)

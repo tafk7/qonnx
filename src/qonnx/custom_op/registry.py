@@ -203,6 +203,35 @@ def _versions(domain: str, op_type: str) -> Dict[int, Type[CustomOp]]:
     return _OP_REGISTRY.get(domain, {}).get(op_type, {})
 
 
+def get_domain_opset_version(domain: str) -> int:
+    """The current opset version of a custom op domain: the version a model
+    using the domain's newest ops imports it at.
+
+    A domain module may state it (``opset_version = N``); otherwise it is the
+    highest since-version among the ops the module exports and those registered
+    to the domain at run time.
+
+    Raises:
+        ModuleNotFoundError: If the domain's module cannot be imported
+        ValueError: If a stated opset_version is not an integer or is below an
+            op's since-version
+    """
+    module = importlib.import_module(resolve_domain(domain))
+    highest = 1
+    for name, obj in _exported_classes(module):
+        highest = max(highest, op_identity(obj, exported_as=name)[1])
+    with _REGISTRY_LOCK:
+        for versions in _OP_REGISTRY.get(domain, {}).values():
+            if versions:
+                highest = max(highest, max(versions))
+    stated = getattr(module, "opset_version", None)
+    if stated is None:
+        return highest
+    if type(stated) is not int or stated < highest:
+        raise ValueError(f"{domain}.opset_version = {stated!r} is below its ops' highest since-version {highest}")
+    return stated
+
+
 def _resolve_version(
     available_versions: Dict[int, Type[CustomOp]], requested_version: Optional[int]
 ) -> Tuple[int, Type[CustomOp]]:

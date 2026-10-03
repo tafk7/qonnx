@@ -28,7 +28,8 @@
 
 """Op identity in the custom-op registry: one rule for versioned names, an
 op_type/op_version stated in a class's own body (not inherited), and registered
-and exported versions merged, a duplicate refused."""
+and exported versions merged, a duplicate refused; a domain's opset version,
+and versions resolved from the model's opset import."""
 
 import pytest
 
@@ -38,15 +39,18 @@ import uuid
 import warnings
 from onnx import helper
 
+from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import (
     add_op_to_domain,
+    get_domain_opset_version,
     get_ops_in_domain,
     get_supported_versions,
     getCustomOp,
     op_identity,
     split_versioned_name,
 )
+from qonnx.util.basic import qonnx_make_model
 
 
 class _Op(CustomOp):
@@ -75,6 +79,17 @@ def _domain(**members):
     module.__all__ = [k for k in members if k != "opset_version"]
     sys.modules[name] = module
     return name
+
+
+def _model(domain, op_type, imported_version=None):
+    node = helper.make_node(op_type, ["x"], ["y"], domain=domain)
+    x = helper.make_tensor_value_info("x", 1, [1, 4])
+    y = helper.make_tensor_value_info("y", 1, [1, 4])
+    graph = helper.make_graph([node], "g", [x], [y])
+    opsets = [helper.make_opsetid("", 13)]
+    if imported_version is not None:
+        opsets.append(helper.make_opsetid(domain, imported_version))
+    return ModelWrapper(qonnx_make_model(graph, opset_imports=opsets))
 
 
 @pytest.mark.parametrize(
@@ -194,3 +209,41 @@ def test_a_bare_lookup_of_a_multi_version_op_warns():
         warnings.simplefilter("error")
         getCustomOp(helper.make_node("Qux", ["x"], ["y"], domain=domain), onnx_opset_version=1)
         getCustomOp(helper.make_node("Single", ["x"], ["y"], domain=domain))
+
+
+def test_domain_opset_version_is_stated_or_the_highest_since_version():
+    MatMul = type("MatMul", (_Op,), {})
+    MatMul_v6 = type("MatMul_v6", (_Op,), {})
+    Thresholding = type("Thresholding", (_Op,), {})
+    assert get_domain_opset_version(_domain(MatMul=MatMul, MatMul_v6=MatMul_v6, Thresholding=Thresholding)) == 6
+    assert get_domain_opset_version(_domain(MatMul=MatMul, MatMul_v6=MatMul_v6, opset_version=7)) == 7
+    with pytest.raises(ValueError, match="below"):
+        get_domain_opset_version(_domain(MatMul=MatMul, MatMul_v6=MatMul_v6, opset_version=5))
+    registered = _domain(MatMul=MatMul)
+    add_op_to_domain(registered, MatMul_v6)
+    assert get_domain_opset_version(registered) == 6
+
+
+def test_a_kernel_family_version_is_resolved_from_the_model_opset_import():
+    """A domain at opset 6 where MatMul changed at 6 and Thresholding never did:
+    a model importing the domain at 1 gets MatMul 1, at 6 or later MatMul 6;
+    Thresholding is version 1 in both. Bare getCustomOp has no model and takes
+    the highest version, with a warning."""
+    MatMul = type("MatMul", (_Op,), {"op_type": "MatMul", "op_version": 1})
+    MatMulV6 = type("MatMulV6", (_Op,), {"op_type": "MatMul", "op_version": 6})
+    Thresholding = type("Thresholding", (_Op,), {})
+    domain = _domain(MatMul=MatMul, MatMulV6=MatMulV6, Thresholding=Thresholding)
+
+    for imported, expected in [(1, MatMul), (5, MatMul), (6, MatMulV6), (9, MatMulV6)]:
+        model = _model(domain, "MatMul", imported)
+        inst = model.get_customop_wrapper(model.graph.node[0])
+        assert type(inst) is expected
+        assert inst.onnx_opset_version == op_identity(expected)[1]
+        model_t = _model(domain, "Thresholding", imported)
+        assert type(model_t.get_customop_wrapper(model_t.graph.node[0])) is Thresholding
+
+    model = _model(domain, "MatMul", None)
+    with pytest.warns(UserWarning, match="not found in model opset imports"):
+        assert type(model.get_customop_wrapper(model.graph.node[0])) is MatMul
+    with pytest.warns(UserWarning, match="without the model's opset"):
+        assert type(getCustomOp(model.graph.node[0])) is MatMulV6

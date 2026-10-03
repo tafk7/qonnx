@@ -45,6 +45,15 @@ Custom Operations/Nodes
 
 QONNX uses many custom operations (op_type in ONNX NodeProto) that are not defined in the ONNX operator schema. These custom nodes are marked with domain="qonnx.*" in the protobuf to identify them as such. These nodes can represent specific operations that we need for low-bit networks, or operations that are specific to a particular hardware backend. To get more familiar with custom operations and how they are created, please take a look in the Jupyter notebook about CustomOps (see chapter :ref:`tutorials` for details) or directly in the module :py:mod:`qonnx.custom_op`.
 
+Custom op versions
+------------------
+
+A custom op domain is a Python module (or a module registered for it with ``add_domain_alias``) that exports the op classes, and custom ops are versioned the way ONNX versions its own operators. A class is identified by the name it is exported under, ``OpType_vN`` for op type ``OpType`` since version ``N`` and any other name for version 1, unless it states ``op_type`` and/or ``op_version`` in its own class body (a stated identity is not inherited by subclasses).
+
+Which version a node was written against is declared by the model, per domain: its opset import of the node's domain. A node resolves to the highest since-version of its op that is not above that import. ``ModelWrapper.get_customop_wrapper(node)``, and the transformations and execution that use it, resolve this way; a domain the model does not import reads as version 1, with a warning. ``getCustomOp(node)`` has no model and takes the highest version, with a warning for an op that has more than one, so code holding the model should use ``get_customop_wrapper``.
+
+A domain's current version is ``qonnx.custom_op.registry.get_domain_opset_version(domain)``: the module's ``opset_version`` if it states one, else the highest since-version of its ops. A transformation that inserts an op of a versioned domain imports the domain at that version if the model does not import it yet, and otherwise keeps the model's import: raising it would reinterpret every node of the domain already in the model.
+
 
 Custom ONNX Execution Flow
 ==========================
