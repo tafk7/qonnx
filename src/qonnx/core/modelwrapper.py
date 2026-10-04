@@ -106,6 +106,8 @@ class ModelWrapper:
                 )
             else:
                 self._model_proto: ModelProto = cast(ModelProto, onnx_model_proto)
+        # the wrapper this one is a subgraph body of (make_subgraph_modelwrapper)
+        self._parent: ModelWrapper | None = None
         self.temporary_fix_oldstyle_domain()
         if fix_missing_initializer_valueinfo:
             self.check_all_tensor_shapes_specified(fix_missing_init_shape=True)
@@ -133,6 +135,15 @@ class ModelWrapper:
                 """Some old-style domain attributes were automatically converted to new-style,
                 i.e. domain=finn to domain=qonnx.custom_op.<general|fpgadataflow|...>"""
             )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> ModelWrapper:
+        """A deep copy of the model; a body's copy stays a body of the same parent
+        (the parent is not copied)."""
+        clone = type(self).__new__(type(self))
+        memo[id(self)] = clone
+        for name, value in self.__dict__.items():
+            setattr(clone, name, value if name == "_parent" else copy.deepcopy(value, memo))
+        return clone
 
     @property
     def graph(self) -> onnx.GraphProto:
@@ -256,6 +267,8 @@ class ModelWrapper:
             (transformed_model, model_was_changed) = transformation.apply(
                 transformed_model
             )
+            # a transformed body, even in a new wrapper, is a body of the same parent
+            transformed_model._parent = self._parent
         if cleanup:
             transformed_model.cleanup()
 
@@ -287,11 +300,17 @@ class ModelWrapper:
         return transformed_model
 
     def make_subgraph_modelwrapper(self, subgraph: GraphProto) -> ModelWrapper:
-        return ModelWrapper(
+        """A ModelWrapper of (a copy of) a subgraph body of this model, with this
+        model's opset imports. The body reads a key of an inheriting metadata
+        namespace (qonnx.core.metadata) it does not state itself from this model.
+        """
+        body = ModelWrapper(
             util.qonnx_make_model(
                 subgraph, opset_imports=self._model_proto.opset_import
             )
         )
+        body._parent = self
+        return body
 
     def has_tensor_datatype(self, tensor_name: str) -> bool:
         """Whether the tensor with given name carries a QONNX DataType
@@ -795,8 +814,33 @@ class ModelWrapper:
 
     def namespace(self, namespace: metadata.Namespace) -> dict[str, Any]:
         """Every key of a typed metadata namespace the graph states, decoded, by
-        key name in declaration order."""
-        return metadata.read(self.graph.metadata_props, namespace)
+        key name in declaration order. For a subgraph body (make_subgraph_modelwrapper)
+        and an inheriting namespace, a key the body does not state is read from
+        the model it is a body of."""
+        own = metadata.read(self.graph.metadata_props, namespace)
+        if not namespace.inherit or self._parent is None:
+            return own
+        values = {**self._parent.namespace(namespace), **own}
+        return {name: values[name] for name in namespace.keys if name in values}
+
+    def inherit_metadata(
+        self, *namespaces: metadata.Namespace, parent: ModelWrapper | None = None
+    ) -> None:
+        """Copy into this graph the keys of the given inheriting namespaces that it
+        does not state itself, as ``parent`` reads them (by default, the model this
+        is a body of). A body reads inherited keys only while it is opened through
+        make_subgraph_modelwrapper; a body that is to stand alone (saved, or
+        extracted into a model of its own) carries them this way."""
+        source = self._parent if parent is None else parent
+        if source is None:
+            raise ValueError("inherit_metadata: this model is no subgraph body; name the parent")
+        for namespace in namespaces:
+            if not namespace.inherit:
+                raise ValueError(f"inherit_metadata: namespace {namespace.name} does not inherit")
+            own = metadata.read(self.graph.metadata_props, namespace)
+            for name, value in source.namespace(namespace).items():
+                if name not in own:
+                    self.set(namespace.keys[name], value)
 
     def get_nodes_by_op_type(self, op_type: str) -> list[NodeProto]:
         """Returns a list of nodes with specified op_type."""

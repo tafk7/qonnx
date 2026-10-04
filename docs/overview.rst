@@ -173,6 +173,8 @@ A graph's ``metadata_props`` hold string keys and string values (``get_metadata_
 
 A key's type is ``str``, ``int``, ``float``, ``bool``, an ``Enum`` subclass (stored by member name) or ``JSON``; each key is one entry ``<namespace>/<key>`` holding the type's canonical text, so the metadata stays readable in ONNX tools. Nothing coerces: a malformed stored value, a value of the wrong type, a stored key the namespace does not declare, or a version the reader cannot upgrade from raises ``MetadataError``. A namespace changed incompatibly raises its version and registers an upgrade from the earlier one (``BOARD.upgrade(1, function)``); readers upgrade what they read, and writers rewrite the namespace at the current version.
 
+Transformations that edit the graph in place keep its metadata; ``MergeONNXModels`` keeps both graphs' (a typed key the two state differently raises ``MetadataError``). A subgraph body (a graph attribute) holds metadata of its own. A namespace declared with ``inherit=True`` reaches into bodies: a body opened with ``make_subgraph_modelwrapper`` (as ``transform(..., apply_to_subgraphs=True)`` does) reads a key it does not state itself from the model it is a body of. A body read alone has only its own keys, so code that extracts a body to stand alone copies them in first with ``body.inherit_metadata(namespace)`` (or ``inherit_metadata(namespace, parent=model)`` for a model built apart from its parent).
+
 ModelWrapper contains more useful functions, if you are interested please have a look at the ModelWrapper module (:py:mod:`qonnx.core.modelwrapper.ModelWrapper`) directly.
 
 
