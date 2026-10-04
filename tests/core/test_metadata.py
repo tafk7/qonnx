@@ -28,11 +28,16 @@
 
 import pytest
 
+import copy
 from enum import Enum
-from onnx import GraphProto, StringStringEntryProto
+from onnx import GraphProto, StringStringEntryProto, TensorProto, helper
 
 from qonnx.core import metadata
 from qonnx.core.metadata import JSON, MetadataError, Namespace
+from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.transformation.general import GiveUniqueNodeNames
+from qonnx.transformation.infer_shapes import InferShapes
+from qonnx.util.basic import qonnx_make_model
 
 
 class Block(Enum):
@@ -261,3 +266,43 @@ def test_declarations_are_checked():
         ns.key("@version", int)
     with pytest.raises(TypeError, match="a metadata key's type"):
         ns.key("l", list)
+
+
+def make_model():
+    inp = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+    out = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+    graph = helper.make_graph([helper.make_node("Relu", ["x"], ["y"])], "g", [inp], [out])
+    return ModelWrapper(qonnx_make_model(graph))
+
+
+def test_modelwrapper_reads_and_writes_typed_keys_on_the_graph(tmp_path):
+    ns, k = make_namespace()
+    model = make_model()
+    assert model.get(k["period"]) is None and model.namespace(ns) == {}
+    model.set(k["period"], 5.0)
+    model.set(k["block"], Block.SMALL)
+    model.set_metadata_prop("untyped", "kept")
+    assert model.get(k["period"]) == 5.0
+    assert model.namespace(ns) == {"block": Block.SMALL, "period": 5.0}
+    assert model.get_metadata_prop("test.platform/period") == "5.0"
+    assert len(model.model.metadata_props) == 0  # the ModelProto's stay untouched
+    model.save(tmp_path / "m.onnx")
+    loaded = ModelWrapper(str(tmp_path / "m.onnx"))
+    assert loaded.namespace(ns) == {"block": Block.SMALL, "period": 5.0}
+    assert copy.deepcopy(loaded).get(k["block"]) is Block.SMALL
+    transformed = loaded.transform(InferShapes()).transform(GiveUniqueNodeNames())
+    assert transformed.get(k["period"]) == 5.0
+    loaded.delete(k["period"])
+    assert loaded.namespace(ns) == {"block": Block.SMALL}
+    assert loaded.get_metadata_prop("untyped") == "kept"
+
+
+def test_modelwrapper_refuses_what_the_namespace_refuses():
+    ns, k = make_namespace()
+    model = make_model()
+    with pytest.raises(MetadataError, match="cannot store 'fast'"):
+        model.set(k["period"], "fast")
+    model.set_metadata_prop("test.platform/@version", "1")
+    model.set_metadata_prop("test.platform/period", "fast")
+    with pytest.raises(MetadataError, match="test.platform/period: stored 'fast'"):
+        model.get(k["part"])  # a namespace is read whole

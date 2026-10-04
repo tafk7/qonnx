@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 import qonnx.util.basic as util
 import qonnx.util.onnx as onnxutil
+from qonnx.core import metadata
 from qonnx.core.datatype import BaseDataType, DataType
 from qonnx.custom_op.registry import getCustomOp, is_custom_op
 from qonnx.transformation.double_to_single_float import DoubleToSingleFloat
@@ -775,6 +776,27 @@ class ModelWrapper:
             self.model.graph.metadata_props.append(metadata_prop)
         else:
             metadata_prop.value = value
+
+    def get(self, key: metadata.Key[T]) -> T | None:
+        """The value of a typed metadata key (:py:mod:`qonnx.core.metadata`), or
+        None when the graph does not state it. Raises MetadataError when the
+        key's namespace is stored malformed."""
+        return self.namespace(key.namespace).get(key.name)
+
+    def set(self, key: metadata.Key[T], value: T) -> None:
+        """Store a value under a typed metadata key, with its namespace's version.
+        Raises MetadataError for a value the key does not admit."""
+        metadata.write(self.graph.metadata_props, key, value)
+
+    def delete(self, key: metadata.Key[Any]) -> None:
+        """Remove a typed metadata key (and its namespace's version with the last
+        key); nothing happens when the graph does not state it."""
+        metadata.delete(self.graph.metadata_props, key)
+
+    def namespace(self, namespace: metadata.Namespace) -> dict[str, Any]:
+        """Every key of a typed metadata namespace the graph states, decoded, by
+        key name in declaration order."""
+        return metadata.read(self.graph.metadata_props, namespace)
 
     def get_nodes_by_op_type(self, op_type: str) -> list[NodeProto]:
         """Returns a list of nodes with specified op_type."""
