@@ -351,6 +351,25 @@ def delete(props: Props, key: Key[Any]) -> None:
         _rewrite(props, key.namespace, entries)
 
 
+def merge(main: Iterable[StringStringEntryProto], other: Iterable[StringStringEntryProto]) -> list[StringStringEntryProto]:
+    """The entries of two graphs merged into one: all of ``main``'s, then those of
+    ``other`` that ``main`` does not state. A key both state with different text is
+    taken from ``main``, unless it belongs to a typed namespace (one either graph
+    stores with a version): then MetadataError, as the two graphs disagree on a fact
+    (a namespace stored at two versions disagrees on its version entry)."""
+    main, other = list(main), list(other)
+    typed = {prop.key[: -len(SEPARATOR + VERSION)] for prop in main + other if prop.key.endswith(SEPARATOR + VERSION)}
+    stated = {prop.key: prop.value for prop in main}
+    merged = [StringStringEntryProto(key=prop.key, value=prop.value) for prop in main]
+    for prop in other:
+        if prop.key not in stated:
+            merged.append(StringStringEntryProto(key=prop.key, value=prop.value))
+            stated[prop.key] = prop.value
+        elif stated[prop.key] != prop.value and prop.key.split(SEPARATOR, 1)[0] in typed:
+            raise MetadataError(f"{prop.key}: the graphs merged state {stated[prop.key]!r} and {prop.value!r}")
+    return merged
+
+
 __all__ = [
     "BOOL",
     "Codec",
@@ -363,6 +382,7 @@ __all__ = [
     "STR",
     "delete",
     "enumeration",
+    "merge",
     "read",
     "write",
 ]

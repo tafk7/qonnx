@@ -306,3 +306,21 @@ def test_modelwrapper_refuses_what_the_namespace_refuses():
     model.set_metadata_prop("test.platform/period", "fast")
     with pytest.raises(MetadataError, match="test.platform/period: stored 'fast'"):
         model.get(k["part"])  # a namespace is read whole
+
+
+def test_merge_takes_main_then_other_and_refuses_a_namespace_at_two_versions():
+    main, other = GraphProto(), GraphProto()
+    store(main, a="main", **{"test.platform/@version": "1", "test.platform/part": "x"})
+    store(other, a="other", b="other", **{"test.platform/@version": "1", "test.platform/ports": "2"})
+    merged = metadata.merge(main.metadata_props, other.metadata_props)
+    assert [(p.key, p.value) for p in merged] == [
+        ("a", "main"),
+        ("test.platform/@version", "1"),
+        ("test.platform/part", "x"),
+        ("b", "other"),
+        ("test.platform/ports", "2"),
+    ]
+    newer = GraphProto()
+    store(newer, **{"test.platform/@version": "2"})
+    with pytest.raises(MetadataError, match="test.platform/@version: the graphs merged state '1' and '2'"):
+        metadata.merge(main.metadata_props, newer.metadata_props)

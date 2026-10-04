@@ -26,6 +26,8 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import pytest
+
 import numpy as np
 import onnx
 import onnx.numpy_helper as np_helper
@@ -34,6 +36,7 @@ from pkgutil import get_data
 
 import qonnx.core.onnx_exec as oxe
 from qonnx.core.datatype import DataType
+from qonnx.core.metadata import MetadataError, Namespace
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.general import GiveReadableTensorNames, GiveUniqueNodeNames
 from qonnx.transformation.infer_data_layouts import InferDataLayouts
@@ -125,3 +128,39 @@ def test_merge_onnx_models():
     assert model_transformed.get_tensor_datatype("global_in") == DataType["UINT8"]
     # check that the merged model uses the greater of the two input opsets
     assert model_transformed.model.opset_import[0].version == exp_opset_id
+
+
+def make_relu_model(name):
+    inp = helper.make_tensor_value_info(f"{name}_in", TensorProto.FLOAT, [1, 4])
+    outp = helper.make_tensor_value_info(f"{name}_out", TensorProto.FLOAT, [1, 4])
+    graph = helper.make_graph([helper.make_node("Relu", [f"{name}_in"], [f"{name}_out"])], name, [inp], [outp])
+    return ModelWrapper(qonnx_make_model(graph, opset_imports=[helper.make_opsetid("", 13)]))
+
+
+BOARD = Namespace("test.board", version=1)
+PERIOD = BOARD.key("period_ns", float)
+PART = BOARD.key("part", str)
+
+
+def test_merge_onnx_models_keeps_both_graphs_metadata():
+    pre, post = make_relu_model("pre"), make_relu_model("post")
+    pre.set(PART, "xc7z020")
+    pre.set_metadata_prop("only_pre", "a")
+    pre.set_metadata_prop("both", "pre")
+    post.set(PERIOD, 5.0)
+    post.set(PART, "xc7z020")
+    post.set_metadata_prop("both", "post")
+    merged = post.transform(MergeONNXModels(pre))
+    assert merged.namespace(BOARD) == {"period_ns": 5.0, "part": "xc7z020"}
+    assert merged.get_metadata_prop("only_pre") == "a"
+    assert merged.get_metadata_prop("both") == "post"  # the main model's untyped key wins
+    # a pre model without metadata leaves the main model's
+    assert post.transform(MergeONNXModels(make_relu_model("bare"))).get(PERIOD) == 5.0
+
+
+def test_merge_onnx_models_refuses_a_typed_key_stated_differently():
+    pre, post = make_relu_model("pre"), make_relu_model("post")
+    pre.set(PERIOD, 4.0)
+    post.set(PERIOD, 5.0)
+    with pytest.raises(MetadataError, match="test.board/period_ns: the graphs merged state '5.0' and '4.0'"):
+        post.transform(MergeONNXModels(pre))
