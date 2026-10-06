@@ -48,11 +48,7 @@ QONNX uses many custom operations (op_type in ONNX NodeProto) that are not defin
 Custom op versions
 ------------------
 
-A custom op domain is a Python module (or a module registered for it with ``add_domain_alias``) that exports the op classes, and custom ops are versioned the way ONNX versions its own operators. A class is identified by the name it is exported under, ``OpType_vN`` for op type ``OpType`` since version ``N`` and any other name for version 1, unless it states ``op_type`` and/or ``op_version`` in its own class body (a stated identity is not inherited by subclasses).
-
-Which version a node was written against is declared by the model, per domain: its opset import of the node's domain. A node resolves to the highest since-version of its op that is not above that import. ``ModelWrapper.get_customop_wrapper(node)``, and the transformations and execution that use it, resolve this way; a domain the model does not import reads as version 1, with a warning. ``getCustomOp(node)`` has no model and takes the highest version, with a warning for an op that has more than one, so code holding the model should use ``get_customop_wrapper``.
-
-A domain's current version is ``qonnx.custom_op.registry.get_domain_opset_version(domain)``: the module's ``opset_version`` if it states one, else the highest since-version of its ops. A transformation that inserts an op of a versioned domain imports the domain at that version if the model does not import it yet, and otherwise keeps the model's import: raising it would reinterpret every node of the domain already in the model.
+A custom op domain is a Python module (or a module registered for it with ``add_domain_alias``) that exports the op classes, and custom ops are versioned the way ONNX versions its own operators: a model's opset import of a domain declares which version its nodes of that domain were written against. How a class's op type and version are named, how a node resolves to a version, and a domain's current version (``qonnx.custom_op.registry.get_domain_opset_version``) are documented on :py:class:`qonnx.custom_op.base.CustomOp`. Code holding the model gets an op through ``ModelWrapper.get_customop_wrapper(node)``, which resolves from the model's import; bare ``getCustomOp(node)`` cannot.
 
 
 Custom ONNX Execution Flow

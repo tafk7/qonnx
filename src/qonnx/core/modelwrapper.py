@@ -972,17 +972,11 @@ class ModelWrapper:
     def get_customop_wrapper(
         self, node, fallback_customop_version=util.get_preferred_qonnx_opset()
     ):
-        """Return CustomOp instance for given node, respecting the
-        imported opset version in the model protobuf. If the node's domain
-        is not found in the model's opset imports, fallback_customop_version
-        will be used.
-
-        For ops that declare wants_model=True, this model is attached to the
-        instance (via attach_model) so they can answer graph-derived queries;
-        ops with wants_model=False are returned exactly as getCustomOp built
-        them. Every call builds a new instance; one attached here answers from
-        this ModelWrapper only, so after a transformation (which returns a copy)
-        ask the transformed model for a new instance.
+        """Return a new CustomOp instance for the given node, of the version the
+        model's opset import of the node's domain selects; for a domain the model
+        does not import, fallback_customop_version, with a warning. An op that
+        declares wants_model=True is attached to this model. Both rules, and an
+        attached instance's lifetime, are CustomOp's (qonnx.custom_op.base).
 
         Raises the registry's KeyError if the domain has no op of this type."""
         opset_imports = self.get_opset_imports()
