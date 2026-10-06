@@ -118,6 +118,15 @@ class TensorValueSummary:
     contains_zero: bool
 
     def __post_init__(self) -> None:
+        self._check_fields()
+        if self.minimum is None or self.maximum is None:
+            self._check_absent_range()
+        else:
+            self._check_range(self.minimum, self.maximum)
+
+    def _check_fields(self) -> None:
+        """Each field on its own: the digest's form, the count, the flags' type,
+        and both extrema present or both absent."""
         if not _DIGEST_PATTERN.fullmatch(self.content_digest):
             raise ValueError(
                 "content_digest must be %d lowercase hex characters, got %r" % (_DIGEST_LENGTH, self.content_digest)
@@ -127,44 +136,48 @@ class TensorValueSummary:
         for flag_name in ("is_integral", "contains_zero"):
             if type(getattr(self, flag_name)) is not bool:
                 raise ValueError("%s must be a bool, got %r" % (flag_name, getattr(self, flag_name)))
-        minimum, maximum = self.minimum, self.maximum
-        if (minimum is None) != (maximum is None):
+        if (self.minimum is None) != (self.maximum is None):
             raise ValueError("minimum and maximum must be both present or both absent")
-        if minimum is None or maximum is None:
-            if self.contains_zero:
-                raise ValueError("contains_zero cannot be True without an observed range")
-            # an empty tensor is vacuously integral; a non-empty one with no
-            # comparable value is all-NaN, which is not integral
-            if self.element_count == 0 and not self.is_integral:
-                raise ValueError("an empty tensor is vacuously integral, so is_integral must be True")
-            if self.element_count > 0 and self.is_integral:
-                raise ValueError("a non-empty tensor with no observed range is all-NaN, so is_integral must be False")
-            return
-        for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
-            if type(bound) not in (int, float):
-                raise ValueError("%s must be an int or float, got %r" % (bound_name, bound))
-            if isinstance(bound, float) and math.isnan(bound):
-                # the factory excludes NaN from the range, so a NaN bound
-                # contradicts the contract rather than reporting a fact
-                raise ValueError("%s must not be NaN" % bound_name)
+
+    def _check_absent_range(self) -> None:
+        """No observed range: an empty tensor (vacuously integral) or an all-NaN
+        one (not integral), and no zero observed."""
+        if self.contains_zero:
+            raise ValueError("contains_zero cannot be True without an observed range")
+        if self.element_count == 0 and not self.is_integral:
+            raise ValueError("an empty tensor is vacuously integral, so is_integral must be True")
+        if self.element_count > 0 and self.is_integral:
+            raise ValueError("a non-empty tensor with no observed range is all-NaN, so is_integral must be False")
+
+    def _check_range(self, minimum: Union[int, float], maximum: Union[int, float]) -> None:
+        """An observed range: two observed values (_check_bound) of a nonempty
+        tensor, ordered, and consistent with contains_zero."""
+        _check_bound("minimum", minimum, self.is_integral)
+        _check_bound("maximum", maximum, self.is_integral)
         if self.element_count == 0:
             raise ValueError("an empty tensor cannot have an observed range")
         if minimum > maximum:
             raise ValueError("minimum %r exceeds maximum %r" % (minimum, maximum))
-        if self.is_integral:
-            if not (math.isfinite(minimum) and math.isfinite(maximum)):
-                raise ValueError("is_integral cannot be True for a non-finite range")
-            for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
-                # the extrema are themselves observed values
-                if bound != int(bound):
-                    raise ValueError("is_integral is True but %s %r is not integral" % (bound_name, bound))
         if minimum > 0 or maximum < 0:
             if self.contains_zero:
                 raise ValueError("contains_zero is True but zero lies outside [%r, %r]" % (minimum, maximum))
-        elif minimum == 0 or maximum == 0:
+        elif (minimum == 0 or maximum == 0) and not self.contains_zero:
             # zero is an extremum, so it was necessarily observed
-            if not self.contains_zero:
-                raise ValueError("contains_zero must be True when zero is an observed extremum")
+            raise ValueError("contains_zero must be True when zero is an observed extremum")
+
+
+def _check_bound(name: str, bound: Union[int, float], is_integral: bool) -> None:
+    """An extremum is an observed value: an int or float, not NaN (the factory
+    excludes NaN from the range), and finite and integral if every value is."""
+    if type(bound) not in (int, float):
+        raise ValueError("%s must be an int or float, got %r" % (name, bound))
+    if isinstance(bound, float) and math.isnan(bound):
+        raise ValueError("%s must not be NaN" % name)
+    if is_integral:
+        if not math.isfinite(bound):
+            raise ValueError("is_integral cannot be True for a non-finite range")
+        if bound != int(bound):
+            raise ValueError("is_integral is True but %s %r is not integral" % (name, bound))
 
 
 def _is_summarizable_dtype(dtype: np.dtype) -> bool:
