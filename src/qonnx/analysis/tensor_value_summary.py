@@ -55,8 +55,6 @@ from dataclasses import dataclass
 from onnx import numpy_helper
 from typing import TYPE_CHECKING, Any, Union, cast
 
-from qonnx.core.datatype import BaseDataType, BipolarType, DataType, IntType, TernaryType, resolve_datatype
-
 if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
 
@@ -95,8 +93,7 @@ class TensorValueSummary:
       authorize a zero-range storage optimization.
     * ``is_integral``: every element is finite and has an integral value.
       ``False`` if any NaN or infinity is present. Vacuously ``True`` for an
-      empty tensor, which
-      :func:`smallest_lossless_integer_datatype` still refuses.
+      empty tensor.
     * ``contains_zero``: at least one element is exactly zero (``-0.0``
       counts). A range alone cannot answer this, and datatypes with a
       non-contiguous domain need it: ``BIPOLAR`` admits ``{-1, +1}`` and
@@ -170,8 +167,18 @@ class TensorValueSummary:
                 raise ValueError("contains_zero must be True when zero is an observed extremum")
 
 
-def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
-    """Returns whether values of this numpy dtype can be summarized soundly.
+def _is_summarizable_dtype(dtype: np.dtype) -> bool:
+    """Whether values of this numpy dtype can be summarized soundly (see
+    summarize_tensor_values)."""
+    if dtype.fields is not None or dtype.subdtype is not None:
+        return False
+    if dtype.kind == "f":
+        return dtype.itemsize in _SUPPORTED_FLOAT_ITEM_SIZES
+    return dtype.kind in _SUPPORTED_NON_FLOAT_KINDS
+
+
+def summarize_tensor_values(array: npt.NDArray[Any]) -> TensorValueSummary:
+    """Summarizes the values of an in-memory tensor.
 
     Supported: signed and unsigned integers, IEEE floating point with 16, 32,
     or 64 bits, and booleans. A platform type such as ``longdouble`` is
@@ -189,22 +196,11 @@ def is_summarizable_dtype(dtype: npt.DTypeLike) -> bool:
     those names: the exclusion is a property of the packed bytes numpy hands
     back, not of the datatype being inexpressible. Decoding those encodings
     into ordinary arrays would lift the exclusion without changing any value
-    in this module's contract."""
-    resolved = np.dtype(dtype)
-    if resolved.fields is not None or resolved.subdtype is not None:
-        return False
-    if resolved.kind == "f":
-        return resolved.itemsize in _SUPPORTED_FLOAT_ITEM_SIZES
-    return resolved.kind in _SUPPORTED_NON_FLOAT_KINDS
+    in this module's contract.
 
-
-def summarize_tensor_values(array: npt.NDArray[Any]) -> TensorValueSummary:
-    """Summarizes the values of an in-memory tensor.
-
-    Raises :class:`UnsupportedTensorValueError` if the array's dtype is not
-    supported by :func:`is_summarizable_dtype`."""
+    Raises :class:`UnsupportedTensorValueError` for an unsupported dtype."""
     array = np.asarray(array)
-    if not is_summarizable_dtype(array.dtype):
+    if not _is_summarizable_dtype(array.dtype):
         raise UnsupportedTensorValueError(
             "Cannot summarize tensor values of dtype %s: only integer, "
             "16/32/64-bit IEEE floating point and boolean tensors are supported." % str(array.dtype)
@@ -284,84 +280,3 @@ def initializer_value_summaries(model: "ModelWrapper") -> dict[str, TensorValueS
         array = numpy_helper.to_array(initializer)
         summaries[initializer.name] = summarize_tensor_values(array)
     return summaries
-
-
-def _lossless_candidates() -> list[BaseDataType]:
-    """Integer-valued candidate datatypes, genuinely narrowest first.
-
-    ``DataType.get_accumulator_dt_cands()`` is grouped by family, not ordered
-    by width: it lists every ``UINT`` before ``TERNARY`` and every ``INT``
-    after it, so a linear scan can return a 2-bit ``TERNARY`` for a range that
-    1-bit ``INT1`` already represents. Sort by bit width so that "smallest"
-    means smallest, and break ties by the original order, which keeps QONNX's
-    established preference for unsigned and for the small named types.
-
-    Fixed-point, scaled-integer and arbitrary-precision float datatypes are
-    not candidates: their losslessness depends on a scale factor or on
-    individual mantissas, neither of which a value summary carries."""
-    candidates = [resolve_datatype(name) for name in DataType.get_accumulator_dt_cands()]
-    indexed = tuple(enumerate(candidates))
-    return [datatype for _index, datatype in sorted(indexed, key=lambda item: (item[1].bitwidth(), item[0]))]
-
-
-def _admits(datatype: BaseDataType, summary: TensorValueSummary) -> bool:
-    """Whether an integer-valued candidate represents every observed value.
-
-    Range containment alone is not the right test: ``BIPOLAR`` and ``TERNARY``
-    share the range ``[-1, +1]`` but ``BIPOLAR`` excludes zero, so a tensor
-    holding ``{-1, 0, +1}`` is inside ``BIPOLAR``'s range while being outside
-    its domain.
-
-    The caller has already established that the summary has a finite integral
-    range, and every candidate is integer-valued, so the question is decidable
-    here. It is not decidable for datatypes in general, which is why this stays
-    private and narrow rather than becoming a public compatibility predicate."""
-    minimum, maximum = summary.minimum, summary.maximum
-    if minimum is None or maximum is None or not summary.is_integral:
-        raise ValueError("_admits requires a summary with a finite integral range")
-    if isinstance(datatype, BipolarType):
-        return minimum >= -1 and maximum <= 1 and not summary.contains_zero
-    if isinstance(datatype, TernaryType):
-        return minimum >= -1 and maximum <= 1
-    if isinstance(datatype, IntType):
-        # every integer between an IntType's bounds is representable
-        return bool(datatype.min() <= minimum and maximum <= datatype.max())
-    raise ValueError("%s is not an integer-valued candidate datatype" % datatype)
-
-
-def smallest_lossless_integer_datatype(summary: TensorValueSummary) -> BaseDataType | None:
-    """Returns the narrowest integer-valued QONNX datatype that represents
-    every observed value, or ``None`` when no such datatype exists.
-
-    The answer is derived from observed values alone. It takes no declared
-    datatype, because a summary cannot soundly validate one: a value can sit
-    inside ``FLOAT16``'s range while needing more mantissa than ``FLOAT16``
-    has, so range containment would prove nothing and trusting the declaration
-    would smuggle an unchecked assumption into a value-derived fact. A
-    declared datatype that cannot hold its own tensor is a source-model
-    inconsistency for the consumer to detect, not a case for this helper.
-    Consumers constrain or validate this answer against the declared logical
-    datatype themselves.
-
-    The name states the domain deliberately. A summary carries a range and a
-    few membership facts, which is enough to prove losslessness for
-    integer-valued datatypes and not enough for fractional ones.
-
-    ``None`` -- an explicit refusal rather than an optimistic approximation --
-    is returned when:
-
-    * the tensor is empty, so no value was observed;
-    * ``minimum``/``maximum`` are absent (every element is NaN);
-    * the values are not all finite and integral, so no integer-valued
-      datatype represents them; or
-    * the observed values exceed the 64-bit candidates."""
-    if summary.element_count == 0:
-        return None
-    if summary.minimum is None or summary.maximum is None:
-        return None
-    if not summary.is_integral:
-        return None
-    for candidate in _lossless_candidates():
-        if _admits(candidate, summary):
-            return candidate
-    return None

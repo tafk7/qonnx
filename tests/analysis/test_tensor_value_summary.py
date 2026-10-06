@@ -29,7 +29,6 @@
 import pytest
 
 import dataclasses
-import inspect
 import numpy as np
 import onnx.helper as oh
 from onnx import TensorProto
@@ -39,8 +38,6 @@ from qonnx.analysis.tensor_value_summary import (
     UnsupportedTensorValueError,
     initializer_value_summaries,
     initializer_value_summary,
-    is_summarizable_dtype,
-    smallest_lossless_integer_datatype,
     summarize_tensor_values,
 )
 from qonnx.core.datatype import DataType
@@ -127,8 +124,6 @@ def test_empty_tensor_has_absent_range():
     assert summary.element_count == 0
     assert summary.minimum is None
     assert summary.maximum is None
-    # empty is not zero and must not authorize a zero-range optimization
-    assert smallest_lossless_integer_datatype(summary) is None
 
 
 def test_empty_tensors_of_different_shape_differ():
@@ -142,7 +137,6 @@ def test_boolean_tensor_is_summarized_as_zero_one():
     summary = summarize_tensor_values(np.array([True, False, True]))
     assert (summary.minimum, summary.maximum) == (0, 1)
     assert summary.is_integral is True
-    assert smallest_lossless_integer_datatype(summary) == DataType["BINARY"]
 
 
 def test_fractional_float_tensor_is_not_integral():
@@ -150,15 +144,12 @@ def test_fractional_float_tensor_is_not_integral():
     assert summary.minimum == 0.0
     assert summary.maximum == 1.0
     assert summary.is_integral is False
-    # a range alone cannot prove losslessness for fractional values
-    assert smallest_lossless_integer_datatype(summary) is None
 
 
-def test_nan_is_excluded_from_range_but_refuses_narrowing():
+def test_nan_is_excluded_from_range_and_not_integral():
     summary = summarize_tensor_values(np.array([1.0, np.nan, 3.0], dtype=np.float32))
     assert (summary.minimum, summary.maximum) == (1.0, 3.0)
     assert summary.is_integral is False
-    assert smallest_lossless_integer_datatype(summary) is None
     # equal content still compares equal, which NaN in the range would break
     assert summary == summarize_tensor_values(np.array([1.0, np.nan, 3.0], dtype=np.float32))
 
@@ -169,15 +160,13 @@ def test_all_nan_tensor_reports_absent_range():
     assert summary.minimum is None
     assert summary.maximum is None
     assert summary.is_integral is False
-    assert smallest_lossless_integer_datatype(summary) is None
 
 
-def test_infinity_is_an_observed_value_but_refuses_narrowing():
+def test_infinity_is_an_observed_value_and_not_integral():
     summary = summarize_tensor_values(np.array([1.0, np.inf], dtype=np.float32))
     assert summary.minimum == 1.0
     assert summary.maximum == np.inf
     assert summary.is_integral is False
-    assert smallest_lossless_integer_datatype(summary) is None
 
 
 def test_wide_integer_tensors_are_exact():
@@ -211,18 +200,14 @@ def test_custom_encoded_dtypes_are_refused():
     bfloat16_view = np.dtype((np.uint16, [("bfloat16", "<u2")]))
     float8_view = np.dtype((np.uint8, [("e4m3fn", "u1")]))
     int4_view = np.dtype((np.int8, [("int4", "i1")]))
-    assert not is_summarizable_dtype(bfloat16_view)
-    assert not is_summarizable_dtype(float8_view)
-    assert not is_summarizable_dtype(int4_view)
-    with pytest.raises(UnsupportedTensorValueError):
-        summarize_tensor_values(np.zeros(4, dtype=bfloat16_view))
+    for view in (bfloat16_view, float8_view, int4_view):
+        with pytest.raises(UnsupportedTensorValueError):
+            summarize_tensor_values(np.zeros(4, dtype=view))
 
 
-def test_supported_dtype_predicate():
-    for dtype in [np.int8, np.uint8, np.int64, np.uint64, np.float16, np.float32, np.float64, bool]:
-        assert is_summarizable_dtype(np.dtype(dtype))
-    for dtype in [np.complex64, np.complex128, object, np.str_]:
-        assert not is_summarizable_dtype(np.dtype(dtype))
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.int64, np.uint64, np.float16, np.float32, np.float64, bool])
+def test_supported_dtypes_are_summarized(dtype):
+    assert summarize_tensor_values(np.zeros(2, dtype=dtype)).element_count == 2
 
 
 def test_distinct_wider_floating_dtype_is_refused():
@@ -231,7 +216,6 @@ def test_distinct_wider_floating_dtype_is_refused():
         pytest.skip("longdouble is not wider than float64 on this platform")
 
     assert dtype.kind == "f"
-    assert not is_summarizable_dtype(dtype)
     with pytest.raises(UnsupportedTensorValueError, match=str(dtype)):
         summarize_tensor_values(np.array([np.finfo(dtype).max], dtype=dtype))
 
@@ -347,95 +331,6 @@ def test_analysis_pass_does_not_repeat_name_based_initializer_lookup(monkeypatch
 
     assert set(summaries) == {"p0", "p1", "p2"}
     assert summaries["p2"] == summarize_tensor_values(np.array([3, 4], dtype=np.int8))
-
-
-# --- smallest lossless datatype ----------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "values, expected",
-    [
-        ([0, 1], "BINARY"),
-        ([0, 0], "BINARY"),
-        ([-1, 0], "INT1"),
-        ([-1, -1], "BIPOLAR"),
-        ([-1, 1], "BIPOLAR"),
-        ([-1, 0, 1], "TERNARY"),
-        ([-2, 1], "INT2"),
-        ([-8, 7], "INT4"),
-        ([-7, 7], "INT4"),
-        ([0, 15], "UINT4"),
-        ([0, 255], "UINT8"),
-        ([-128, 127], "INT8"),
-        ([-129, 127], "INT9"),
-    ],
-)
-def test_smallest_lossless_integer_datatype_for_ranges(values, expected):
-    summary = summarize_tensor_values(np.array(values, dtype=np.float32))
-    assert smallest_lossless_integer_datatype(summary) == DataType[expected]
-
-
-@pytest.mark.parametrize("values", [[-1, 0], [-1, -1], [0, 0], [-1, 0, 1], [-2, 1], [0, 255]])
-def test_result_is_the_narrowest_admitting_candidate(values):
-    # "smallest" must mean smallest: no admitting datatype may be narrower
-    # than the answer. The candidate list is grouped by family, not by width,
-    # so a linear scan over it returns 2-bit TERNARY where 1-bit INT1 fits.
-    summary = summarize_tensor_values(np.array(values, dtype=np.float32))
-    result = smallest_lossless_integer_datatype(summary)
-    assert result is not None
-    for name in DataType.get_accumulator_dt_cands():
-        candidate = DataType[name]
-        if candidate.bitwidth() < result.bitwidth():
-            admits_all = all(bool(candidate.allowed(float(v))) for v in values)
-            assert not admits_all, "%s is narrower than %s and admits %r" % (candidate, result, values)
-
-
-def test_bipolar_and_ternary_are_told_apart_by_zero():
-    # {-1, +1} and {-1, 0, +1} share the range [-1, +1]; only the zero
-    # membership fact separates 1-bit BIPOLAR from 2-bit TERNARY
-    without_zero = summarize_tensor_values(np.array([-1.0, 1.0], dtype=np.float32))
-    with_zero = summarize_tensor_values(np.array([-1.0, 0.0, 1.0], dtype=np.float32))
-    assert (without_zero.minimum, without_zero.maximum) == (with_zero.minimum, with_zero.maximum)
-    assert without_zero.contains_zero is False
-    assert with_zero.contains_zero is True
-    assert smallest_lossless_integer_datatype(without_zero) == DataType["BIPOLAR"]
-    assert smallest_lossless_integer_datatype(with_zero) == DataType["TERNARY"]
-
-
-def test_bipolar_is_never_returned_for_a_tensor_containing_zero():
-    # regression: a range check alone admits BIPOLAR here, because zero is
-    # inside [-1, +1] while being outside BIPOLAR's domain
-    summary = summarize_tensor_values(np.array([-1.0, 0.0, 1.0], dtype=np.float32))
-    assert not DataType["BIPOLAR"].allowed(0.0)
-    assert smallest_lossless_integer_datatype(summary) != DataType["BIPOLAR"]
-
-
-def test_helper_answers_from_observed_values_alone():
-    # the helper takes no declared datatype: a summary cannot soundly validate
-    # one, and the answer depends only on what the tensor actually holds
-    summary = summarize_tensor_values(np.array([-3.0, 3.0], dtype=np.float32))
-    assert smallest_lossless_integer_datatype(summary) == DataType["INT3"]
-    assert list(inspect.signature(smallest_lossless_integer_datatype).parameters) == ["summary"]
-
-
-def test_consumer_constrains_the_answer_against_its_declared_datatype():
-    # the comparison the helper used to make is ordinary consumer-side work,
-    # and it stays honest because it is made against real values
-    summary = summarize_tensor_values(np.array([-3.0, 3.0], dtype=np.float32))
-    narrowest = smallest_lossless_integer_datatype(summary)
-    for declared, expected_fits in [("INT8", True), ("INT3", True), ("INT2", False), ("UINT8", False)]:
-        declared_datatype = DataType[declared]
-        fits = declared_datatype.min() <= summary.minimum and summary.maximum <= declared_datatype.max()
-        assert fits is expected_fits
-        if fits:
-            # narrowing is worthwhile only when it actually saves bits
-            assert narrowest.bitwidth() <= declared_datatype.bitwidth()
-
-
-def test_out_of_range_integral_values_are_refused():
-    summary = summarize_tensor_values(np.array([2.0**70], dtype=np.float64))
-    assert summary.is_integral is True
-    assert smallest_lossless_integer_datatype(summary) is None
 
 
 def test_narrowness_question_is_derivable_from_the_summary():
