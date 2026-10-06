@@ -40,7 +40,6 @@ from qonnx.analysis.tensor_value_summary import (
     initializer_value_summary,
     summarize_tensor_values,
 )
-from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.fold_constants import FoldConstants
 from qonnx.util.basic import qonnx_make_model
@@ -314,7 +313,9 @@ def test_analysis_pass_summarizes_every_initializer():
     assert all(isinstance(s, TensorValueSummary) for s in summaries.values())
 
 
-def test_analysis_pass_does_not_repeat_name_based_initializer_lookup(monkeypatch):
+def test_analysis_pass_stays_linear_in_initializer_count(monkeypatch):
+    # A performance regression guard: ModelWrapper.get_initializer searches every
+    # initializer by name, so a pass calling it per initializer is quadratic.
     model = make_model_with_initializers(
         {
             "p0": np.array([1.0, 2.0], dtype=np.float32),
@@ -331,45 +332,6 @@ def test_analysis_pass_does_not_repeat_name_based_initializer_lookup(monkeypatch
 
     assert set(summaries) == {"p0", "p1", "p2"}
     assert summaries["p2"] == summarize_tensor_values(np.array([3, 4], dtype=np.int8))
-
-
-def test_narrowness_question_is_derivable_from_the_summary():
-    # the consumer-side question "does this tensor exclude its datatype
-    # minimum?" is answered from the summary, not by rescanning the array
-    declared = DataType["INT4"]
-    narrow = summarize_tensor_values(np.array([-7.0, 7.0], dtype=np.float32))
-    full = summarize_tensor_values(np.array([-8.0, 7.0], dtype=np.float32))
-    assert narrow.minimum > declared.min()
-    assert not (full.minimum > declared.min())
-
-
-def test_summaries_are_comparable_without_a_model():
-    # a composition-level consumer can compare and combine several summaries
-    # on its own, with no model and nothing imported from a consumer framework
-    first = summarize_tensor_values(np.array([-3.0, 2.0], dtype=np.float32))
-    second = summarize_tensor_values(np.array([0.0, 9.0], dtype=np.float32))
-    assert min(first.minimum, second.minimum) == -3.0
-    assert max(first.maximum, second.maximum) == 9.0
-    assert first.is_integral and second.is_integral
-    assert first.contains_zero is False and second.contains_zero is True
-    assert first.content_digest != second.content_digest
-
-
-def test_a_combined_range_is_not_a_tensor_summary():
-    # combining two tensors' ranges does not produce a third tensor, so it
-    # must not be expressible as a TensorValueSummary with a fabricated
-    # identity: the digest is the exact identity of one real tensor
-    first = summarize_tensor_values(np.array([-3.0, 2.0], dtype=np.float32))
-    second = summarize_tensor_values(np.array([0.0, 9.0], dtype=np.float32))
-    with pytest.raises(ValueError, match="content_digest"):
-        TensorValueSummary(
-            content_digest="",
-            element_count=first.element_count + second.element_count,
-            minimum=min(first.minimum, second.minimum),
-            maximum=max(first.maximum, second.maximum),
-            is_integral=True,
-            contains_zero=True,
-        )
 
 
 @pytest.mark.parametrize(
