@@ -117,6 +117,8 @@ class CustomOp(ABC):
 
     # The opt-in for graph context (see "Model-aware ops" above).
     wants_model: bool = False
+    # The model attach_model gave this instance; None until it is attached.
+    _model: "ModelWrapper | None" = None
 
     def __init__(
         self,

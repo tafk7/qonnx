@@ -81,7 +81,7 @@ def test_model_aware_op_receives_model_via_wrapper_only(make_domain, model_aware
 
     bare = getCustomOp(node)
     assert isinstance(bare, model_aware_op)
-    assert getattr(bare, "_model", None) is None
+    assert bare._model is None
     assert model_aware_op.attached_to == []
 
     aware = model.get_customop_wrapper(node)
@@ -100,7 +100,7 @@ def test_classic_op_identical_from_both_paths(make_domain, classic_op):
     wrapped = model.get_customop_wrapper(node)
 
     assert type(bare) is type(wrapped) is classic_op
-    assert getattr(bare, "_model", None) is None
+    assert bare._model is None
     assert getattr(wrapped, "_model", None) is None
     assert classic_op.attached_to == []
     assert bare.get_nodeattr("my_attr") == wrapped.get_nodeattr("my_attr") == 3
