@@ -31,8 +31,7 @@ import numpy as np
 import threading
 import warnings
 from abc import ABC, ABCMeta, abstractmethod
-from enum import Enum, EnumMeta
-from typing import Any, Dict, Union
+from typing import Any, Dict, TypeGuard, Union
 
 
 class DataTypeWarning(DeprecationWarning):
@@ -64,7 +63,7 @@ class _DataTypeValueMeta(ABCMeta):
             return _INTERNED.setdefault(name, value)
 
 
-def is_datatype(value: object) -> bool:
+def is_datatype(value: object) -> TypeGuard["BaseDataType"]:
     """Whether ``value`` is one of QONNX's datatype values (the instance its
     canonical name resolves to).
 
@@ -644,15 +643,20 @@ def resolve_datatype(name: str, canonical: bool = False) -> BaseDataType:
     return _resolve(name, canonical, stacklevel=3)
 
 
-class DataTypeMeta(EnumMeta):
+class DataTypeTable:
+    """The QONNX data types that set the quantization annotation, by name:
+    ``DataType["INT8"]`` is the datatype value of that name (``resolve_datatype``).
+    ONNX does not support data types smaller than 8-bit integers, whereas in QONNX we are
+    interested in smaller integers down to ternary and bipolar.
+
+    ``DataType`` is the one instance, a lookup and not a type: the values it returns
+    are ``BaseDataType`` instances. Neither an Enum nor a class with a metaclass
+    ``__getitem__``: a type checker reads ``DataType[name]`` on an Enum as the Enum
+    itself, and on a class as a type application (``X = DataType["INT8"]`` would
+    declare a type alias)."""
+
     def __getitem__(self, name: str) -> BaseDataType:
         return _resolve(name, False, stacklevel=3)
-
-
-class DataType(Enum, metaclass=DataTypeMeta):
-    """Enum class that contains QONNX data types to set the quantization annotation.
-    ONNX does not support data types smaller than 8-bit integers, whereas in QONNX we are
-    interested in smaller integers down to ternary and bipolar."""
 
     @staticmethod
     def get_accumulator_dt_cands() -> list[str]:
@@ -667,10 +671,13 @@ class DataType(Enum, metaclass=DataTypeMeta):
         """Returns smallest (fewest bits) possible DataType that can represent
         value. Prefers unsigned integers where possible."""
         if not int(value) == value:
-            return DataType["FLOAT32"]
-        cands = DataType.get_accumulator_dt_cands()
+            return resolve_datatype("FLOAT32")
+        cands = DataTypeTable.get_accumulator_dt_cands()
         for cand in cands:
-            dt = DataType[cand]
+            dt = resolve_datatype(cand)
             if (dt.min() <= value) and (value <= dt.max()):
                 return dt
         raise Exception("Could not find a suitable int datatype for " + str(value))
+
+
+DataType = DataTypeTable()
