@@ -30,9 +30,10 @@ import importlib
 import inspect
 import re
 import warnings
+from onnx import NodeProto
 from threading import RLock
 from typing import Dict, List, Optional, Tuple, Type
-from onnx import NodeProto
+
 from qonnx.custom_op.base import CustomOp
 
 # Nested registry for O(1) lookups: domain -> op_type -> version -> CustomOp class

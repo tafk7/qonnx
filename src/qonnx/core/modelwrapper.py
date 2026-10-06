@@ -32,15 +32,15 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
-from pathlib import Path
+import numpy as np
 import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as np_helper
 import os
 import warnings
-import numpy as np
-from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar, cast
 from onnx import GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar, cast
 
 if TYPE_CHECKING:
     from qonnx.transformation.base import Transformation
@@ -93,17 +93,13 @@ class ModelWrapper:
         initializers that are missing theirs.
         """
         if isinstance(onnx_model_proto, str):
-            assert os.path.isfile(onnx_model_proto), (
-                f"File not found: {onnx_model_proto}"
-            )
+            assert os.path.isfile(onnx_model_proto), f"File not found: {onnx_model_proto}"
             self._model_proto: ModelProto = onnx.load(onnx_model_proto)
         elif isinstance(onnx_model_proto, bytes):
             self._model_proto: ModelProto = onnx.load_from_string(onnx_model_proto)
         else:
             if make_deepcopy:
-                self._model_proto: ModelProto = copy.deepcopy(
-                    cast(ModelProto, onnx_model_proto)
-                )
+                self._model_proto: ModelProto = copy.deepcopy(cast(ModelProto, onnx_model_proto))
             else:
                 self._model_proto: ModelProto = cast(ModelProto, onnx_model_proto)
         # the wrapper this one is a subgraph body of (make_subgraph_modelwrapper)
@@ -173,15 +169,14 @@ class ModelWrapper:
 
     def analysis(
         self,
-        analysis_fxn: Callable[["ModelWrapper", bool], T]
-        | Callable[["ModelWrapper"], T],
+        analysis_fxn: Callable[["ModelWrapper", bool], T] | Callable[["ModelWrapper"], T],
         apply_to_subgraphs: bool = False,
     ) -> T:
         """Runs given anaylsis_fxn on this model and return resulting dict."""
         if apply_to_subgraphs:
-            assert "apply_to_subgraphs" in inspect.signature(analysis_fxn).parameters, (
-                "analysis_fxn must have 'apply_to_subgraphs' argument when apply_to_subgraphs == True"
-            )
+            assert (
+                "apply_to_subgraphs" in inspect.signature(analysis_fxn).parameters
+            ), "analysis_fxn must have 'apply_to_subgraphs' argument when apply_to_subgraphs == True"
             return analysis_fxn(self, apply_to_subgraphs)  # type: ignore[call-arg]
         else:
             return analysis_fxn(self)  # type: ignore
@@ -249,9 +244,7 @@ class ModelWrapper:
         if make_deepcopy:
             transformed_model = copy.deepcopy(self)
         if self.fix_float64:
-            (transformed_model, model_was_changed) = DoubleToSingleFloat().apply(
-                transformed_model
-            )
+            (transformed_model, model_was_changed) = DoubleToSingleFloat().apply(transformed_model)
 
         if apply_to_subgraphs and (use_preorder_traversal is False):
             transformed_model.transform_subgraphs(
@@ -264,9 +257,7 @@ class ModelWrapper:
 
         model_was_changed = True
         while model_was_changed:
-            (transformed_model, model_was_changed) = transformation.apply(
-                transformed_model
-            )
+            (transformed_model, model_was_changed) = transformation.apply(transformed_model)
             # a transformed body, even in a new wrapper, is a body of the same parent
             transformed_model._parent = self._parent
         if cleanup:
@@ -294,9 +285,7 @@ class ModelWrapper:
             GiveUniqueParameterTensors(),
         ]
         for trn in cleanup_transforms:
-            transformed_model = transformed_model.transform(
-                trn, cleanup=False, make_deepcopy=False
-            )
+            transformed_model = transformed_model.transform(trn, cleanup=False, make_deepcopy=False)
         return transformed_model
 
     def make_subgraph_modelwrapper(self, subgraph: GraphProto) -> ModelWrapper:
@@ -304,11 +293,7 @@ class ModelWrapper:
         model's opset imports. The body reads a key of an inheriting metadata
         namespace (qonnx.core.metadata) it does not state itself from this model.
         """
-        body = ModelWrapper(
-            util.qonnx_make_model(
-                subgraph, opset_imports=self._model_proto.opset_import
-            )
-        )
+        body = ModelWrapper(util.qonnx_make_model(subgraph, opset_imports=self._model_proto.opset_import))
         body._parent = self
         return body
 
@@ -330,9 +315,7 @@ class ModelWrapper:
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret = util.get_by_name(
-                ret.quant_parameter_tensor_names, "finn_datatype", "key"
-            )
+            ret = util.get_by_name(ret.quant_parameter_tensor_names, "finn_datatype", "key")
             if ret is not None:
                 return DataType[ret.value]
         onnx_dtype_to_qonnx_dtype = {
@@ -367,9 +350,7 @@ class ModelWrapper:
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret_dt = util.get_by_name(
-                ret.quant_parameter_tensor_names, "finn_datatype", "key"
-            )
+            ret_dt = util.get_by_name(ret.quant_parameter_tensor_names, "finn_datatype", "key")
             if ret_dt is not None:
                 if datatype is None:
                     ret.quant_parameter_tensor_names.remove(ret_dt)
@@ -397,18 +378,14 @@ class ModelWrapper:
         vi_names += [(x.name, x) for x in graph.value_info]
         try:
             vi_t_names = [x[0] for x in vi_names]
-            assert vi_t_names.count(tensor_name) <= 1, (
-                "Multiple ValueInfoProto found for " + tensor_name
-            )
+            assert vi_t_names.count(tensor_name) <= 1, "Multiple ValueInfoProto found for " + tensor_name
             vi_ind = vi_t_names.index(tensor_name)
             vi = vi_names[vi_ind][1]
             return vi
         except ValueError:
             return None
 
-    def get_tensor_shape(
-        self, tensor_name: str, fix_missing_init_shape: bool = False
-    ) -> list[int] | None:
+    def get_tensor_shape(self, tensor_name: str, fix_missing_init_shape: bool = False) -> list[int] | None:
         """Returns the shape of tensor with given name, if it has ValueInfoProto.
         If fix_missing_init_shape is specified, it will add a ValueInfoProto for initializers
         that are missing theirs."""
@@ -418,9 +395,7 @@ class ModelWrapper:
         vi_names += [(x.name, x) for x in graph.value_info]
         try:
             vi_t_names = [x[0] for x in vi_names]
-            assert vi_t_names.count(tensor_name) <= 1, (
-                "Multiple ValueInfoProto found for " + tensor_name
-            )
+            assert vi_t_names.count(tensor_name) <= 1, "Multiple ValueInfoProto found for " + tensor_name
             vi_ind = vi_t_names.index(tensor_name)
             vi = vi_names[vi_ind][1]
             dims = [x.dim_value for x in vi.type.tensor_type.shape.dim]
@@ -428,23 +403,17 @@ class ModelWrapper:
         except ValueError:
             # no ValueInfo found for tensor, check initializer
             # (see https://github.com/onnx/onnx/issues/2874)
-            tensor_init, tensor_init_dtype = self.get_initializer(
-                tensor_name, return_dtype=True
-            )  # type: ignore
+            tensor_init, tensor_init_dtype = self.get_initializer(tensor_name, return_dtype=True)  # type: ignore
             if tensor_init is None:
                 # no shape defined for this tensor
                 return None
             else:
                 if fix_missing_init_shape:
-                    self.set_tensor_shape(
-                        tensor_name, tensor_init.shape, dtype=tensor_init_dtype
-                    )
+                    self.set_tensor_shape(tensor_name, tensor_init.shape, dtype=tensor_init_dtype)
                 # use list return type to keep it consistent with ValueInfo case
                 return list(tensor_init.shape)
 
-    def set_tensor_shape(
-        self, tensor_name: str, tensor_shape: Sequence[int], dtype: int | None = None
-    ) -> None:
+    def set_tensor_shape(self, tensor_name: str, tensor_shape: Sequence[int], dtype: int | None = None) -> None:
         """Assigns shape in ValueInfoProto for tensor with given name. If override_dtype
         is None, it will try to preserve the existing datatype, otherwise defaults to
         single-precision float."""
@@ -522,9 +491,7 @@ class ModelWrapper:
         if initializer is not None:
             initializer.name = new_name
         # sweep over quantization annotations
-        quant_annotation = util.get_by_name(
-            graph.quantization_annotation, old_name, "tensor_name"
-        )
+        quant_annotation = util.get_by_name(graph.quantization_annotation, old_name, "tensor_name")
         if quant_annotation is not None:
             quant_annotation.tensor_name = new_name
         # sweep over node i/o
@@ -608,9 +575,7 @@ class ModelWrapper:
         elif len(ret) == 1:
             return ret[0]
         else:
-            warnings.warn(
-                "find_consumer: found multiple consumers, returning first one"
-            )
+            warnings.warn("find_consumer: found multiple consumers, returning first one")
             return ret[0]
 
     def find_consumers(self, tensor_name: str) -> list[NodeProto]:
@@ -657,13 +622,9 @@ class ModelWrapper:
         # if the node output is also wired to a top-level output, it is still
         # a fork with only 1 direct successor
         if node.output[0] in [x.name for x in self.graph.output]:
-            is_fork = (
-                False if direct_successors is None else (len(direct_successors) > 0)
-            )
+            is_fork = False if direct_successors is None else (len(direct_successors) > 0)
         else:
-            is_fork = (
-                False if direct_successors is None else (len(direct_successors) > 1)
-            )
+            is_fork = False if direct_successors is None else (len(direct_successors) > 1)
         return is_fork
 
     def is_join_node(self, node: NodeProto) -> bool:
@@ -673,13 +634,9 @@ class ModelWrapper:
         # if the node input is also wired to a top-level input, it is still
         # a fork with only 1 direct predecessor
         if node.input[0] in [x.name for x in self.graph.input]:
-            is_join = (
-                False if direct_predecessors is None else (len(direct_predecessors) > 0)
-            )
+            is_join = False if direct_predecessors is None else (len(direct_predecessors) > 0)
         else:
-            is_join = (
-                False if direct_predecessors is None else (len(direct_predecessors) > 1)
-            )
+            is_join = False if direct_predecessors is None else (len(direct_predecessors) > 1)
         return is_join
 
     def get_all_tensor_names(self) -> list[str]:
@@ -734,9 +691,7 @@ class ModelWrapper:
         execution_context[""] = None
         return execution_context
 
-    def check_all_tensor_shapes_specified(
-        self, fix_missing_init_shape: bool = False
-    ) -> bool:
+    def check_all_tensor_shapes_specified(self, fix_missing_init_shape: bool = False) -> bool:
         """Checks whether all tensors have a specified shape (ValueInfo).
         The ONNX standard allows for intermediate activations to have no
         associated ValueInfo, but QONNX expects this.
@@ -751,19 +706,9 @@ class ModelWrapper:
             for i in n.input:
                 # skip tensor names with empty string (indicates defaults)
                 if i != "":
-                    ret = (
-                        self.get_tensor_shape(
-                            i, fix_missing_init_shape=fix_missing_init_shape
-                        )
-                        is not None
-                    ) and ret
+                    ret = (self.get_tensor_shape(i, fix_missing_init_shape=fix_missing_init_shape) is not None) and ret
             for o in n.output:
-                ret = (
-                    self.get_tensor_shape(
-                        o, fix_missing_init_shape=fix_missing_init_shape
-                    )
-                    is not None
-                ) and ret
+                ret = (self.get_tensor_shape(o, fix_missing_init_shape=fix_missing_init_shape) is not None) and ret
         return ret
 
     def get_tensor_fanout(self, tensor_name: str) -> int:
@@ -823,9 +768,7 @@ class ModelWrapper:
         values = {**self._parent.namespace(namespace), **own}
         return {name: values[name] for name in namespace.keys if name in values}
 
-    def inherit_metadata(
-        self, *namespaces: metadata.Namespace, parent: ModelWrapper | None = None
-    ) -> None:
+    def inherit_metadata(self, *namespaces: metadata.Namespace, parent: ModelWrapper | None = None) -> None:
         """Copy into this graph the keys of the given inheriting namespaces that it
         does not state itself, as ``parent`` reads them (by default, the model this
         is a body of). A body reads inherited keys only while it is opened through
@@ -833,7 +776,9 @@ class ModelWrapper:
         extracted into a model of its own) carries them this way."""
         source = self._parent if parent is None else parent
         if source is None:
-            raise ValueError("inherit_metadata: this model was not opened as a subgraph body (make_subgraph_modelwrapper); pass parent=")
+            raise ValueError(
+                "inherit_metadata: this model was not opened as a subgraph body (make_subgraph_modelwrapper); pass parent="
+            )
         for namespace in namespaces:
             if not namespace.inherit:
                 raise ValueError(f"inherit_metadata: namespace {namespace.name} does not inherit")
@@ -891,9 +836,7 @@ class ModelWrapper:
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret = util.get_by_name(
-                ret.quant_parameter_tensor_names, "tensor_layout", "key"
-            )
+            ret = util.get_by_name(ret.quant_parameter_tensor_names, "tensor_layout", "key")
             if ret is not None:
                 return _literal_annotation(ret.value, "tensor_layout", tensor_name)
         return None
@@ -906,9 +849,7 @@ class ModelWrapper:
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret_tl = util.get_by_name(
-                ret.quant_parameter_tensor_names, "tensor_layout", "key"
-            )
+            ret_tl = util.get_by_name(ret.quant_parameter_tensor_names, "tensor_layout", "key")
             if ret_tl is not None:
                 ret_tl.value = str(data_layout)
             else:
@@ -931,24 +872,18 @@ class ModelWrapper:
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret = util.get_by_name(
-                ret.quant_parameter_tensor_names, "tensor_sparsity", "key"
-            )
+            ret = util.get_by_name(ret.quant_parameter_tensor_names, "tensor_sparsity", "key")
             if ret is not None:
                 return _literal_annotation(ret.value, "tensor_sparsity", tensor_name)
         return None
 
-    def set_tensor_sparsity(
-        self, tensor_name: str, sparsity_dict: dict[str, Any]
-    ) -> None:
+    def set_tensor_sparsity(self, tensor_name: str, sparsity_dict: dict[str, Any]) -> None:
         """Sets the sparsity annotation of a tensor with given name."""
         graph = self._model_proto.graph
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
         if ret is not None:
-            ret_ts = util.get_by_name(
-                ret.quant_parameter_tensor_names, "tensor_sparsity", "key"
-            )
+            ret_ts = util.get_by_name(ret.quant_parameter_tensor_names, "tensor_sparsity", "key")
             if ret_ts is not None:
                 ret_ts.value = str(sparsity_dict)
             else:
@@ -969,9 +904,7 @@ class ModelWrapper:
         """Returns a list of imported opsets as a {domain, version} dictionary."""
         return {opset.domain: opset.version for opset in self._model_proto.opset_import}
 
-    def get_customop_wrapper(
-        self, node, fallback_customop_version=util.get_preferred_qonnx_opset()
-    ):
+    def get_customop_wrapper(self, node, fallback_customop_version=util.get_preferred_qonnx_opset()):
         """Return a new CustomOp instance for the given node, of the version the
         model's opset import of the node's domain selects; for a domain the model
         does not import, fallback_customop_version, with a warning. An op that

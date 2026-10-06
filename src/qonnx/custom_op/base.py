@@ -27,14 +27,13 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
+import numpy.typing as npt
 import onnx.helper as helper
 import onnx.numpy_helper as np_helper
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from onnx import GraphProto, NodeProto, TensorProto
 from typing import TYPE_CHECKING, Sequence, cast
-
-import numpy.typing as npt
-from onnx import NodeProto, GraphProto, TensorProto
 
 from qonnx.util.basic import get_by_name, get_preferred_qonnx_opset
 
@@ -149,9 +148,7 @@ class CustomOp(ABC):
         elif len(attrdef) == 4:
             (dtype, req, def_val, allowed_values) = attrdef
         else:
-            raise Exception(
-                "Unexpected length %d n-tuple from get_nodeattr_types" % len(attrdef)
-            )
+            raise Exception("Unexpected length %d n-tuple from get_nodeattr_types" % len(attrdef))
         return (dtype, req, def_val, allowed_values)
 
     def get_nodeattr_allowed_values(
@@ -160,9 +157,7 @@ class CustomOp(ABC):
         "Return set of allowed values for given attribute, None if not specified."
         return self.get_nodeattr_def(name)[3]
 
-    def get_nodeattr(
-        self, name: str
-    ) -> int | float | str | bool | npt.NDArray | list[str | int | float] | None:
+    def get_nodeattr(self, name: str) -> int | float | str | bool | npt.NDArray | list[str | int | float] | None:
         """Get a node attribute by name. Data is stored inside the ONNX node's
         AttributeProto container. Attribute must be part of get_nodeattr_types.
         Default value is returned if attribute is not set."""
@@ -207,9 +202,7 @@ class CustomOp(ABC):
                     # not set, return default value
                     return def_val
         except KeyError:
-            raise AttributeError(
-                f"{self.onnx_node.name} has no such attribute: " + name
-            )
+            raise AttributeError(f"{self.onnx_node.name} has no such attribute: " + name)
 
     def set_nodeattr(
         self, name: str, value: int | float | str | bool | npt.NDArray | list[str | int | float] | None
@@ -220,53 +213,32 @@ class CustomOp(ABC):
             (dtype, req, def_val, allowed_values) = self.get_nodeattr_def(name)
             if allowed_values is not None:
                 if value not in allowed_values:
-                    raise ValueError(
-                        "%s = %s not in %s"
-                        % (str(name), str(value), str(allowed_values))
-                    )
+                    raise ValueError("%s = %s not in %s" % (str(name), str(value), str(allowed_values)))
             attr = get_by_name(self.onnx_node.attribute, name)
-            tensor_value : TensorProto | None = None
+            tensor_value: TensorProto | None = None
             # Verify value type matches dtype before setting/converting
             if dtype == "i":
                 if not isinstance(value, int):
                     raise TypeError(f"Attribute {name} expects int, got {type(value)}")
             elif dtype == "f":
                 if not isinstance(value, float):
-                    raise TypeError(
-                        f"Attribute {name} expects float, got {type(value)}"
-                    )
+                    raise TypeError(f"Attribute {name} expects float, got {type(value)}")
             elif dtype == "s":
                 if not isinstance(value, (str, bytes)):
                     raise TypeError(f"Attribute {name} expects str, got {type(value)}")
             elif dtype == "ints":
-                if not (
-                    isinstance(value, list) and all(isinstance(v, int) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of ints, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, int) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of ints, got {type(value)}")
             elif dtype == "floats":
-                if not (
-                    isinstance(value, list)
-                    and all(isinstance(v, (int, float)) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of floats, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, (int, float)) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of floats, got {type(value)}")
             elif dtype == "strings":
-                if not (
-                    isinstance(value, list)
-                    and all(isinstance(v, (str, bytes)) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of strings, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, (str, bytes)) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of strings, got {type(value)}")
             elif dtype == "t":
                 # Validate that value is a numpy array
                 if not isinstance(value, (np.ndarray, np.generic)):
-                    raise TypeError(
-                        f"Attribute {name} expects numpy array, got {type(value)}"
-                    )
+                    raise TypeError(f"Attribute {name} expects numpy array, got {type(value)}")
                 # Convert numpy array to TensorProto
                 tensor_value = np_helper.from_array(cast(npt.NDArray, value))
             if attr is not None:
@@ -277,9 +249,7 @@ class CustomOp(ABC):
                     val = cast(str, value).encode("utf-8")
                     attr.__setattr__(dtype, val)
                 elif dtype == "strings":
-                    attr.strings[:] = [
-                        x.encode("utf-8") for x in cast(list[str], value)
-                    ]
+                    attr.strings[:] = [x.encode("utf-8") for x in cast(list[str], value)]
                 elif dtype == "floats":  # list of floats
                     attr.floats[:] = cast(list[float], value)
                 elif dtype == "ints":  # list of integers

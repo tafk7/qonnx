@@ -39,9 +39,7 @@ def execute_custom_node(node, context, graph, onnx_opset_version, model=None):
         if model is None:
             inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
         else:
-            inst = model.get_customop_wrapper(
-                node, fallback_customop_version=onnx_opset_version
-            )
+            inst = model.get_customop_wrapper(node, fallback_customop_version=onnx_opset_version)
         inst.execute_node(context, graph)
     except KeyError:
         # exception if op_type is not supported
