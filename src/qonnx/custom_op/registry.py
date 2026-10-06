@@ -97,7 +97,7 @@ def op_identity(cls: Type[CustomOp], exported_as: Optional[str] = None) -> Tuple
 
     A class may state either in its own body (``op_type = "MatMul"``,
     ``op_version = 6``). A stated identity is not inherited, so a backend
-    subclass of a kernel op is not registered as the kernel op. Otherwise both
+    subclass of an op is not registered as that op. Otherwise both
     come from the name the domain exports the class under (``exported_as``,
     default the class name), split by split_versioned_name.
 

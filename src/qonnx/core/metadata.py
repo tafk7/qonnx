@@ -28,7 +28,7 @@
 
 """Typed, namespaced graph metadata.
 
-A namespace (``Namespace("finn.platform", version=1)``) declares keys, each
+A namespace (``Namespace("mytool.board", version=1)``) declares keys, each
 with a type: ``str``, ``int``, ``float``, ``bool``, an ``enum.Enum`` subclass
 (stored by member name) or ``JSON`` (a JSON value). Each key is one entry of a
 graph's ``metadata_props``, named ``<namespace>/<key>``, its value the type's

@@ -89,9 +89,9 @@ def _infer_node_datatype(model, node, allow_scaledint_dtypes):
     if is_custom_op(node.domain):
         # handle DataType inference for CustomOp
         try:
-            # model-aware instantiation: ops declaring wants_model=True receive the
-            # model (kernel ops derive dtypes from live graph context); classic ops
-            # are unaffected (safe superset of getCustomOp).
+            # model-aware instantiation: ops declaring wants_model=True (those that
+            # derive datatypes from the graph around them) receive the model;
+            # classic ops are unaffected (safe superset of getCustomOp).
             inst = model.get_customop_wrapper(node)
             inst.infer_node_datatype(model)
         except KeyError:

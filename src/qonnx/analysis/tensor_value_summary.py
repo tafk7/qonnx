@@ -345,9 +345,7 @@ def smallest_lossless_integer_datatype(summary: TensorValueSummary) -> BaseDataT
 
     The name states the domain deliberately. A summary carries a range and a
     few membership facts, which is enough to prove losslessness for
-    integer-valued datatypes and not enough for fractional ones. (C0 calls for
-    a smallest-lossless-QONNX-datatype helper; this is that helper, named for
-    what it proves.)
+    integer-valued datatypes and not enough for fractional ones.
 
     ``None`` -- an explicit refusal rather than an optimistic approximation --
     is returned when:

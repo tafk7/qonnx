@@ -59,7 +59,7 @@ class CustomOp(ABC):
 
         A class may instead state ``op_type`` and/or ``op_version`` in its own
         body (``op_type = "MatMul"``, ``op_version = 6``). A stated identity is
-        not inherited: a subclass (a backend of a kernel op, say) is identified
+        not inherited: a subclass (a backend of an op, say) is identified
         by its own name unless it states its own.
 
         The registry automatically selects the highest version <= requested opset.
