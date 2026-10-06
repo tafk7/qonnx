@@ -40,9 +40,10 @@ import os
 import warnings
 from onnx import GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence, TypeVar, cast, overload
 
 if TYPE_CHECKING:
+    from qonnx.custom_op.base import CustomOp
     from qonnx.transformation.base import Transformation
 
 import qonnx.util.basic as util
@@ -501,6 +502,14 @@ class ModelWrapper:
             if old_name in n.output:
                 n.output[list(n.output).index(old_name)] = new_name
 
+    @overload
+    def get_initializer(self, tensor_name: str, return_dtype: Literal[False] = False) -> np.ndarray | None:
+        ...
+
+    @overload
+    def get_initializer(self, tensor_name: str, return_dtype: Literal[True]) -> tuple[np.ndarray, int] | tuple[None, None]:
+        ...
+
     def get_initializer(
         self, tensor_name: str, return_dtype: bool = False
     ) -> np.ndarray | tuple[np.ndarray, int] | tuple[None, None] | None:
@@ -900,11 +909,13 @@ class ModelWrapper:
             qa.quant_parameter_tensor_names.append(dt)
             qnt_annotations.append(qa)
 
-    def get_opset_imports(self):
+    def get_opset_imports(self) -> dict[str, int]:
         """Returns a list of imported opsets as a {domain, version} dictionary."""
         return {opset.domain: opset.version for opset in self._model_proto.opset_import}
 
-    def get_customop_wrapper(self, node, fallback_customop_version=util.get_preferred_qonnx_opset()):
+    def get_customop_wrapper(
+        self, node: NodeProto, fallback_customop_version: int = util.get_preferred_qonnx_opset()
+    ) -> CustomOp:
         """Return a new CustomOp instance for the given node, of the version the
         model's opset import of the node's domain selects; for a domain the model
         does not import, fallback_customop_version, with a warning. An op that
@@ -928,7 +939,7 @@ class ModelWrapper:
             inst.attach_model(self)
         return inst
 
-    def set_opset_import(self, domain, version):
+    def set_opset_import(self, domain: str, version: int) -> None:
         """Sets the opset version for a given domain in the model's opset imports.
         If the domain already exists, its version will be updated. If not, a new
         opset import will be added.

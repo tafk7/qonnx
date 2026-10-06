@@ -119,8 +119,8 @@ class Trunc_v2(CustomOp):
         # set context according to output name
         context[node.output[0]] = ret
 
-    def verify_node(self):
-        pass
+    def verify_node(self) -> list[str]:
+        return []
 
 
 def trunc_v1(inp_tensor, scale, zeropt, input_bit_width, output_bit_width, rounding_mode):
@@ -192,5 +192,5 @@ class Trunc_v1(CustomOp):
         # set context according to output name
         context[node.output[0]] = ret
 
-    def verify_node(self):
-        pass
+    def verify_node(self) -> list[str]:
+        return []

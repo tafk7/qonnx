@@ -257,5 +257,5 @@ class FloatQuant(CustomOp):
         node = self.onnx_node
         model.set_tensor_datatype(node.output[0], finn_dt)
 
-    def verify_node(self):
-        pass
+    def verify_node(self) -> list[str]:
+        return []
