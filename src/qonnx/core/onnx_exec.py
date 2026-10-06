@@ -27,16 +27,23 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+from __future__ import annotations
+
 import copy
 import numpy as np
 import onnx.helper as helper
 import onnxruntime as rt
 import warnings
+from onnx import NodeProto
+from typing import TYPE_CHECKING, Literal, Mapping, overload
 
 import qonnx.analysis.topology as ta
 import qonnx.core.execute_custom_node as ex_cu_node
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.util.basic import get_preferred_qonnx_opset, get_sanitize_quant_tensors, qonnx_make_model, sanitize_quant_values
+
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
 
 
 def execute_node(
@@ -117,7 +124,35 @@ def execute_node(
             context[outp] = output_list[list_ind]
 
 
-def execute_onnx(model, input_dict, return_full_exec_context=False, start_node=None, end_node=None):
+@overload
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: Literal[False] = False,
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+) -> dict[str, np.ndarray]:
+    ...
+
+
+@overload
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: Literal[True],
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+) -> dict[str, np.ndarray | None]:
+    ...
+
+
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: bool = False,
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+) -> dict[str, np.ndarray] | dict[str, np.ndarray | None]:
     """Executes given ONNX ModelWrapper with given named inputs.
 
     If return_full_exec_context is False, a dict of named outputs is returned
@@ -125,7 +160,8 @@ def execute_onnx(model, input_dict, return_full_exec_context=False, start_node=N
 
     If return return_full_exec_context is True, the full set of tensors used by
     the execution (including inputs, weights, activations and final outputs)
-    will be returned as a dict.
+    will be returned as a dict; its entry for the empty name (an omitted
+    optional input) is None.
 
     When start_node and end_node are set to None, the whole graph is executed.
     If they are set to particular ONNX nodes, only the subgraph between (and
