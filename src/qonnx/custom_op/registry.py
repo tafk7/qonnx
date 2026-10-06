@@ -107,23 +107,17 @@ def op_identity(cls: Type[CustomOp], exported_as: Optional[str] = None) -> Tuple
     """
     own = vars(cls)
     name_op_type, name_version = split_versioned_name(exported_as or cls.__name__)
-    op_type = own.get("op_type", name_op_type)
-    op_version = own.get("op_version", name_version)
+    return _check_identity(own.get("op_type", name_op_type), own.get("op_version", name_version), f"{cls.__name__}.")
+
+
+def _check_identity(op_type: object, op_version: object, owner: str = "") -> Tuple[str, int]:
+    """(op_type, op_version) if op_type is a nonempty string and op_version a
+    positive integer; otherwise ValueError, naming them with the owner's prefix."""
     if not isinstance(op_type, str) or not op_type:
-        raise ValueError(f"{cls.__name__}.op_type must be a nonempty string, not {op_type!r}")
+        raise ValueError(f"{owner}op_type must be a nonempty string, not {op_type!r}")
     if type(op_version) is not int or op_version < 1:
-        raise ValueError(f"{cls.__name__}.op_version must be a positive integer, not {op_version!r}")
+        raise ValueError(f"{owner}op_version must be a positive integer, not {op_version!r}")
     return op_type, op_version
-
-
-def _get_op_type_for_class(cls: Type[CustomOp]) -> str:
-    """The op_type of a CustomOp class (see op_identity)."""
-    return op_identity(cls)[0]
-
-
-def _get_op_version_for_class(cls: Type[CustomOp]) -> int:
-    """The since-version of a CustomOp class (see op_identity)."""
-    return op_identity(cls)[1]
 
 
 def _exported_classes(module) -> List[Tuple[str, Type[CustomOp]]]:
@@ -308,12 +302,9 @@ def add_op_to_domain(
         raise ValueError(f"{op_class} must be a subclass of CustomOp")
 
     class_op_type, class_version = op_identity(op_class)
-    op_type = class_op_type if op_type is None else op_type
-    op_version = class_version if op_version is None else op_version
-    if not isinstance(op_type, str) or not op_type:
-        raise ValueError(f"op_type must be a nonempty string, not {op_type!r}")
-    if type(op_version) is not int or op_version < 1:
-        raise ValueError(f"op_version must be a positive integer, not {op_version!r}")
+    op_type, op_version = _check_identity(
+        class_op_type if op_type is None else op_type, class_version if op_version is None else op_version
+    )
 
     with _REGISTRY_LOCK:
         # merge what the domain module exports first, so registering one
