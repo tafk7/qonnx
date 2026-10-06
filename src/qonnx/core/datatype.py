@@ -359,7 +359,7 @@ class IntType(BaseDataType):
     def __init__(self, bitwidth: int, signed: bool) -> None:
         super().__init__()
         if bitwidth < 0:
-            raise ValueError(f"an integer datatype needs a positive bit width, not {bitwidth}")
+            raise ValueError(f"an integer datatype needs a non-negative bit width, not {bitwidth}")
         self._bitwidth = bitwidth
         self._signed = signed
 

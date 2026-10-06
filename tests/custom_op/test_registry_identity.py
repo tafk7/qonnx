@@ -188,6 +188,8 @@ def test_domain_opset_version_is_stated_or_the_highest_since_version(make_op, ma
     assert get_domain_opset_version(make_domain(MatMul=MatMul, MatMul_v6=MatMul_v6, opset_version=7)) == 7
     with pytest.raises(ValueError, match="below"):
         get_domain_opset_version(make_domain(MatMul=MatMul, MatMul_v6=MatMul_v6, opset_version=5))
+    with pytest.raises(ValueError, match="must be an integer"):
+        get_domain_opset_version(make_domain(MatMul=MatMul, opset_version="7"))
     registered = make_domain(MatMul=MatMul)
     add_op_to_domain(registered, MatMul_v6)
     assert get_domain_opset_version(registered) == 6

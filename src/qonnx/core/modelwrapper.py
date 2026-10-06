@@ -833,7 +833,7 @@ class ModelWrapper:
         extracted into a model of its own) carries them this way."""
         source = self._parent if parent is None else parent
         if source is None:
-            raise ValueError("inherit_metadata: this model is no subgraph body; name the parent")
+            raise ValueError("inherit_metadata: this model was not opened as a subgraph body (make_subgraph_modelwrapper); pass parent=")
         for namespace in namespaces:
             if not namespace.inherit:
                 raise ValueError(f"inherit_metadata: namespace {namespace.name} does not inherit")

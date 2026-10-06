@@ -221,8 +221,10 @@ def get_domain_opset_version(domain: str) -> int:
     stated = getattr(module, "opset_version", None)
     if stated is None:
         return highest
-    if type(stated) is not int or stated < highest:
-        raise ValueError(f"{domain}.opset_version = {stated!r} is below its ops' highest since-version {highest}")
+    if type(stated) is not int:
+        raise ValueError(f"{domain}.opset_version must be an integer, not {stated!r}")
+    if stated < highest:
+        raise ValueError(f"{domain}.opset_version = {stated} is below its ops' highest since-version {highest}")
     return stated
 
 
