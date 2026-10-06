@@ -430,5 +430,5 @@ def test_inherit_metadata_copies_what_a_standalone_body_must_carry(tmp_path):
     assert extracted.get(NAME) == "board"
     with pytest.raises(ValueError, match="does not inherit"):
         extracted.inherit_metadata(LOCAL, parent=model)
-    with pytest.raises(ValueError, match="no subgraph body"):
+    with pytest.raises(ValueError, match="not opened as a subgraph body"):
         extracted.inherit_metadata(SITE)

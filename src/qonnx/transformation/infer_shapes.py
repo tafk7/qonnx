@@ -39,8 +39,8 @@ def _make_shape_compatible_op(node, model):
     assert is_custom_op(node.domain), "Node domain is not a registered custom op domain"
     op_type = node.op_type
     try:
-        # model-aware instantiation: ops that declare wants_model=True (e.g. kernel
-        # ops that derive their shape from live graph context) receive the model;
+        # model-aware instantiation: ops that declare wants_model=True (those that
+        # derive their shape from the graph around them) receive the model;
         # classic ops are unaffected (safe superset of getCustomOp).
         inst = model.get_customop_wrapper(node)
         return inst.make_shape_compatible_op(model)

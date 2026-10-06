@@ -34,6 +34,7 @@ from abc import ABC, ABCMeta, abstractmethod
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Union
 
+
 class DataTypeWarning(DeprecationWarning):
     """A name was resolved that denotes no datatype today but is still
     accepted (a zero-width integer type); a later release refuses it."""
@@ -262,12 +263,10 @@ class ArbPrecFloatType(BaseDataType):
         exponent_bitwidth = self.exponent_bits()
         mantissa_bitwidth = self.mantissa_bits()
         max_exponent = (2.0**exponent_bitwidth) - 1.0 - exponent_bias
-        max_mantissa = np.sum(
-            (2.0 ** np.arange(0, -1.0 * mantissa_bitwidth - 1.0, -1.0))
-        )
+        max_mantissa = np.sum((2.0 ** np.arange(0, -1.0 * mantissa_bitwidth - 1.0, -1.0)))
         max_val = max_mantissa * (2**max_exponent)
         return float(max_val)
-    
+
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         # fp32 format parameters
         fp32_exponent_bias = 127
@@ -359,7 +358,7 @@ class IntType(BaseDataType):
     def __init__(self, bitwidth: int, signed: bool) -> None:
         super().__init__()
         if bitwidth < 0:
-            raise ValueError(f"an integer datatype needs a positive bit width, not {bitwidth}")
+            raise ValueError(f"an integer datatype needs a non-negative bit width, not {bitwidth}")
         self._bitwidth = bitwidth
         self._signed = signed
 
@@ -612,13 +611,9 @@ def _construct(name: str) -> BaseDataType:
         raise ValueError("unknown datatype family")
 
 
-
-
 def _resolve(name: str, canonical: bool, stacklevel: int) -> BaseDataType:
     if not isinstance(name, str):
-        raise TypeError(
-            f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'"
-        )
+        raise TypeError(f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'")
     value = _INTERNED.get(name)
     if value is None:
         try:

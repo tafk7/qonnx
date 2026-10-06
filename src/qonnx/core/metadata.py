@@ -28,7 +28,7 @@
 
 """Typed, namespaced graph metadata.
 
-A namespace (``Namespace("finn.platform", version=1)``) declares keys, each
+A namespace (``Namespace("mytool.board", version=1)``) declares keys, each
 with a type: ``str``, ``int``, ``float``, ``bool``, an ``enum.Enum`` subclass
 (stored by member name) or ``JSON`` (a JSON value). Each key is one entry of a
 graph's ``metadata_props``, named ``<namespace>/<key>``, its value the type's
@@ -59,9 +59,10 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from onnx import StringStringEntryProto
-from typing import Any, Callable, Generic, Iterable, MutableSequence, TypeVar
+from typing import Any, Callable, Generic, Iterable, MutableSequence, TypeVar, overload
 
 T = TypeVar("T")
+E = TypeVar("E", bound=Enum)
 
 SEPARATOR = "/"
 VERSION = "@version"
@@ -142,7 +143,7 @@ JSON: Codec[Any] = Codec(
 )
 
 
-def enumeration(kind: type[Enum]) -> Codec[Any]:
+def enumeration(kind: type[E]) -> Codec[E]:
     """The codec of an enumeration: a member, stored by its name."""
     return Codec(
         f"a {kind.__name__} ({', '.join(kind.__members__)})",
@@ -177,7 +178,7 @@ class Key(Generic[T]):
     namespace: Namespace
     name: str
     codec: Codec[T]
-    check: Callable[[T], bool] | None = None
+    check: Callable[[Any], bool] | None = None
     expect: str | None = None
 
     @property
@@ -223,10 +224,50 @@ class Namespace:
     def __repr__(self) -> str:
         return f"Namespace({self.name!r}, version={self.version}, inherit={self.inherit})"
 
+    # One overload per kind, so a key's value type follows from its declaration
+    # (ModelWrapper.get(key) returns it). The narrower kind comes first: an Enum
+    # may also be a str (_codec takes it as an Enum), a bool is an int, and a type
+    # checker takes an int for a float. The check's argument stays untyped: typed
+    # per kind, a lambda check would match both int and float, and the key would
+    # be Key[Any].
+    @overload
+    def key(self, name: str, kind: type[E], check: Callable[[Any], bool] | None = None, expect: str | None = None) -> Key[E]:
+        ...
+
+    @overload
+    def key(
+        self, name: str, kind: type[bool], check: Callable[[Any], bool] | None = None, expect: str | None = None
+    ) -> Key[bool]:
+        ...
+
+    @overload
+    def key(
+        self, name: str, kind: type[int], check: Callable[[Any], bool] | None = None, expect: str | None = None
+    ) -> Key[int]:
+        ...
+
+    @overload
+    def key(
+        self, name: str, kind: type[float], check: Callable[[Any], bool] | None = None, expect: str | None = None
+    ) -> Key[float]:
+        ...
+
+    @overload
+    def key(
+        self, name: str, kind: type[str], check: Callable[[Any], bool] | None = None, expect: str | None = None
+    ) -> Key[str]:
+        ...
+
+    @overload
+    def key(
+        self, name: str, kind: Codec[T], check: Callable[[Any], bool] | None = None, expect: str | None = None
+    ) -> Key[T]:
+        ...
+
     def key(self, name: str, kind: Any, check: Callable[[Any], bool] | None = None, expect: str | None = None) -> Key[Any]:
         """Declare a key: its name, its type (``str``, ``int``, ``float``, ``bool``, an
-        ``Enum`` subclass, or ``JSON``) and optionally a check on its values with
-        ``expect`` describing what the check admits."""
+        ``Enum`` subclass, or a ``Codec`` such as ``JSON``) and optionally a check on
+        its values with ``expect`` describing what the check admits."""
         _check_name(name, "key")
         if name in self.keys:
             raise ValueError(f"namespace {self.name} declares key {name!r} twice")

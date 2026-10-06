@@ -27,14 +27,13 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
+import numpy.typing as npt
 import onnx.helper as helper
 import onnx.numpy_helper as np_helper
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from onnx import GraphProto, NodeProto, TensorProto
 from typing import TYPE_CHECKING, Sequence, cast
-
-import numpy.typing as npt
-from onnx import NodeProto, GraphProto, TensorProto
 
 from qonnx.util.basic import get_by_name, get_preferred_qonnx_opset
 
@@ -59,24 +58,25 @@ class CustomOp(ABC):
 
         A class may instead state ``op_type`` and/or ``op_version`` in its own
         body (``op_type = "MatMul"``, ``op_version = 6``). A stated identity is
-        not inherited: a subclass (a backend of a kernel op, say) is identified
+        not inherited: a subclass (a backend of an op, say) is identified
         by its own name unless it states its own.
-
-        The registry automatically selects the highest version <= requested opset.
 
         Which version a node was written against is the model's: a model
         declares it per domain, by its opset import of the node's domain, as
-        ONNX does for its own operators (a node carries no version).
+        ONNX does for its own operators (a node carries no version). The node
+        resolves to the highest since-version of its op not above that import.
         ``ModelWrapper.get_customop_wrapper`` (and InferShapes, InferDataTypes,
         FoldConstants and execute_onnx through it) resolves from that import;
         a domain the model does not import reads as version 1, with a warning.
         Bare ``getCustomOp(node)`` has no model and takes the highest version
-        (warning when the op has more than one). A domain's current version is
-        ``registry.get_domain_opset_version(domain)`` (a module may state it as
-        ``opset_version``). A transformation that inserts an op of a versioned
-        domain imports the domain at that version if the model does not import
-        it yet, and otherwise uses the model's version: raising an existing
-        import would reinterpret every node of the domain already in the model.
+        (warning when the op has more than one).
+
+        A domain's current version is ``registry.get_domain_opset_version(domain)``
+        (a module may state it as ``opset_version``). A transformation that
+        inserts an op of a versioned domain should import the domain at that
+        version if the model does not import it yet, and otherwise keep the
+        model's version: raising an existing import would reinterpret every node
+        of the domain already in the model.
 
         Example:
             class IntQuant(CustomOp):
@@ -94,27 +94,28 @@ class CustomOp(ABC):
         obtained through ``ModelWrapper.get_customop_wrapper`` (which InferShapes,
         InferDataTypes, FoldConstants and execute_onnx use) are then attached to
         that ModelWrapper via ``attach_model``; bare ``getCustomOp`` never attaches.
-        Ops that do not opt in are unchanged.
+        Ops that do not opt in are unchanged, and their ``attach_model`` is never
+        called.
 
-        - Queries read the model; they do not change it. ``infer_node_datatype``
-          is the one documented exception: it writes this node's output
-          annotations, as it always has.
+        - Queries read the model; they do not change it. ``attach_model`` and
+          every query borrow a read reference; ``infer_node_datatype`` is the
+          one exception: it writes this node's output annotations, as it
+          always has.
+        - ``attach_model`` is idempotent, and an attach with a different model
+          invalidates any state derived from the previous one.
         - Lifetime: an attached instance borrows the ModelWrapper it was obtained
-          from, and its ``onnx_node`` is a node of that model. Neither follows a
-          copy: after ``model.transform(...)`` (which deep-copies by default),
-          ``copy.deepcopy`` or a reload, the instance still answers from the old
-          model. Obtain a fresh instance from the new model instead of keeping
-          one across transformations.
+          from (not a snapshot), and its ``onnx_node`` is a node of that model.
+          State derived at attach reflects the model as it was then. Neither
+          follows a copy: after ``model.transform(...)`` (which deep-copies by
+          default), ``copy.deepcopy`` or a reload, the instance still answers
+          from the old model. Obtain a fresh instance from the new model instead
+          of keeping one across transformations.
         - qonnx does not cache instances: every ``get_customop_wrapper`` call
           builds and attaches a new one, so state cached on an instance lives
           only as long as that instance.
     """
 
-    # Class-level opt-in for graph context. Default False => this op answers all
-    # queries from its own node attributes and needs no ModelWrapper. An op that
-    # derives shapes/datatypes/widths from graph context (tensor shapes, datatypes,
-    # or initializer VALUES) sets this True and overrides attach_model. The default
-    # keeps every existing op byte-for-byte unchanged.
+    # The opt-in for graph context (see "Model-aware ops" above).
     wants_model: bool = False
 
     def __init__(
@@ -128,20 +129,10 @@ class CustomOp(ABC):
 
     def attach_model(self, model: "ModelWrapper") -> "CustomOp":
         """Give this op the ModelWrapper it belongs to, so context-dependent queries
-        can be answered from live graph facts rather than baked node attributes. The
-        default stores the reference and returns self; context-dependent ops override
-        to (re)build and cache derived state.
-
-        Contract: attach_model and every query getter MUST NOT mutate the graph --
-        attach BORROWS a read reference (infer_node_datatype, which writes this
-        node's output annotations, is the exception). Idempotent; a later attach with
-        a different model must invalidate any cached derived state. A no-op trigger
-        for ops with wants_model=False (they never call it).
-
-        Lifetime: the reference is to this ModelWrapper, not to a snapshot or to its
-        copies. State derived at attach reflects the model as it was then; a caller
-        that changes or copies the model obtains a new instance from it
-        (get_customop_wrapper) rather than reusing this one."""
+        can be answered from the graph rather than from node attributes alone. The
+        default stores the reference and returns self; a model-aware op overrides
+        it to (re)build state derived from the model. The contract is the class's
+        (see "Model-aware ops")."""
         self._model = model
         return self
 
@@ -157,9 +148,7 @@ class CustomOp(ABC):
         elif len(attrdef) == 4:
             (dtype, req, def_val, allowed_values) = attrdef
         else:
-            raise Exception(
-                "Unexpected length %d n-tuple from get_nodeattr_types" % len(attrdef)
-            )
+            raise Exception("Unexpected length %d n-tuple from get_nodeattr_types" % len(attrdef))
         return (dtype, req, def_val, allowed_values)
 
     def get_nodeattr_allowed_values(
@@ -168,9 +157,7 @@ class CustomOp(ABC):
         "Return set of allowed values for given attribute, None if not specified."
         return self.get_nodeattr_def(name)[3]
 
-    def get_nodeattr(
-        self, name: str
-    ) -> int | float | str | bool | npt.NDArray | list[str | int | float] | None:
+    def get_nodeattr(self, name: str) -> int | float | str | bool | npt.NDArray | list[str | int | float] | None:
         """Get a node attribute by name. Data is stored inside the ONNX node's
         AttributeProto container. Attribute must be part of get_nodeattr_types.
         Default value is returned if attribute is not set."""
@@ -215,9 +202,7 @@ class CustomOp(ABC):
                     # not set, return default value
                     return def_val
         except KeyError:
-            raise AttributeError(
-                f"{self.onnx_node.name} has no such attribute: " + name
-            )
+            raise AttributeError(f"{self.onnx_node.name} has no such attribute: " + name)
 
     def set_nodeattr(
         self, name: str, value: int | float | str | bool | npt.NDArray | list[str | int | float] | None
@@ -228,53 +213,32 @@ class CustomOp(ABC):
             (dtype, req, def_val, allowed_values) = self.get_nodeattr_def(name)
             if allowed_values is not None:
                 if value not in allowed_values:
-                    raise ValueError(
-                        "%s = %s not in %s"
-                        % (str(name), str(value), str(allowed_values))
-                    )
+                    raise ValueError("%s = %s not in %s" % (str(name), str(value), str(allowed_values)))
             attr = get_by_name(self.onnx_node.attribute, name)
-            tensor_value : TensorProto | None = None
+            tensor_value: TensorProto | None = None
             # Verify value type matches dtype before setting/converting
             if dtype == "i":
                 if not isinstance(value, int):
                     raise TypeError(f"Attribute {name} expects int, got {type(value)}")
             elif dtype == "f":
                 if not isinstance(value, float):
-                    raise TypeError(
-                        f"Attribute {name} expects float, got {type(value)}"
-                    )
+                    raise TypeError(f"Attribute {name} expects float, got {type(value)}")
             elif dtype == "s":
                 if not isinstance(value, (str, bytes)):
                     raise TypeError(f"Attribute {name} expects str, got {type(value)}")
             elif dtype == "ints":
-                if not (
-                    isinstance(value, list) and all(isinstance(v, int) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of ints, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, int) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of ints, got {type(value)}")
             elif dtype == "floats":
-                if not (
-                    isinstance(value, list)
-                    and all(isinstance(v, (int, float)) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of floats, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, (int, float)) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of floats, got {type(value)}")
             elif dtype == "strings":
-                if not (
-                    isinstance(value, list)
-                    and all(isinstance(v, (str, bytes)) for v in value)
-                ):
-                    raise TypeError(
-                        f"Attribute {name} expects list of strings, got {type(value)}"
-                    )
+                if not (isinstance(value, list) and all(isinstance(v, (str, bytes)) for v in value)):
+                    raise TypeError(f"Attribute {name} expects list of strings, got {type(value)}")
             elif dtype == "t":
                 # Validate that value is a numpy array
                 if not isinstance(value, (np.ndarray, np.generic)):
-                    raise TypeError(
-                        f"Attribute {name} expects numpy array, got {type(value)}"
-                    )
+                    raise TypeError(f"Attribute {name} expects numpy array, got {type(value)}")
                 # Convert numpy array to TensorProto
                 tensor_value = np_helper.from_array(cast(npt.NDArray, value))
             if attr is not None:
@@ -285,9 +249,7 @@ class CustomOp(ABC):
                     val = cast(str, value).encode("utf-8")
                     attr.__setattr__(dtype, val)
                 elif dtype == "strings":
-                    attr.strings[:] = [
-                        x.encode("utf-8") for x in cast(list[str], value)
-                    ]
+                    attr.strings[:] = [x.encode("utf-8") for x in cast(list[str], value)]
                 elif dtype == "floats":  # list of floats
                     attr.floats[:] = cast(list[float], value)
                 elif dtype == "ints":  # list of integers

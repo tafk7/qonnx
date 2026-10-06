@@ -30,9 +30,10 @@ import importlib
 import inspect
 import re
 import warnings
+from onnx import NodeProto
 from threading import RLock
 from typing import Dict, List, Optional, Tuple, Type
-from onnx import NodeProto
+
 from qonnx.custom_op.base import CustomOp
 
 # Nested registry for O(1) lookups: domain -> op_type -> version -> CustomOp class
@@ -97,7 +98,7 @@ def op_identity(cls: Type[CustomOp], exported_as: Optional[str] = None) -> Tuple
 
     A class may state either in its own body (``op_type = "MatMul"``,
     ``op_version = 6``). A stated identity is not inherited, so a backend
-    subclass of a kernel op is not registered as the kernel op. Otherwise both
+    subclass of an op is not registered as that op. Otherwise both
     come from the name the domain exports the class under (``exported_as``,
     default the class name), split by split_versioned_name.
 
@@ -107,23 +108,17 @@ def op_identity(cls: Type[CustomOp], exported_as: Optional[str] = None) -> Tuple
     """
     own = vars(cls)
     name_op_type, name_version = split_versioned_name(exported_as or cls.__name__)
-    op_type = own.get("op_type", name_op_type)
-    op_version = own.get("op_version", name_version)
+    return _check_identity(own.get("op_type", name_op_type), own.get("op_version", name_version), f"{cls.__name__}.")
+
+
+def _check_identity(op_type: object, op_version: object, owner: str = "") -> Tuple[str, int]:
+    """(op_type, op_version) if op_type is a nonempty string and op_version a
+    positive integer; otherwise ValueError, naming them with the owner's prefix."""
     if not isinstance(op_type, str) or not op_type:
-        raise ValueError(f"{cls.__name__}.op_type must be a nonempty string, not {op_type!r}")
+        raise ValueError(f"{owner}op_type must be a nonempty string, not {op_type!r}")
     if type(op_version) is not int or op_version < 1:
-        raise ValueError(f"{cls.__name__}.op_version must be a positive integer, not {op_version!r}")
+        raise ValueError(f"{owner}op_version must be a positive integer, not {op_version!r}")
     return op_type, op_version
-
-
-def _get_op_type_for_class(cls: Type[CustomOp]) -> str:
-    """The op_type of a CustomOp class (see op_identity)."""
-    return op_identity(cls)[0]
-
-
-def _get_op_version_for_class(cls: Type[CustomOp]) -> int:
-    """The since-version of a CustomOp class (see op_identity)."""
-    return op_identity(cls)[1]
 
 
 def _exported_classes(module) -> List[Tuple[str, Type[CustomOp]]]:
@@ -227,8 +222,10 @@ def get_domain_opset_version(domain: str) -> int:
     stated = getattr(module, "opset_version", None)
     if stated is None:
         return highest
-    if type(stated) is not int or stated < highest:
-        raise ValueError(f"{domain}.opset_version = {stated!r} is below its ops' highest since-version {highest}")
+    if type(stated) is not int:
+        raise ValueError(f"{domain}.opset_version must be an integer, not {stated!r}")
+    if stated < highest:
+        raise ValueError(f"{domain}.opset_version = {stated} is below its ops' highest since-version {highest}")
     return stated
 
 
@@ -308,12 +305,9 @@ def add_op_to_domain(
         raise ValueError(f"{op_class} must be a subclass of CustomOp")
 
     class_op_type, class_version = op_identity(op_class)
-    op_type = class_op_type if op_type is None else op_type
-    op_version = class_version if op_version is None else op_version
-    if not isinstance(op_type, str) or not op_type:
-        raise ValueError(f"op_type must be a nonempty string, not {op_type!r}")
-    if type(op_version) is not int or op_version < 1:
-        raise ValueError(f"op_version must be a positive integer, not {op_version!r}")
+    op_type, op_version = _check_identity(
+        class_op_type if op_type is None else op_type, class_version if op_version is None else op_version
+    )
 
     with _REGISTRY_LOCK:
         # merge what the domain module exports first, so registering one
