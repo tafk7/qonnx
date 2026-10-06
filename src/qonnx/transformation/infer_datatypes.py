@@ -26,11 +26,19 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
+
+from onnx import NodeProto
+from typing import TYPE_CHECKING
+
 from qonnx.core.datatype import DataType, ScaledIntType
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.qcdq_to_qonnx import extract_elem_type
 from qonnx.util.basic import get_by_name
+
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
 
 
 def is_scaled_int(x):
@@ -56,7 +64,7 @@ def infer_mac_result_dtype(idtypes, odtype_orig, possible_negation):
     return ret
 
 
-def _infer_node_datatype(model, node, allow_scaledint_dtypes):
+def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes: bool) -> bool:
     """Infer output datatype(s) for a particular node. Returns True if any
     changes were made."""
     dt_identity_optypes = [
@@ -166,5 +174,5 @@ class InferDataTypes(Transformation):
         graph = model.graph
         graph_modified = False
         for node in graph.node:
-            graph_modified |= _infer_node_datatype(model, node, self.allow_scaledint_dtypes)
+            graph_modified |= infer_node_datatype(model, node, self.allow_scaledint_dtypes)
         return (model, graph_modified)
