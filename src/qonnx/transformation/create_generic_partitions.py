@@ -31,6 +31,7 @@ import pathlib
 import tempfile
 from onnx import helper
 
+from qonnx.core import metadata
 from qonnx.transformation.base import Transformation
 
 
@@ -46,6 +47,11 @@ class PartitionFromLambda(Transformation):
 
     Argument 1 (optional): partition_dir
     * Manually define where to save the partition models
+
+    A partition model is cut from a copy of the graph: it keeps the graph's
+    metadata whole, and a tensor's typed metadata (qonnx.core.metadata) of the
+    namespaces that follow a tensor into a cut only. The parent graph keeps its
+    own copy of a boundary tensor's metadata (ModelWrapper.clear removes it).
     """
 
     def __init__(self, partitioning=lambda node: -1, partition_dir=None):
@@ -143,6 +149,14 @@ class PartitionFromLambda(Transformation):
             for o in p_out_vi:
                 if o in p_model.graph.value_info:
                     p_model.graph.value_info.remove(o)
+
+            # a tensor's typed metadata follows it into the partition for the
+            # namespaces that state so (qonnx.core.metadata.cut); the parent
+            # keeps its own copy of a boundary tensor's
+            for annotation in list(p_model.graph.quantization_annotation):
+                metadata.cut(annotation.quant_parameter_tensor_names)
+                if len(annotation.quant_parameter_tensor_names) == 0:
+                    p_model.graph.quantization_annotation.remove(annotation)
 
             # save partition model
             p_model_filename = self.partition_dir + "/partition_" + str(partition_id) + ".onnx"

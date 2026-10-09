@@ -171,6 +171,19 @@ A key's type is ``str``, ``int``, ``float``, ``bool``, an ``Enum`` subclass (sto
 
 Transformations that edit the graph in place keep its metadata; ``MergeONNXModels`` keeps both graphs' (a typed key the two state differently raises ``MetadataError``). A subgraph body (a graph attribute) holds metadata of its own. A namespace declared with ``inherit=True`` reaches into bodies: a body opened with ``make_subgraph_modelwrapper`` (as ``transform(..., apply_to_subgraphs=True)`` does) reads a key it does not state itself from the model it is a body of. A body read alone has only its own keys, so code that extracts a body to stand alone copies them in first with ``body.inherit_metadata(namespace)`` (or ``inherit_metadata(namespace, parent=model)`` for a model built apart from its parent).
 
+A tensor has typed metadata of its own: ``get``, ``set``, ``delete`` and ``namespace`` take ``tensor=`` (a tensor name; without it they are the graph's), for any tensor, initializers included. A tensor the graph does not have raises ``MetadataError``. A tensor's keys are stored as the graph's are, in its entry of the graph's ``quantization_annotation`` (beside its ``finn_datatype`` and ``tensor_layout``), so they survive ``set_tensor_shape`` and ``set_initializer``, are renamed with the tensor (``rename_tensor``) and removed with it (``RemoveUnusedTensors``). A body's tensor keys are its own (``inherit`` concerns graph keys).
+::
+
+  STREAM = Namespace("mytool.stream", version=1, follow=True)
+  DEPTH = STREAM.key("depth", int)
+
+  model.set(DEPTH, 32, tensor="t")         # mytool.stream/depth, @version and @follow on tensor t
+  model.get(DEPTH, tensor="t")             # 32
+  model.tensors_stating(STREAM)            # ["t"]
+  model.clear(STREAM, tensor="t")          # every entry of the namespace, from one tensor (or the graph)
+
+A namespace states whether a tensor's keys follow the tensor into a subgraph cut from the graph (``follow=True``; stored on the tensor as ``<namespace>/@follow``, so that whoever cuts the graph reads it from the model). ``PartitionFromLambda`` and ``PartitionFromDict`` keep them on the partition's copy of each tensor and drop the keys of a namespace that does not follow; the partition keeps the graph's own metadata whole, and the parent graph keeps its copy of a boundary tensor's keys (a caller that wants it gone clears it).
+
 ModelWrapper contains more useful functions, if you are interested please have a look at the ModelWrapper module (:py:mod:`qonnx.core.modelwrapper.ModelWrapper`) directly.
 
 

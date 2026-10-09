@@ -134,11 +134,16 @@ def test_quantize_graph(test_model):
         inf_cost["total_mem_w_elems"] == original_model_inf_cost["total_mem_w_elems"]
     )  # "11678912.0" must be same as the original model.
     assert (
-        inf_cost["total_mem_o_bits"] == original_model_inf_cost["total_mem_o_bits"]
-    )  # "79510784.0" must be same as the original model.
-    assert (
         inf_cost["total_mem_o_elems"] == original_model_inf_cost["total_mem_o_elems"]
     )  # "2484712.0" must be same as the original model.
+    # the MAC outputs whose inputs are now all quantized are typed by their exact
+    # ranges: Conv_0 (INT8 input, 3x7x7 INT8 weights) as INT11, the Gemm as INT8;
+    # the others stay FLOAT32, all of them before
+    assert original_model_inf_cost["mem_o_FLOAT32"] == 2484712.0
+    assert inf_cost["mem_o_FLOAT32"] == 1680896.0
+    assert inf_cost["mem_o_INT11"] == 802816.0
+    assert inf_cost["mem_o_INT8"] == 1000.0
+    assert inf_cost["total_mem_o_bits"] == 62627648.0  # 79510784.0 before
     assert inf_cost["total_bops"] == 1566256136192.0
     assert inf_cost["total_mem_w_bits"] == 360326656.0
     assert inf_cost["op_mac_INT8_INT8"] == 118525952.0

@@ -750,32 +750,107 @@ class ModelWrapper:
         else:
             metadata_prop.value = value
 
-    def get(self, key: metadata.Key[T]) -> T | None:
-        """The value of a typed metadata key (:py:mod:`qonnx.core.metadata`), or
-        None when the graph does not state it. Raises MetadataError when the
-        key's namespace is stored malformed."""
-        return self.namespace(key.namespace).get(key.name)
+    def _tensor_annotation(self, tensor: str) -> onnx.TensorAnnotation | None:
+        """A tensor's quantization annotation, which holds its metadata entries, if
+        it has one. MetadataError for a name the graph has no tensor of."""
+        if tensor not in self._tensor_names():
+            raise metadata.MetadataError(f"tensor {tensor!r}: the graph has no tensor of that name")
+        return util.get_by_name(self.graph.quantization_annotation, tensor, "tensor_name")
 
-    def set(self, key: metadata.Key[T], value: T) -> None:
-        """Store a value under a typed metadata key, with its namespace's version.
-        Raises MetadataError for a value the key does not admit."""
-        metadata.write(self.graph.metadata_props, key, value)
+    def _tensor_names(self) -> set[str]:
+        """Every tensor the graph has: its inputs, outputs, value_info, initializers
+        and the nodes' inputs and outputs."""
+        graph = self.graph
+        names = {vi.name for vi in [*graph.input, *graph.output, *graph.value_info]}
+        names.update(init.name for init in graph.initializer)
+        for node in graph.node:
+            names.update(node.input)
+            names.update(node.output)
+        names.discard("")
+        return names
 
-    def delete(self, key: metadata.Key[Any]) -> None:
+    def _drop_empty(self, annotation: onnx.TensorAnnotation) -> None:
+        """Remove a tensor's annotation once it holds no entry."""
+        if len(annotation.quant_parameter_tensor_names) == 0:
+            self.graph.quantization_annotation.remove(annotation)
+
+    def get(self, key: metadata.Key[T], *, tensor: str | None = None) -> T | None:
+        """The value of a typed metadata key (:py:mod:`qonnx.core.metadata`) of the
+        graph, or of the named tensor, or None when it does not state it. Raises
+        MetadataError when the key's namespace is stored malformed, or for a
+        tensor the graph does not have."""
+        return self.namespace(key.namespace, tensor=tensor).get(key.name)
+
+    def set(self, key: metadata.Key[T], value: T, *, tensor: str | None = None) -> None:
+        """Store a value under a typed metadata key, with its namespace's version, on
+        the graph or on the named tensor (any tensor: an input, an output, an
+        intermediate or an initializer). Raises MetadataError for a value the key
+        does not admit, or for a tensor the graph does not have."""
+        if tensor is None:
+            metadata.write(self.graph.metadata_props, key, value)
+            return
+        annotation = self._tensor_annotation(tensor)
+        if annotation is not None:
+            metadata.write(annotation.quant_parameter_tensor_names, key, value, tensor=True)
+            return
+        # a tensor's first annotation is added once the value is written
+        made = onnx.TensorAnnotation(tensor_name=tensor)
+        metadata.write(made.quant_parameter_tensor_names, key, value, tensor=True)
+        self.graph.quantization_annotation.append(made)
+
+    def delete(self, key: metadata.Key[Any], *, tensor: str | None = None) -> None:
         """Remove a typed metadata key (and its namespace's version with the last
-        key); nothing happens when the graph does not state it."""
-        metadata.delete(self.graph.metadata_props, key)
+        key) from the graph or the named tensor; nothing happens when it does not
+        state it. MetadataError for a tensor the graph does not have."""
+        if tensor is None:
+            metadata.delete(self.graph.metadata_props, key)
+            return
+        annotation = self._tensor_annotation(tensor)
+        if annotation is not None:
+            metadata.delete(annotation.quant_parameter_tensor_names, key, tensor=True)
+            self._drop_empty(annotation)
 
-    def namespace(self, namespace: metadata.Namespace) -> dict[str, Any]:
-        """Every key of a typed metadata namespace the graph states, decoded, by
-        key name in declaration order. For a subgraph body (make_subgraph_modelwrapper)
-        and an inheriting namespace, a key the body does not state is read from
-        the model it is a body of."""
+    def clear(self, namespace: metadata.Namespace, *, tensor: str | None = None) -> None:
+        """Remove every entry of a typed metadata namespace from the graph or the
+        named tensor, as stored (it need not be readable). MetadataError for a
+        tensor the graph does not have. For every tensor's, clear each of
+        tensors_stating(namespace)."""
+        if tensor is None:
+            metadata.clear(self.graph.metadata_props, namespace)
+            return
+        annotation = self._tensor_annotation(tensor)
+        if annotation is not None:
+            metadata.clear(annotation.quant_parameter_tensor_names, namespace)
+            self._drop_empty(annotation)
+
+    def namespace(self, namespace: metadata.Namespace, *, tensor: str | None = None) -> dict[str, Any]:
+        """Every key of a typed metadata namespace the graph (or the named tensor)
+        states, decoded, by key name in declaration order. For a subgraph body
+        (make_subgraph_modelwrapper) and an inheriting namespace, a graph key the
+        body does not state is read from the model it is a body of; a tensor's keys
+        are its own. MetadataError for a tensor the graph does not have."""
+        if tensor is not None:
+            annotation = self._tensor_annotation(tensor)
+            return (
+                {} if annotation is None else metadata.read(annotation.quant_parameter_tensor_names, namespace, tensor=True)
+            )
         own = metadata.read(self.graph.metadata_props, namespace)
         if not namespace.inherit or self._parent is None:
             return own
         values = {**self._parent.namespace(namespace), **own}
         return {name: values[name] for name in namespace.keys if name in values}
+
+    def tensors_stating(self, namespace: metadata.Namespace) -> list[str]:
+        """The names of the tensors that store entries of a typed metadata namespace,
+        in the order of their annotations (nothing is read)."""
+        prefix = namespace.name + metadata.SEPARATOR
+        names = self._tensor_names()
+        return [
+            annotation.tensor_name
+            for annotation in self.graph.quantization_annotation
+            if annotation.tensor_name in names
+            and any(entry.key.startswith(prefix) for entry in annotation.quant_parameter_tensor_names)
+        ]
 
     def inherit_metadata(self, *namespaces: metadata.Namespace, parent: ModelWrapper | None = None) -> None:
         """Copy into this graph the keys of the given inheriting namespaces that it

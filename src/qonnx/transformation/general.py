@@ -28,13 +28,13 @@
 
 import numpy as np
 import onnx.helper as helper
-
-# Protobuf onnx graph node type
-from onnx import NodeProto  # noqa
 from toposort import toposort_flatten
 
 import qonnx.util.basic as util
 from qonnx.transformation.base import Transformation
+
+# Protobuf onnx graph node type
+from onnx import NodeProto  # noqa
 
 
 class MovePadAttributeToTensor(Transformation):
@@ -217,6 +217,11 @@ class GiveUniqueParameterTensors(Transformation):
                 new_param_name = model.make_new_valueinfo_name()
 
                 model.set_initializer(new_param_name, input_init)
+                # the copy carries the parameter's annotations, its typed metadata among them
+                original = util.get_by_name(graph.quantization_annotation, node_input, "tensor_name")
+                if original is not None:
+                    copied = graph.quantization_annotation.add(tensor_name=new_param_name)
+                    copied.quant_parameter_tensor_names.extend(original.quant_parameter_tensor_names)
                 model.set_tensor_datatype(new_param_name, model.get_tensor_datatype(node_input))
 
                 # point node input to new tensor

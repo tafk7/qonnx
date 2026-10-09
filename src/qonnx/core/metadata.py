@@ -26,29 +26,47 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Typed, namespaced graph metadata.
+"""Typed, namespaced metadata of a graph and of its tensors.
 
 A namespace (``Namespace("mytool.board", version=1)``) declares keys, each
 with a type: ``str``, ``int``, ``float``, ``bool``, an ``enum.Enum`` subclass
 (stored by member name) or ``JSON`` (a JSON value). Each key is one entry of a
-graph's ``metadata_props``, named ``<namespace>/<key>``, its value the type's
+list of string entries, named ``<namespace>/<key>``, its value the type's
 canonical text; the namespace's version is the entry ``<namespace>/@version``,
-written with its keys. A graph stores each namespace at one version.
+written with its keys. Each list stores each namespace at one version.
+
+A graph's keys are its ``metadata_props``. A tensor's keys are its entry of
+the graph's ``quantization_annotation`` (``quant_parameter_tensor_names``,
+beside qonnx's ``finn_datatype`` and ``tensor_layout``), which every tensor can
+have, initializers included, and which ``rename_tensor`` renames and
+``RemoveUnusedTensors`` removes with its tensor.
+
+A namespace states whether a tensor's keys follow the tensor into a subgraph
+cut from the graph (``Namespace(..., follow=True)``). A tensor's entries of a
+namespace that follows also hold ``<namespace>/@follow`` (``true``), so the
+stored entries say it whoever cuts them: a cut keeps them on the body's copy of
+the tensor and drops the others (``cut``; qonnx's ``PartitionFromLambda``). The
+graph keeps its own copy of a boundary tensor's keys; the cut leaves that to
+its caller (``clear``).
 
 Nothing coerces. A stored value that does not parse as its key's type, a value
 of the wrong type on writing, a stored key the namespace does not declare, a
 namespace stored without a version or at a version the reader cannot upgrade
-from raise ``MetadataError``, naming the entry, the text and the expectation.
+from, and a tensor's namespace whose ``@follow`` disagrees with its declaration
+at its version raise ``MetadataError``, naming the entry, the text and the
+expectation.
 
 Versions are upgraded, never downgraded: a namespace at version N may register
 an upgrade from each earlier version (a function from the entries stored at
 that version, key name to text, to those of the next). A reader upgrades what it
 reads; a writer rewrites the namespace at the current version before writing.
 
-The functions here operate on a ``metadata_props`` field (a graph's); the
-``ModelWrapper`` methods ``get``, ``set``, ``delete`` and ``namespace`` are
-the API. The untyped ``get_metadata_prop``/``set_metadata_prop`` keep working
-for keys outside any namespace.
+The functions here operate on one list of entries (``tensor=True`` for a
+tensor's); the ``ModelWrapper`` methods ``get``, ``set``, ``delete``,
+``namespace`` and ``clear``, each with an optional ``tensor=``, and
+``tensors_stating`` are the API.
+The untyped ``get_metadata_prop``/``set_metadata_prop`` keep working for keys
+outside any namespace.
 """
 
 from __future__ import annotations
@@ -66,6 +84,7 @@ E = TypeVar("E", bound=Enum)
 
 SEPARATOR = "/"
 VERSION = "@version"
+FOLLOW = "@follow"
 
 
 class MetadataError(ValueError):
@@ -208,21 +227,24 @@ class Key(Generic[T]):
 
 class Namespace:
     """A versioned set of typed keys. ``inherit=True`` lets a subgraph body read a
-    key it does not state itself from the graph it is a body of (see
-    ``ModelWrapper.make_subgraph_modelwrapper``)."""
+    graph key it does not state itself from the graph it is a body of (see
+    ``ModelWrapper.make_subgraph_modelwrapper``). ``follow=True`` lets a tensor's
+    keys follow the tensor into a subgraph cut from its graph (see ``cut``);
+    without it, a cut drops them from the body's copy of the tensor."""
 
-    def __init__(self, name: str, version: int = 1, inherit: bool = False) -> None:
+    def __init__(self, name: str, version: int = 1, inherit: bool = False, follow: bool = False) -> None:
         _check_name(name, "namespace")
         if not isinstance(version, int) or isinstance(version, bool) or version < 1:
             raise ValueError(f"namespace {name}: a version is a positive int, not {version!r}")
         self.name = name
         self.version = version
         self.inherit = inherit
+        self.follow = follow
         self.keys: dict[str, Key[Any]] = {}
         self._upgrades: dict[int, Callable[[dict[str, str]], dict[str, str]]] = {}
 
     def __repr__(self) -> str:
-        return f"Namespace({self.name!r}, version={self.version}, inherit={self.inherit})"
+        return f"Namespace({self.name!r}, version={self.version}, inherit={self.inherit}, follow={self.follow})"
 
     # One overload per kind, so a key's value type follows from its declaration
     # (ModelWrapper.get(key) returns it). The narrower kind comes first: an Enum
@@ -307,10 +329,14 @@ class Namespace:
 Props = MutableSequence[StringStringEntryProto]
 
 
-def _stored(props: Iterable[StringStringEntryProto], namespace: Namespace) -> tuple[int | None, dict[str, str]]:
-    """A namespace's stored version and entries (key name to text), as stored."""
+def _stored(
+    props: Iterable[StringStringEntryProto], namespace: Namespace, tensor: bool
+) -> tuple[int | None, bool, dict[str, str]]:
+    """A namespace's stored version, whether it is stored as following its tensor
+    into a cut, and its entries (key name to text), as stored."""
     prefix = namespace.name + SEPARATOR
     version_text = None
+    follow_text = None
     entries: dict[str, str] = {}
     for prop in props:
         if not prop.key.startswith(prefix):
@@ -320,44 +346,66 @@ def _stored(props: Iterable[StringStringEntryProto], namespace: Namespace) -> tu
             if version_text is not None:
                 raise MetadataError(f"{prop.key}: stored twice")
             version_text = prop.value
+        elif name == FOLLOW:
+            if follow_text is not None:
+                raise MetadataError(f"{prop.key}: stored twice")
+            follow_text = prop.value
         elif name in entries:
             raise MetadataError(f"{prop.key}: stored twice")
         else:
             entries[name] = prop.value
+    if follow_text is not None:
+        if not tensor:
+            raise MetadataError(f"{prefix}{FOLLOW}: stored on a graph; only a tensor's namespace states it")
+        if follow_text != "true":
+            raise MetadataError(f"{prefix}{FOLLOW}: stored {follow_text!r}, not 'true'")
     if version_text is None:
-        if entries:
-            raise MetadataError(f"{namespace.name}: keys {sorted(entries)} are stored without {prefix}{VERSION}")
-        return None, entries
+        if entries or follow_text is not None:
+            stored = sorted(entries) + ([FOLLOW] if follow_text is not None else [])
+            raise MetadataError(f"{namespace.name}: keys {stored} are stored without {prefix}{VERSION}")
+        return None, False, entries
     if not re.fullmatch(r"[1-9][0-9]*", version_text):
         raise MetadataError(f"{prefix}{VERSION}: stored {version_text!r} is not a positive int")
-    return int(version_text), entries
+    return int(version_text), follow_text is not None, entries
 
 
-def read(props: Iterable[StringStringEntryProto], namespace: Namespace) -> dict[str, Any]:
-    """The keys of ``namespace`` stored in ``props``, decoded (upgraded from an
-    earlier stored version), in declaration order; MetadataError as the module
-    describes."""
-    version, entries = _stored(props, namespace)
+def _load(props: Iterable[StringStringEntryProto], namespace: Namespace, tensor: bool) -> tuple[int | None, dict[str, str]]:
+    """A namespace's stored version and entries; a tensor's namespace stored at the
+    current version must state ``@follow`` as the namespace declares it."""
+    version, follows, entries = _stored(props, namespace, tensor)
+    if tensor and version == namespace.version and follows != namespace.follow:
+        raise MetadataError(
+            f"{namespace.name}{SEPARATOR}{FOLLOW}: stored {'with' if follows else 'without'} it at version {version}, "
+            f"which declares follow={namespace.follow}"
+        )
+    return version, entries
+
+
+def read(props: Iterable[StringStringEntryProto], namespace: Namespace, *, tensor: bool = False) -> dict[str, Any]:
+    """The keys of ``namespace`` stored in ``props`` (a tensor's entries when
+    ``tensor``), decoded (upgraded from an earlier stored version), in declaration
+    order; MetadataError as the module describes."""
+    version, entries = _load(props, namespace, tensor)
     if version is None:
         return {}
     return namespace._decoded(namespace._current(version, entries))
 
 
-def _rewrite(props: Props, namespace: Namespace, entries: dict[str, str]) -> None:
+def _rewrite(props: Props, namespace: Namespace, entries: dict[str, str], tensor: bool) -> None:
     """Replace the namespace's stored entries by ``entries`` at the current version
     (none at all when ``entries`` is empty)."""
-    prefix = namespace.name + SEPARATOR
-    for prop in [prop for prop in props if prop.key.startswith(prefix)]:
-        props.remove(prop)
+    clear(props, namespace)
     if entries:
-        props.append(StringStringEntryProto(key=prefix + VERSION, value=str(namespace.version)))
+        props.append(StringStringEntryProto(key=namespace.name + SEPARATOR + VERSION, value=str(namespace.version)))
+        if tensor and namespace.follow:
+            props.append(StringStringEntryProto(key=namespace.name + SEPARATOR + FOLLOW, value="true"))
         for name, key in namespace.keys.items():
             if name in entries:
                 props.append(StringStringEntryProto(key=key.entry, value=entries[name]))
 
 
-def _current_entries(props: Props, namespace: Namespace) -> dict[str, str]:
-    version, entries = _stored(props, namespace)
+def _current_entries(props: Props, namespace: Namespace, tensor: bool) -> dict[str, str]:
+    version, entries = _load(props, namespace, tensor)
     if version is None:
         return {}
     entries = namespace._current(version, entries)
@@ -365,12 +413,13 @@ def _current_entries(props: Props, namespace: Namespace) -> dict[str, str]:
     return entries
 
 
-def write(props: Props, key: Key[T], value: T) -> None:
+def write(props: Props, key: Key[T], value: T, *, tensor: bool = False) -> None:
     """Store ``value`` under ``key`` (the namespace rewritten at the current version
-    if it was stored at an earlier one)."""
+    if it was stored at an earlier one) in ``props``, a tensor's entries when
+    ``tensor``."""
     text = key.encode(value)
     namespace = key.namespace
-    version, stored = _stored(props, namespace)
+    version, stored = _load(props, namespace, tensor)
     if version == namespace.version:
         namespace._decoded(stored)
         for prop in props:
@@ -379,17 +428,43 @@ def write(props: Props, key: Key[T], value: T) -> None:
                 return
         props.append(StringStringEntryProto(key=key.entry, value=text))
         return
-    entries = _current_entries(props, namespace)
+    entries = _current_entries(props, namespace, tensor)
     entries[key.name] = text
-    _rewrite(props, namespace, entries)
+    _rewrite(props, namespace, entries, tensor)
 
 
-def delete(props: Props, key: Key[Any]) -> None:
+def delete(props: Props, key: Key[Any], *, tensor: bool = False) -> None:
     """Remove ``key``'s entry, and the namespace's version with its last key."""
-    entries = _current_entries(props, key.namespace)
+    entries = _current_entries(props, key.namespace, tensor)
     if key.name in entries:
         del entries[key.name]
-        _rewrite(props, key.namespace, entries)
+        _rewrite(props, key.namespace, entries, tensor)
+
+
+def clear(props: Props, namespace: Namespace) -> None:
+    """Remove every entry of ``namespace``, as stored (nothing is read: a namespace
+    stored malformed or at a version this reader cannot upgrade from is removed
+    too)."""
+    prefix = namespace.name + SEPARATOR
+    for prop in [prop for prop in props if prop.key.startswith(prefix)]:
+        props.remove(prop)
+
+
+def cut(props: Props) -> None:
+    """A tensor's entries as a subgraph cut from its graph keeps them: the entries
+    of each typed namespace (one stored with a version) that is not stored as
+    following its tensor (``@follow``) are removed. Entries outside a typed
+    namespace stay."""
+    keys = [prop.key for prop in props]
+    typed = {key[: -len(SEPARATOR + VERSION)] for key in keys if key.endswith(SEPARATOR + VERSION)}
+    follows = {
+        prop.key[: -len(SEPARATOR + FOLLOW)]
+        for prop in props
+        if prop.key.endswith(SEPARATOR + FOLLOW) and prop.value == "true"
+    }
+    dropped = typed - follows
+    for prop in [prop for prop in props if SEPARATOR in prop.key and prop.key.split(SEPARATOR, 1)[0] in dropped]:
+        props.remove(prop)
 
 
 def merge(main: Iterable[StringStringEntryProto], other: Iterable[StringStringEntryProto]) -> list[StringStringEntryProto]:
@@ -421,6 +496,8 @@ __all__ = [
     "MetadataError",
     "Namespace",
     "STR",
+    "clear",
+    "cut",
     "delete",
     "enumeration",
     "merge",
