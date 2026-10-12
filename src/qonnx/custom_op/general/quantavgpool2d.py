@@ -110,7 +110,9 @@ class QuantAvgPool2d(CustomOp):
         node = self.onnx_node
         k = self.get_nodeattr("kernel")
         s = self.get_nodeattr("stride")
-        inp_values = context[node.input[0]]
+        # Computed in float32 whatever the input's type: ONNX Runtime has no float64
+        # AveragePool.
+        inp_values = context[node.input[0]].astype(np.float32)
         oshape = context[node.output[0]].shape
         if self.get_nodeattr("data_layout") == "NHWC":
             inp_values = inp_values.transpose(0, 3, 1, 2)

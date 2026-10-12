@@ -29,7 +29,7 @@
 # TODO deprecate in favor of the channels_last MaxPool
 
 import numpy as np
-from onnx import TensorProto, helper
+from onnx import helper
 
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.base import CustomOp
@@ -98,12 +98,13 @@ class MaxPoolNHWC(CustomOp):
         # convert i/o NHWC -> NCHW
         inp = np.transpose(inp, (0, 3, 1, 2))
         dummy_out = np.transpose(dummy_out, (0, 3, 1, 2))
-        # execute as regular MaxPool
+        # Executed as a standard MaxPool, in the element type of the input it is given.
         orig_domain = node.domain
         node.domain = ""
         node.op_type = "MaxPool"
-        inp_vi = helper.make_tensor_value_info(inp_name, TensorProto.FLOAT, inp.shape)
-        out_vi = helper.make_tensor_value_info(out_name, TensorProto.FLOAT, dummy_out.shape)
+        elem_type = helper.np_dtype_to_tensor_dtype(inp.dtype)
+        inp_vi = helper.make_tensor_value_info(inp_name, elem_type, inp.shape)
+        out_vi = helper.make_tensor_value_info(out_name, elem_type, dummy_out.shape)
         tmp_graph = helper.make_graph(nodes=[node], name="tmp_graph", inputs=[inp_vi], outputs=[out_vi])
         tmp_model = qonnx_make_model(tmp_graph, producer_name="finn")
         tmp_model = ModelWrapper(tmp_model)
