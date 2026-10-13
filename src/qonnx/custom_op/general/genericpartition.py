@@ -27,7 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from qonnx.core.modelwrapper import ModelWrapper
-from qonnx.core.onnx_exec import exact_integers_running, execute_onnx
+from qonnx.core.onnx_exec import execute_onnx
 from qonnx.custom_op.base import CustomOp
 
 
@@ -59,8 +59,7 @@ class GenericPartition(CustomOp):
             if old_iname != new_iname:
                 inp_ctx[new_iname] = inp_ctx[old_iname]
                 del inp_ctx[old_iname]
-        # The body runs with the option its partition node was executed with.
-        ret = execute_onnx(model, inp_ctx, return_full_exec_context, exact_integers=exact_integers_running())
+        ret = execute_onnx(model, inp_ctx, return_full_exec_context)
         # outputs may have been renamed in partition
         for i, node_oname in enumerate(node.output):
             model_oname = model.graph.output[i].name

@@ -26,8 +26,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Execution with exact_integers: a standard node whose float tensors all hold integers,
-one past what its float container holds exactly, computes in float64."""
+"""Execution with exact integers (QONNX_EXACT_INTEGERS): a standard node whose float tensors
+all hold integers, one past what its float container holds exactly, computes in float64;
+constant folding stores such a node's value in its stated type where that type holds it,
+and refuses where it does not."""
 
 import pytest
 
@@ -36,13 +38,26 @@ from onnx import TensorProto, helper
 
 from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
-from qonnx.core.onnx_exec import execute_node, execute_onnx
+from qonnx.core.onnx_exec import EXACT_INTEGERS, execute_node, execute_onnx, get_exact_integers
+from qonnx.transformation.fold_constants import FoldConstants, FoldConstantsFiltered
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.util.basic import qonnx_make_model
 
 GENERAL = "qonnx.custom_op.general"
 K = 2304
 F = TensorProto.FLOAT
+
+
+@pytest.fixture
+def exact(monkeypatch):
+    """Exact integers on for the test."""
+    monkeypatch.setenv(EXACT_INTEGERS, "1")
+
+
+@pytest.fixture
+def rounding(monkeypatch):
+    """Exact integers off for the test, as by default."""
+    monkeypatch.delenv(EXACT_INTEGERS, raising=False)
 
 
 def wide_weights():
@@ -79,7 +94,20 @@ def wide_layer(weights=None):
     return model.transform(InferDataTypes())
 
 
-def test_a_wide_matmul_is_exact_with_the_option_and_rounds_without():
+def test_the_setting_is_read_from_the_environment(monkeypatch):
+    monkeypatch.delenv(EXACT_INTEGERS, raising=False)
+    assert get_exact_integers() is False
+    monkeypatch.setenv(EXACT_INTEGERS, "0")
+    assert get_exact_integers() is False
+    monkeypatch.setenv(EXACT_INTEGERS, "1")
+    assert get_exact_integers() is True
+    monkeypatch.setenv(EXACT_INTEGERS, "yes")
+    with pytest.raises(ValueError, match=EXACT_INTEGERS):
+        get_exact_integers()
+
+
+def test_a_wide_matmul_is_exact_with_the_setting_and_rounds_without(monkeypatch):
+    monkeypatch.delenv(EXACT_INTEGERS, raising=False)
     weights = wide_weights()
     model = wide_layer(weights)
     x = wide_input(weights)
@@ -91,35 +119,36 @@ def test_a_wide_matmul_is_exact_with_the_option_and_rounds_without():
     assert rounded.dtype == np.float32
     assert not np.array_equal(rounded.astype(np.int64), exact)
 
-    widened = execute_onnx(model, {"x": x.astype(np.float32)}, exact_integers=True)["s"]
+    monkeypatch.setenv(EXACT_INTEGERS, "1")
+    widened = execute_onnx(model, {"x": x.astype(np.float32)})["s"]
     assert widened.dtype == np.float64
     assert np.array_equal(widened.astype(np.int64), exact)
     # The caller may give the integers as they are: the node casts what it reads.
-    given = execute_onnx(model, {"x": x}, exact_integers=True)["s"]
+    given = execute_onnx(model, {"x": x})["s"]
     assert np.array_equal(given.astype(np.int64), exact)
 
 
-def test_a_float_node_reads_a_widened_tensor_back_in_float32():
+def test_a_float_node_reads_a_widened_tensor_back_in_float32(exact):
     weights = wide_weights()
     model = wide_layer(weights)
     x = wide_input(weights)
     exact = x @ weights.astype(np.int64)
-    out = execute_onnx(model, {"x": x.astype(np.float32)}, exact_integers=True, return_full_exec_context=True)
+    out = execute_onnx(model, {"x": x.astype(np.float32)}, return_full_exec_context=True)
     assert out["s"].dtype == np.float64
     # Mul is float arithmetic (0.5 is no integer): it reads the exact sums in float32.
     assert out["scaled"].dtype == np.float32
     assert np.array_equal(out["scaled"], exact.astype(np.float32) * np.float32(0.5))
 
 
-def test_a_node_widened_past_2_to_the_53_raises_naming_the_tensor():
+def test_a_node_widened_past_2_to_the_53_raises_naming_the_tensor(exact):
     model = wide_layer()
     model.set_tensor_datatype("s", DataType["INT60"])
     x = np.zeros((2, K), dtype=np.float32)
     with pytest.raises(ArithmeticError, match=r"MatMul_0 \(MatMul\): s .*INT60"):
-        execute_onnx(model, {"x": x}, exact_integers=True)
+        execute_onnx(model, {"x": x})
 
 
-def test_a_widened_op_without_a_float64_kernel_raises_naming_it():
+def test_a_widened_op_without_a_float64_kernel_raises_naming_it(exact):
     graph = helper.make_graph(
         [helper.make_node("Conv", ["x", "w"], ["y"], name="Conv_0", kernel_shape=[1, 1])],
         "conv",
@@ -133,39 +162,42 @@ def test_a_widened_op_without_a_float64_kernel_raises_naming_it():
     model = model.transform(InferDataTypes())
     assert model.get_tensor_datatype("y").max() > 2**24
     with pytest.raises(NotImplementedError, match=r"Conv_0 \(Conv\).*float64"):
-        execute_onnx(model, {"x": np.ones((1, 2, 2, 2), dtype=np.float32)}, exact_integers=True)
+        execute_onnx(model, {"x": np.ones((1, 2, 2, 2), dtype=np.float32)})
 
 
-def test_off_by_default_and_within_float32_nothing_changes():
+def test_off_by_default_and_within_float32_nothing_changes(monkeypatch):
     weights = wide_weights()
     model = wide_layer(weights)
     x = wide_input(weights).astype(np.float32)
+    monkeypatch.delenv(EXACT_INTEGERS, raising=False)
     default = execute_onnx(model, {"x": x}, return_full_exec_context=True)
-    off = execute_onnx(model, {"x": x}, return_full_exec_context=True, exact_integers=False)
+    monkeypatch.setenv(EXACT_INTEGERS, "0")
+    off = execute_onnx(model, {"x": x}, return_full_exec_context=True)
     for name, value in default.items():
         if value is not None:
             assert off[name].dtype == value.dtype and np.array_equal(off[name], value)
-    # A layer whose sums float32 holds exactly runs as it does today with the option on.
+    # A layer whose sums float32 holds exactly runs with the setting on as it does off.
     narrow = wide_layer(weights[:16])
     narrow.set_tensor_shape("x", [2, 16])
     narrow = narrow.transform(InferDataTypes())
     assert narrow.get_tensor_datatype("s").max() <= 2**24
     xs = x[:, :16]
-    today = execute_onnx(narrow, {"x": xs}, return_full_exec_context=True)
-    exact = execute_onnx(narrow, {"x": xs}, return_full_exec_context=True, exact_integers=True)
-    for name, value in today.items():
+    off = execute_onnx(narrow, {"x": xs}, return_full_exec_context=True)
+    monkeypatch.setenv(EXACT_INTEGERS, "1")
+    exact = execute_onnx(narrow, {"x": xs}, return_full_exec_context=True)
+    for name, value in off.items():
         if value is not None:
             assert exact[name].dtype == value.dtype and np.array_equal(exact[name], value)
 
 
-def test_execute_node_needs_the_model_for_the_option():
+def test_execute_node_needs_the_model_for_the_setting(exact):
     model = wide_layer()
     context = model.make_empty_exec_context()
     with pytest.raises(ValueError, match="MatMul_0"):
-        execute_node(model.graph.node[0], context, model.graph, 13, exact_integers=True)
+        execute_node(model.graph.node[0], context, model.graph, 13)
 
 
-def test_maxpoolnhwc_computes_in_its_input_type():
+def test_maxpoolnhwc_computes_in_its_input_type(exact):
     d = TensorProto.DOUBLE
     graph = helper.make_graph(
         [
@@ -186,11 +218,11 @@ def test_maxpoolnhwc_computes_in_its_input_type():
     )
     model = ModelWrapper(qonnx_make_model(graph))
     x = np.array([2**24 + 1, 3, -5, 2**24 - 1], dtype=np.float64).reshape(1, 2, 2, 1)
-    y = execute_onnx(model, {"x": x}, exact_integers=True)["y"]
+    y = execute_onnx(model, {"x": x})["y"]
     assert y.dtype == np.float64 and int(y.item()) == 2**24 + 1
 
 
-def test_quantavgpool2d_reads_a_float64_input():
+def test_quantavgpool2d_reads_a_float64_input(exact):
     graph = helper.make_graph(
         [
             helper.make_node(
@@ -212,11 +244,11 @@ def test_quantavgpool2d_reads_a_float64_input():
     )
     model = ModelWrapper(qonnx_make_model(graph))
     x = np.array([1, 2, 3, 6], dtype=np.float64).reshape(1, 1, 2, 2)
-    y = execute_onnx(model, {"x": x}, exact_integers=True)["y"]
+    y = execute_onnx(model, {"x": x})["y"]
     assert y.dtype == np.float32 and y.item() == 3
 
 
-def test_a_generic_partition_runs_its_body_with_the_option(tmp_path):
+def test_a_generic_partition_runs_its_body_with_the_setting(exact, tmp_path):
     weights = wide_weights()
     body = wide_layer(weights)
     body_file = str(tmp_path / "body.onnx")
@@ -230,5 +262,76 @@ def test_a_generic_partition_runs_its_body_with_the_option(tmp_path):
     parent = ModelWrapper(qonnx_make_model(graph))
     x = wide_input(weights)
     exact = x @ weights.astype(np.int64)
-    s = execute_onnx(parent, {"x": x.astype(np.float32)}, exact_integers=True)["s"]
+    s = execute_onnx(parent, {"x": x.astype(np.float32)})["s"]
     assert np.array_equal(s.astype(np.int64), exact)
+
+
+def constant_sum(a=2**24, b=1):
+    """c = a + b, both constants, then y = x + c; every tensor INT32-annotated and held in
+    float32."""
+    graph = helper.make_graph(
+        [
+            helper.make_node("Add", ["a", "b"], ["c"], name="Add_0"),
+            helper.make_node("Add", ["x", "c"], ["y"], name="Add_1"),
+        ],
+        "constant_sum",
+        [helper.make_tensor_value_info("x", F, [1])],
+        [helper.make_tensor_value_info("y", F, [1])],
+        value_info=[helper.make_tensor_value_info("c", F, [1])],
+    )
+    model = ModelWrapper(qonnx_make_model(graph))
+    model.set_initializer("a", np.array([a], dtype=np.float32))
+    model.set_initializer("b", np.array([b], dtype=np.float32))
+    for name in ("a", "b", "c", "x", "y"):
+        model.set_tensor_datatype(name, DataType["INT32"])
+    return model
+
+
+@pytest.mark.parametrize("fold", [FoldConstants(), FoldConstantsFiltered(lambda model, node: True)])
+def test_folding_a_sum_float32_cannot_hold_raises_naming_it(exact, fold):
+    model = constant_sum()
+    x = {"x": np.zeros(1, dtype=np.float32)}
+    assert execute_onnx(model, x)["y"].item() == 2**24 + 1
+    with pytest.raises(ArithmeticError, match=r"Add_0 \(Add\): c folds to 16777217, which its FLOAT container"):
+        model.transform(fold)
+
+
+def test_without_the_setting_folding_rounds_the_sum(rounding):
+    folded = constant_sum().transform(FoldConstants())
+    c = folded.get_initializer("c")
+    assert c.dtype == np.float32 and c.item() == 2**24
+
+
+def test_a_widened_fold_that_float32_holds_is_stored_as_without_the_setting(monkeypatch):
+    monkeypatch.setenv(EXACT_INTEGERS, "1")
+    exact = constant_sum(2**24, 2).transform(FoldConstants())
+    monkeypatch.setenv(EXACT_INTEGERS, "0")
+    off = constant_sum(2**24, 2).transform(FoldConstants())
+    assert exact.get_initializer("c").dtype == np.float32
+    assert exact.get_initializer("c").item() == 2**24 + 2
+    assert exact.model == off.model
+
+
+def test_a_widened_fold_is_exact_where_float32_arithmetic_is_not(exact):
+    """A dot product of constants whose partial sums pass 2**24 but whose result float32
+    holds: folded in float64, stored in float32, exact."""
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["a", "b"], ["c"], name="MatMul_0"),
+            helper.make_node("Add", ["x", "c"], ["y"], name="Add_0"),
+        ],
+        "dot",
+        [helper.make_tensor_value_info("x", F, [1, 1])],
+        [helper.make_tensor_value_info("y", F, [1, 1])],
+        value_info=[helper.make_tensor_value_info("c", F, [1, 1])],
+    )
+    model = ModelWrapper(qonnx_make_model(graph))
+    model.set_initializer("a", np.array([[2**24, 1, -(2**24)]], dtype=np.float32))
+    model.set_initializer("b", np.ones((3, 1), dtype=np.float32))
+    model.set_tensor_datatype("a", DataType["INT26"])
+    model.set_tensor_datatype("b", DataType["INT2"])
+    model.set_tensor_datatype("x", DataType["INT8"])
+    model = model.transform(InferDataTypes())
+    assert model.get_tensor_datatype("c").max() > 2**24
+    c = model.transform(FoldConstants()).get_initializer("c")
+    assert c.dtype == np.float32 and c.item() == 1

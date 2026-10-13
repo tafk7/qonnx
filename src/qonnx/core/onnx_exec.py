@@ -33,8 +33,8 @@ import copy
 import numpy as np
 import onnx.helper as helper
 import onnxruntime as rt
+import os
 import warnings
-from contextvars import ContextVar
 from onnx import AttributeProto, NodeProto, TensorProto, ValueInfoProto
 from onnxruntime.capi.onnxruntime_pybind11_state import NotImplemented as RuntimeNotImplemented
 from typing import TYPE_CHECKING, Literal, Mapping, overload
@@ -48,15 +48,19 @@ if TYPE_CHECKING:
     from qonnx.core.datatype import BaseDataType
     from qonnx.core.modelwrapper import ModelWrapper
 
-# Whether the custom op execute_node is running was asked for exact integers: a custom
-# op that executes a model of its own reads it (exact_integers_running).
-_exact_integers: ContextVar[bool] = ContextVar("qonnx.core.onnx_exec.exact_integers", default=False)
+#: The environment variable that turns exact integers on ("1") or off ("0", or unset).
+EXACT_INTEGERS = "QONNX_EXACT_INTEGERS"
 
 
-def exact_integers_running() -> bool:
-    """Whether the custom op being executed was asked for exact integers (execute_node's
-    exact_integers). A custom op that executes a model of its own passes it on."""
-    return _exact_integers.get()
+def get_exact_integers() -> bool:
+    """Whether execute_node computes integers exactly where the graph's float containers
+    would round them: the environment variable QONNX_EXACT_INTEGERS, "1" on, "0" or
+    unset off. The process's environment holds it, so every caller of execute_node in
+    every thread reads the same setting, and a child process inherits it."""
+    value = os.environ.get(EXACT_INTEGERS, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f'{EXACT_INTEGERS} is "1" (on) or "0" (off), not {value!r}')
+    return value == "1"
 
 
 def _np_type(elem_type: int) -> np.dtype | None:
@@ -125,35 +129,32 @@ def execute_node(
     opset_version,
     return_full_exec_context=False,
     model=None,
-    exact_integers=False,
 ):
     """Executes one node, its inputs read from context and its outputs written there:
     a custom op by its own execute_node, a standard op as an ONNX Runtime session of a
     model holding the node alone.
 
-    exact_integers: integers are computed exactly where the graph's float containers
-    would round them. A standard node whose float tensors (those the graph holds in a
-    float element type) are all integer-annotated, one of the annotations past what its
-    container holds exactly (float32: 2**24), computes in float64: its tensors are
-    stated DOUBLE and its inputs given as float64, and its outputs stay float64. Every
-    other standard node computes in the graph's element types, its inputs cast to them.
-    A node that would widen raises where an annotation passes 2**53, or where ONNX
-    Runtime has no float64 kernel for its op. The annotations are read from model,
-    which the option needs. A custom op computes in whatever it is given; one that
-    executes a model of its own reads the option with exact_integers_running."""
+    With exact integers on (get_exact_integers), integers are computed exactly where
+    the graph's float containers would round them. A standard node whose float tensors
+    (those the graph holds in a float element type) are all integer-annotated, one of
+    the annotations past what its container holds exactly (float32: 2**24), computes in
+    float64: its tensors are stated DOUBLE and its inputs given as float64, and its
+    outputs stay float64. Every other standard node computes in the graph's element
+    types, its inputs cast to them. A node that would widen raises where an annotation
+    passes 2**53, or where ONNX Runtime has no float64 kernel for its op. The
+    annotations are read from model, which exact integers need. A custom op computes in
+    whatever it is given; one that executes a model of its own runs it under the same
+    setting."""
 
+    exact_integers = get_exact_integers()
     if is_custom_op(node.domain, node.op_type):
-        token = _exact_integers.set(exact_integers)
-        try:
-            ex_cu_node.execute_custom_node(
-                node,
-                context,
-                graph,
-                onnx_opset_version=opset_version,
-                model=model,
-            )
-        finally:
-            _exact_integers.reset(token)
+        ex_cu_node.execute_custom_node(
+            node,
+            context,
+            graph,
+            onnx_opset_version=opset_version,
+            model=model,
+        )
     else:
         # ONNX Runtime executes whole models only, so the node runs as a model of its
         # own. Its inputs and outputs take their value infos from the graph: a tensor
@@ -175,7 +176,7 @@ def execute_node(
         widened = set()
         if exact_integers:
             if model is None:
-                raise ValueError(f"{node.name} ({node.op_type}): exact_integers reads the model's annotations; pass model")
+                raise ValueError(f"{node.name} ({node.op_type}): exact integers read the model's annotations; pass model")
             widened = _widened(node, node_inputs + node_outputs, model)
             node_inputs = [_as_double(x) if x.name in widened else x for x in node_inputs]
             node_outputs = [_as_double(x) if x.name in widened else x for x in node_outputs]
@@ -187,7 +188,7 @@ def execute_node(
         )
         node_model = qonnx_make_model(node_graph)
         node_model.opset_import[0].version = opset_version
-        # With exact_integers, each input is given in the element type the node
+        # With exact integers, each input is given in the element type the node
         # reads it in.
         read_as = {x.name: _np_type(x.type.tensor_type.elem_type) for x in node_inputs} if exact_integers else {}
         input_dict = dict()
@@ -234,7 +235,6 @@ def execute_onnx(
     return_full_exec_context: Literal[False] = False,
     start_node: NodeProto | None = None,
     end_node: NodeProto | None = None,
-    exact_integers: bool = False,
 ) -> dict[str, np.ndarray]:
     ...
 
@@ -246,7 +246,6 @@ def execute_onnx(
     return_full_exec_context: Literal[True],
     start_node: NodeProto | None = None,
     end_node: NodeProto | None = None,
-    exact_integers: bool = False,
 ) -> dict[str, np.ndarray | None]:
     ...
 
@@ -257,7 +256,6 @@ def execute_onnx(
     return_full_exec_context: bool = False,
     start_node: NodeProto | None = None,
     end_node: NodeProto | None = None,
-    exact_integers: bool = False,
 ) -> dict[str, np.ndarray] | dict[str, np.ndarray | None]:
     """Executes given ONNX ModelWrapper with given named inputs.
 
@@ -273,9 +271,9 @@ def execute_onnx(
     If they are set to particular ONNX nodes, only the subgraph between (and
     including) those nodes is executed.
 
-    exact_integers: integers are computed exactly where the graph's float
-    containers would round them (execute_node). A node computed so leaves its
-    outputs in float64, graph outputs included.
+    With exact integers on (get_exact_integers), integers are computed exactly
+    where the graph's float containers would round them (execute_node). A node
+    computed so leaves its outputs in float64, graph outputs included.
     """
 
     if not model.check_all_tensor_shapes_specified():
@@ -344,7 +342,6 @@ def execute_onnx(
                 opset_version,
                 return_full_exec_context,
                 model=model,
-                exact_integers=exact_integers,
             )
             if get_sanitize_quant_tensors() != 0:
                 # round output values to quantization annotation
