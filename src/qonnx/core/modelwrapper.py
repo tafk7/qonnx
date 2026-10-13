@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 import qonnx.util.basic as util
 import qonnx.util.onnx as onnxutil
-from qonnx.core import metadata
+from qonnx.core import metadata, ranges
 from qonnx.core.datatype import BaseDataType, DataType
 from qonnx.custom_op.registry import getCustomOp, is_custom_op
 from qonnx.transformation.double_to_single_float import DoubleToSingleFloat
@@ -344,32 +344,50 @@ class ModelWrapper:
         else:
             return DataType["FLOAT32"]
 
-    def set_tensor_datatype(self, tensor_name: str, datatype: BaseDataType | None) -> None:
-        """Sets the QONNX DataType of tensor with given name. None removes the
-        annotation (other annotations of the tensor, such as its layout, stay)."""
-        graph = self._model_proto.graph
-        qnt_annotations = graph.quantization_annotation
-        ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
-        if ret is not None:
-            ret_dt = util.get_by_name(ret.quant_parameter_tensor_names, "finn_datatype", "key")
-            if ret_dt is not None:
-                if datatype is None:
-                    ret.quant_parameter_tensor_names.remove(ret_dt)
-                else:
-                    ret_dt.value = datatype.name
-            elif datatype is not None:
-                dt = onnx.StringStringEntryProto()
-                dt.key = "finn_datatype"
-                dt.value = datatype.name
-                ret.quant_parameter_tensor_names.append(dt)
-        elif datatype is not None:
+    def set_tensor_datatype(
+        self, tensor_name: str, datatype: BaseDataType | None, range: ranges.TensorRange | None = None
+    ) -> None:
+        """Sets the QONNX DataType of tensor with given name, and its range with it
+        (qonnx.core.ranges): the datatype and the range are one fact. Without
+        ``range`` (or with None, or the datatype's full range) the tensor states no
+        range: one it stated before is cleared in the same call. A range the
+        datatype does not hold is not stored, and is named (RangeContradiction).
+        A datatype of None removes the datatype annotation and the range (other
+        annotations of the tensor, such as its layout, stay)."""
+        qa = ranges.annotation(self, tensor_name)
+        if qa is None:
+            if datatype is None:
+                return
             qa = onnx.TensorAnnotation()
-            dt = onnx.StringStringEntryProto()
-            dt.key = "finn_datatype"
-            dt.value = datatype.name
             qa.tensor_name = tensor_name
-            qa.quant_parameter_tensor_names.append(dt)
-            qnt_annotations.append(qa)
+            self._model_proto.graph.quantization_annotation.append(qa)
+            qa = self._model_proto.graph.quantization_annotation[-1]
+        props = qa.quant_parameter_tensor_names
+        ret_dt = None
+        for entry in props:
+            if entry.key == "finn_datatype":
+                ret_dt = entry
+                break
+        if datatype is None:
+            if ret_dt is not None:
+                props.remove(ret_dt)
+            metadata.clear(props, ranges.TENSOR)
+            return
+        if ret_dt is None:
+            props.append(onnx.StringStringEntryProto(key="finn_datatype", value=datatype.name))
+        elif ret_dt.value != datatype.name:
+            ret_dt.value = datatype.name
+        ranges.write(self, tensor_name, props, datatype, range)
+
+    def get_tensor_range(self, tensor_name: str) -> ranges.TensorRange:
+        """The range of the tensor with given name (qonnx.core.ranges): the one it
+        states with its datatype, else its datatype's full range. For an
+        initializer, the exact range of its values. MetadataError for a stored
+        range that is malformed or that its datatype does not hold."""
+        values = self.get_initializer(tensor_name)
+        if values is not None:
+            return ranges.values_range(values)
+        return ranges.tensor_range(self, tensor_name)
 
     def get_tensor_valueinfo(self, tensor_name: str) -> ValueInfoProto | None:
         """Returns ValueInfoProto of tensor with given name, if it has one."""
