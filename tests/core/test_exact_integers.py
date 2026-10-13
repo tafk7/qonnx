@@ -29,7 +29,7 @@
 """Execution with exact integers (QONNX_EXACT_INTEGERS): a standard node whose float tensors
 all hold integers, one past what its float container holds exactly, computes in float64;
 constant folding stores such a node's value in its stated type where that type holds it,
-and refuses where it does not."""
+and leaves the node unfolded where it does not."""
 
 import pytest
 
@@ -288,18 +288,26 @@ def constant_sum(a=2**24, b=1):
 
 
 @pytest.mark.parametrize("fold", [FoldConstants(), FoldConstantsFiltered(lambda model, node: True)])
-def test_folding_a_sum_float32_cannot_hold_raises_naming_it(exact, fold):
+def test_a_sum_float32_cannot_hold_is_left_unfolded_and_executes_exactly(exact, fold):
+    """The INT32 sum 16777216 + 1 stays a node; a constant node after it still folds."""
     model = constant_sum()
+    model.graph.node.append(helper.make_node("Add", ["a", "a"], ["d"], name="Add_2"))
+    model.graph.node.append(helper.make_node("Add", ["x", "d"], ["e"], name="Add_3"))
+    model.graph.value_info.append(helper.make_tensor_value_info("d", F, [1]))
+    model.graph.output.append(helper.make_tensor_value_info("e", F, [1]))
+    folded = model.transform(fold)
+    assert sorted(n.name for n in folded.graph.node) == ["Add_0", "Add_1", "Add_3"]
+    assert folded.get_initializer("c") is None
+    assert folded.get_initializer("d").item() == 2**25
     x = {"x": np.zeros(1, dtype=np.float32)}
-    assert execute_onnx(model, x)["y"].item() == 2**24 + 1
-    with pytest.raises(ArithmeticError, match=r"Add_0 \(Add\): c folds to 16777217, which its FLOAT container"):
-        model.transform(fold)
+    assert execute_onnx(folded, x)["y"].item() == 2**24 + 1
 
 
 def test_without_the_setting_folding_rounds_the_sum(rounding):
     folded = constant_sum().transform(FoldConstants())
     c = folded.get_initializer("c")
     assert c.dtype == np.float32 and c.item() == 2**24
+    assert execute_onnx(folded, {"x": np.zeros(1, dtype=np.float32)})["y"].item() == 2**24
 
 
 def test_a_widened_fold_that_float32_holds_is_stored_as_without_the_setting(monkeypatch):

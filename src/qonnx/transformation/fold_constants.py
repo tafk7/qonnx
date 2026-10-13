@@ -27,7 +27,6 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
-from onnx import TensorProto
 
 import qonnx.core.onnx_exec as oxe
 from qonnx.custom_op.registry import is_custom_op
@@ -37,28 +36,24 @@ from qonnx.transformation.infer_shapes import InferShapes
 
 def _folded(model, node, context):
     """The value of node's first output that constant folding stores, in the element
-    type the graph states for it. A standard node computed in float64 for exact integers
-    (execute_node) gives a float64 value; where its stated float type holds every value
-    exactly, the value is stored in that type, as without exact integers. Where it does
-    not, folding raises naming the tensor: an initializer in that type would round the
-    integers, and one stated wider would leave its consumers' types mixed."""
+    type the graph states for it, or None where the node is left unfolded. A standard
+    node computed in float64 for exact integers (execute_node) gives a float64 value;
+    where its stated float type holds every value exactly, the value is stored in that
+    type, as without exact integers."""
     name = node.output[0]
     value = context[name]
     info = model.get_tensor_valueinfo(name)
     if is_custom_op(node.domain, node.op_type) or info is None:
         return value
-    elem_type = info.type.tensor_type.elem_type
-    stated = oxe._np_type(elem_type)
+    stated = oxe._np_type(info.type.tensor_type.elem_type)
     if stated is None or value.dtype == stated:
         return value
     held = value.astype(stated)
     if not np.array_equal(held, value):
-        differs = value[held != value].flat[0]
-        raise ArithmeticError(
-            f"{node.name} ({node.op_type}): {name} folds to {differs:.0f}, which its "
-            f"{TensorProto.DataType.Name(elem_type)} container does not hold exactly "
-            f"(annotated {model.get_tensor_datatype(name).name}); folding it would round it"
-        )
+        # The stated type cannot hold the value, so the node stays: it computes the exact
+        # value whenever it runs, while an initializer in the stated type would round it
+        # and one in a wider type would leave its float readers ill-typed.
+        return None
     return held
 
 
@@ -97,8 +92,11 @@ class FoldConstantsFiltered(Transformation):
                     opset_version=opset_version,
                     model=model,
                 )
+                folded = _folded(model, n, execution_context)
+                if folded is None:
+                    continue
                 # use the execution result as an initializer
-                model.set_initializer(node_out, _folded(model, n, execution_context))
+                model.set_initializer(node_out, folded)
                 # remove old node
                 nodes_to_remove.append(n)
                 graph_modified = True
@@ -149,8 +147,11 @@ class FoldConstants(Transformation):
                     opset_version=opset_version,
                     model=model,
                 )
+                folded = _folded(model, n, execution_context)
+                if folded is None:
+                    continue
                 # use the execution result as an initializer
-                model.set_initializer(node_out, _folded(model, n, execution_context))
+                model.set_initializer(node_out, folded)
                 # remove old node
                 nodes_to_remove.append(n)
                 graph_modified = True
