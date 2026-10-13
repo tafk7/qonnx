@@ -29,6 +29,7 @@
 import numpy as np
 import onnx.helper as helper
 
+from qonnx.core import ranges
 from qonnx.core.datatype import DataType
 from qonnx.custom_op.base import CustomOp
 
@@ -108,6 +109,11 @@ class MultiThreshold(CustomOp):
         return helper.make_node("Relu", [node.input[0]], [node.output[0]])
 
     def infer_node_datatype(self, model):
+        """The output's datatype is ``out_dtype``, or FLOAT32 where ``out_scale``
+        or ``out_bias`` is not an integer. Where both are integers, its range is
+        stated with it (qonnx.core.ranges): ``out_bias + out_scale * [0, N]``, N
+        the number of thresholds per channel. A range ``out_dtype`` does not hold
+        is a contradiction: not stated, and named."""
         node = self.onnx_node
         odt = self.get_nodeattr("out_dtype")
         is_float = False
@@ -120,7 +126,19 @@ class MultiThreshold(CustomOp):
         if is_float:
             model.set_tensor_datatype(node.output[0], DataType["FLOAT32"])
         else:
-            model.set_tensor_datatype(node.output[0], DataType[odt])
+            model.set_tensor_datatype(node.output[0], DataType[odt], self.output_range(model))
+
+    def output_range(self, model):
+        """``out_bias + out_scale * [0, N]`` for integer ``out_scale`` and
+        ``out_bias``, while the number of thresholds N is known; else None."""
+        thresholds = ranges.initializer(model, self.onnx_node.input[1])
+        shape = list(thresholds.dims) if thresholds is not None else model.get_tensor_shape(self.onnx_node.input[1])
+        if not shape or shape[-1] <= 0:
+            return None
+        scale = int(self.get_nodeattr("out_scale"))
+        bias = int(self.get_nodeattr("out_bias"))
+        ends = sorted((bias, bias + scale * int(shape[-1])))
+        return ranges.TensorRange(ends[0], ends[1])
 
     def execute_node(self, context, graph):
         node = self.onnx_node

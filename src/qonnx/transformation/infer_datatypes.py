@@ -30,10 +30,14 @@ from __future__ import annotations
 
 import math
 import numpy as np
+from collections import Counter, OrderedDict
+from fractions import Fraction
 from onnx import NodeProto
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Optional
 
+from qonnx.core import ranges
 from qonnx.core.datatype import BaseDataType, DataType, ScaledIntType
+from qonnx.core.ranges import TensorRange
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.qcdq_to_qonnx import extract_elem_type
@@ -45,6 +49,30 @@ if TYPE_CHECKING:
 # The integers a tensor may hold, both ends included.
 Range = tuple[int, int]
 
+# The bounds computed over initializers (a MatMul's, Gemm's or Conv's sums over its
+# weights; an initializer's own range), kept in the process by what they read: the
+# rule, the weights' content digest and the input's range. Least recently used first.
+_BOUNDS: OrderedDict[Hashable, Any] = OrderedDict()
+_BOUNDS_KEPT = 4096
+bounds_counts: Counter[str] = Counter()
+"""How often each kind of bound was computed, and answered from the cache ("<kind> computed",
+"<kind> cached")."""
+
+
+def _cached(key: tuple[Hashable, ...], compute: Callable[[], Any]) -> Any:
+    try:
+        value = _BOUNDS[key]
+    except KeyError:
+        bounds_counts[f"{key[0]} computed"] += 1
+        value = compute()
+        _BOUNDS[key] = value
+        if len(_BOUNDS) > _BOUNDS_KEPT:
+            _BOUNDS.popitem(last=False)
+        return value
+    _BOUNDS.move_to_end(key)
+    bounds_counts[f"{key[0]} cached"] += 1
+    return value
+
 
 def int_type_holding(lo: int, hi: int) -> BaseDataType:
     """The smallest INTn or UINTn holding every integer in [lo, hi]: unsigned when
@@ -54,16 +82,34 @@ def int_type_holding(lo: int, hi: int) -> BaseDataType:
     return DataType["INT%d" % (max((-lo - 1).bit_length(), max(hi, 0).bit_length()) + 1)]
 
 
-def _range(model: ModelWrapper, name: str) -> Optional[Range]:
-    """The integers ``name`` may hold: an initializer's by its values, any other
-    tensor's by its annotation. None for an initializer holding a non-integer."""
-    values = model.get_initializer(name)
-    if values is None:
-        dtype = model.get_tensor_datatype(name)
-        return int(dtype.min()), int(dtype.max())
+def _integer_values(values: np.ndarray) -> Optional[Range]:
     if values.size == 0 or not np.all(np.isfinite(values)) or not np.all(values == np.round(values)):
         return None
     return int(values.min()), int(values.max())
+
+
+def _range(model: ModelWrapper, name: str) -> Optional[Range]:
+    """The integers ``name`` may hold: an initializer's by its values, any other
+    tensor's by its range (qonnx.core.ranges: the one it states with its
+    datatype, else its datatype's). None for an initializer holding a
+    non-integer."""
+    key = ranges.digest(model, name)
+    if key is None:
+        found = ranges.tensor_range(model, name)
+        if found.is_integer():
+            return found.least, found.greatest  # type: ignore[return-value]
+        dtype = ranges.datatype(model, name)
+        return int(dtype.min()), int(dtype.max())
+    return _cached(("integers", key), lambda: _integer_values(model.get_initializer(name)))
+
+
+def _tensor_range(model: ModelWrapper, name: str) -> TensorRange:
+    """The values ``name`` may hold, for any datatype: an initializer's by its
+    values, any other tensor's range."""
+    key = ranges.digest(model, name)
+    if key is None:
+        return ranges.tensor_range(model, name)
+    return _cached(("values", key), lambda: ranges.values_range(model.get_initializer(name)))
 
 
 def _sum(x: Range, y: Range) -> Range:
@@ -107,14 +153,20 @@ def _depth(model: ModelWrapper, name: str, axis: int) -> Optional[int]:
 
 def _dot(model: ModelWrapper, x: str, w: str, axis: int, depth: Optional[int]) -> Optional[Range]:
     """The range of sums of ``depth`` products of x and w: from w's values summed
-    over its ``axis`` when w is an initializer, else from both ranges; None while
-    the depth is unknown, or when w holds a non-integer."""
+    over its ``axis`` when w is an initializer (cached by the weights' digest,
+    the axis and x's range), else from both ranges; None while the depth is
+    unknown, or when w holds a non-integer."""
     x_range, w_range = _range(model, x), _range(model, w)
     if x_range is None or w_range is None:
         return None
-    weights = model.get_initializer(w)
-    if weights is not None:
-        return _span(*_dot_bounds(weights, (axis % weights.ndim,), x_range))
+    key = ranges.digest(model, w)
+    if key is not None:
+
+        def compute() -> Range:
+            weights = model.get_initializer(w)
+            return _span(*_dot_bounds(weights, (axis % weights.ndim,), x_range))
+
+        return _cached(("dot", key, axis, x_range), compute)
     if depth is None:
         return None
     lo, hi = _product(x_range, w_range)
@@ -123,11 +175,11 @@ def _dot(model: ModelWrapper, x: str, w: str, axis: int, depth: Optional[int]) -
 
 def _matmul(model: ModelWrapper, node: NodeProto) -> Optional[Range]:
     a, b = node.input
-    if model.get_initializer(b) is None and model.get_initializer(a) is not None:
+    if ranges.initializer(model, b) is None and ranges.initializer(model, a) is not None:
         # a constant left operand: each row's sum over its last axis
         return _dot(model, b, a, -1, None)
-    weights = model.get_initializer(b)
-    axis = 0 if weights is not None and weights.ndim == 1 else -2
+    weights = ranges.initializer(model, b)
+    axis = 0 if weights is not None and len(weights.dims) == 1 else -2
     return _dot(model, a, b, axis, _depth(model, a, -1) or _depth(model, b, axis))
 
 
@@ -141,7 +193,7 @@ def _gemm(model: ModelWrapper, node: NodeProto) -> Optional[Range]:
     b_axis = 1 if "transB" in attribute and attribute["transB"].i else 0
     if not (alpha.is_integer() and beta.is_integer()):
         return None
-    if model.get_initializer(b) is None and model.get_initializer(a) is not None:
+    if ranges.initializer(model, b) is None and ranges.initializer(model, a) is not None:
         product = _dot(model, b, a, a_axis, None)
     else:
         product = _dot(model, a, b, b_axis, _depth(model, a, a_axis) or _depth(model, b, b_axis))
@@ -168,14 +220,21 @@ def _conv(model: ModelWrapper, node: NodeProto) -> Optional[Range]:
         return None
     # padding adds zeros to the sums
     x_range = (min(x_range[0], 0), max(x_range[1], 0))
-    weights = model.get_initializer(w)
-    if weights is not None:
-        lows, highs = _dot_bounds(weights, tuple(range(1, weights.ndim)), x_range)
-        offsets = None if bias is None else model.get_initializer(bias)
-        if offsets is not None:
-            offsets = _integers(offsets, 1).astype(object)
-            return _span(lows + offsets, highs + offsets)
-        result = _span(lows, highs)
+    key = ranges.digest(model, w)
+    if key is not None:
+        bias_key = None if bias is None else ranges.digest(model, bias)
+
+        def compute() -> Range:
+            weights = model.get_initializer(w)
+            lows, highs = _dot_bounds(weights, tuple(range(1, weights.ndim)), x_range)
+            if bias_key is not None:
+                offsets = _integers(model.get_initializer(bias), 1).astype(object)
+                return _span(lows + offsets, highs + offsets)
+            return _span(lows, highs)
+
+        result = _cached(("conv", key, bias_key, x_range), compute)
+        if bias is None or bias_key is not None:
+            return result
     else:
         shape = model.get_tensor_shape(w)
         if not shape or len(shape) < 2 or min(shape[1:]) <= 0:
@@ -256,8 +315,8 @@ def _integer_inputs(model: ModelWrapper, node: NodeProto) -> bool:
     constant bounds are read by their values)."""
     names = [name for name in node.input if name]
     if node.op_type == "Clip":
-        names = names[:1] + [name for name in names[1:] if model.get_initializer(name) is None]
-    return all(model.get_tensor_datatype(name).is_integer() for name in names)
+        names = names[:1] + [name for name in names[1:] if ranges.initializer(model, name) is None]
+    return all(ranges.datatype(model, name).is_integer() for name in names)
 
 
 def is_scaled_int(x):
@@ -283,17 +342,173 @@ def infer_mac_result_dtype(idtypes, odtype_orig, possible_negation):
     return ret
 
 
+# The ops that pass their inputs' values through without rounding: the output
+# holds only values of its inputs (and a Pad's constant).
+_FIRST_INPUT = {
+    "Reshape",
+    "Transpose",
+    "Flatten",
+    "Slice",
+    "Gather",
+    "GatherElements",
+    "GatherND",
+    "Identity",
+    "Expand",
+    "MaxPool",
+    "GlobalMaxPool",
+    "Squeeze",
+    "Unsqueeze",
+    "Tile",
+    "Resize",
+    "Upsample",
+}
+
+
+def _pad_value(model: ModelWrapper, node: NodeProto) -> TensorRange:
+    if len(node.input) > 2 and node.input[2]:
+        return _tensor_range(model, node.input[2])
+    value = get_by_name(node.attribute, "value")
+    return TensorRange(ranges.endpoint(value.f if value is not None else 0.0), ranges.endpoint(value.f if value else 0.0))
+
+
+def _bound(model: ModelWrapper, node: NodeProto, index: int, key: str, default: float) -> TensorRange:
+    name = node.input[index] if len(node.input) > index else ""
+    if name:
+        return _tensor_range(model, name)
+    attribute = get_by_name(node.attribute, key)
+    value = ranges.endpoint(attribute.f if attribute is not None else default)
+    return TensorRange(value, value)
+
+
+def _passed(model: ModelWrapper, node: NodeProto) -> Optional[TensorRange]:
+    """The range of a node that passes values through without rounding, for any
+    datatype; None for any other node."""
+    op = node.op_type
+    if op in _FIRST_INPUT:
+        return _tensor_range(model, node.input[0])
+    if op == "Pad":
+        x = _tensor_range(model, node.input[0])
+        mode = get_by_name(node.attribute, "mode")
+        if mode is not None and mode.s not in (b"", b"constant"):
+            return x
+        return ranges.hull(x, _pad_value(model, node))
+    if op in ("Scatter", "ScatterElements", "ScatterND"):
+        return ranges.hull(_tensor_range(model, node.input[0]), _tensor_range(model, node.input[2]))
+    inputs = [_tensor_range(model, name) for name in node.input if name]
+    nan = any(item.nan for item in inputs)
+    if op == "Concat":
+        return ranges.hull(*inputs)
+    if op == "Max":
+        return TensorRange(max(item.least for item in inputs), max(item.greatest for item in inputs), nan)
+    if op == "Min":
+        return TensorRange(min(item.least for item in inputs), min(item.greatest for item in inputs), nan)
+    x = inputs[0]
+    if op == "Relu":
+        return TensorRange(max(x.least, 0), max(x.greatest, 0), x.nan)
+    if op == "Neg":
+        return TensorRange(-x.greatest, -x.least, x.nan)
+    if op == "Clip":
+        low, high = _bound(model, node, 1, "min", -math.inf), _bound(model, node, 2, "max", math.inf)
+        least = min(max(x.least, low.least), high.least)
+        greatest = min(max(x.greatest, low.greatest), high.greatest)
+        return TensorRange(least, greatest, x.nan)
+    return None
+
+
+def _power_of_two(value: Fraction) -> bool:
+    size = abs(value)
+    return size != 0 and (size.numerator == 1 or size.denominator == 1) and (size.numerator & (size.numerator - 1)) == 0
+
+
+def _exact_in(datatype: BaseDataType, value: ranges.Endpoint) -> bool:
+    """Whether ``datatype`` holds ``value`` exactly (an infinity as a float's)."""
+    if isinstance(value, float):
+        return True
+    container = {"FLOAT32": np.float32, "FLOAT16": np.float16}.get(datatype.get_canonical_name())
+    if container is None:
+        return False
+    stored = float(container(float(value)))
+    return math.isfinite(stored) and Fraction(stored) == value
+
+
+def _scaled_by_power_of_two(model: ModelWrapper, node: NodeProto, datatype: BaseDataType) -> Optional[TensorRange]:
+    """A Mul by a constant power of two (every element the same +-2^k): its input's
+    range scaled exactly, where ``datatype`` holds the scaled ends exactly (a
+    float's rounding is monotone, so values between them stay between them);
+    else None."""
+    for scale, other in ((1, 0), (0, 1)):
+        if ranges.initializer(model, node.input[scale]) is None:
+            continue
+        values = model.get_initializer(node.input[scale])
+        if values.size == 0 or not np.all(np.isfinite(values)) or not np.all(values == values.flat[0]):
+            continue
+        factor = Fraction(float(values.flat[0]))
+        if not _power_of_two(factor):
+            continue
+        x = _tensor_range(model, node.input[other])
+        ends = sorted((x.least * factor, x.greatest * factor))
+        scaled = TensorRange(ends[0], ends[1], x.nan)
+        if ranges.full(datatype).nan and not all(_exact_in(datatype, end) for end in scaled.span):
+            return None
+        return scaled
+    return None
+
+
+def _arithmetic(model: ModelWrapper, node: NodeProto, datatype: BaseDataType) -> TensorRange:
+    """A mixed or float arithmetic op's range (MatMul, Gemm, Conv, Add, Sub, Mul):
+    unbounded, as no rounding model is applied. For a float result, NaN possible
+    where an input may be NaN or infinite, or the op sums products (a MatMul's,
+    Gemm's or Conv's partial sums may reach both infinities); a scaled-integer
+    result has none. A Mul by a power of two scales its input's range."""
+    if node.op_type == "Mul":
+        scaled = _scaled_by_power_of_two(model, node, datatype)
+        if scaled is not None:
+            return scaled
+    if not ranges.full(datatype).nan:
+        # a scaled-integer result: no NaN, no infinity
+        return ranges.unbounded(False)
+    inputs = [_tensor_range(model, name) for name in node.input if name]
+    nan = node.op_type in ("MatMul", "Gemm", "Conv") or any(
+        item.nan or math.isinf(item.least) or math.isinf(item.greatest) for item in inputs
+    )
+    return ranges.unbounded(nan)
+
+
+def _fact(model: ModelWrapper, name: str) -> tuple[str, Optional[str]]:
+    """A tensor's datatype (as get_tensor_datatype reads it) and stored range text."""
+    annotation = ranges.annotation(model, name)
+    text = None
+    if annotation is not None:
+        for entry in annotation.quant_parameter_tensor_names:
+            if entry.key == ranges.RANGE.entry:
+                text = entry.value
+    return ranges.datatype(model, name).get_canonical_name(), text
+
+
 def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes: bool) -> bool:
-    """Infer output datatype(s) for a particular node. Returns True if any
-    changes were made.
+    """Infer the datatype and range (qonnx.core.ranges) of a node's outputs.
+    Returns True if any changed.
 
     A standard op with a range rule (MatMul, Gemm, Conv, Add, Sub, Mul, Max, Min,
     Concat, Relu, Neg, Clip) whose inputs are annotated integers is typed by the
-    exact range of its result: interval arithmetic over the inputs' ranges, an
-    initializer's read by its values (a MatMul's, Gemm's or Conv's weights per
-    output column), the result the smallest INTn or UINTn holding it. Its output's
-    annotation is replaced, whatever it was. An initializer or Clip bound holding a
-    non-integer makes the result FLOAT32. Other inputs keep the rules below."""
+    exact range of its result: interval arithmetic over the inputs' ranges (each
+    input's stated range, else its datatype's), an initializer's read by its
+    values (a MatMul's, Gemm's or Conv's weights per output column, cached by
+    their digest), the result the smallest INTn or UINTn holding it, and that
+    range stated with it. An initializer or Clip bound holding a non-integer
+    makes the result FLOAT32. Other inputs keep the rules below, with ranges:
+
+    - an op that passes values through without rounding (Relu, Neg, Max, Min,
+      Clip, Concat, Pad, Scatter and the identity and shape ops) states the range
+      of what it passes, for any datatype;
+    - a mixed or float MatMul, Gemm, Conv, Add, Sub or Mul states an unbounded
+      range, NaN possible where it can make one; a Mul by a constant power of two
+      scales its input's range where its datatype holds the scaled ends exactly;
+    - any other op states none. A custom op states its own.
+
+    The datatype and the range are written together (set_tensor_datatype); an
+    output's range is never kept from before. A float datatype is never
+    narrowed."""
     dt_identity_optypes = [
         "Reshape",
         "Transpose",
@@ -321,8 +536,7 @@ def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dt
     # integers: Concat and Clip then keep input 0's type, Max, Min, Relu and Neg
     # take the unknown op's rule
     mac_like_optypes = ["MatMul", "Gemm", "Conv", "Add", "Sub", "Mul"]
-    idtypes = list(map(lambda x: model.get_tensor_datatype(x), node.input))
-    odtypes = list(map(lambda x: model.get_tensor_datatype(x), node.output))
+    before = [_fact(model, name) for name in node.output]
     op_type = node.op_type
     if is_custom_op(node.domain):
         # handle DataType inference for CustomOp
@@ -335,70 +549,89 @@ def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dt
         except KeyError:
             # exception if op_type is not supported
             raise Exception("Custom op_type %s is currently not supported." % op_type)
-    else:
-        if node.op_type in _range_rules and _integer_inputs(model, node):
-            span = _range_rules[node.op_type](model, node)
-            odtype = DataType["FLOAT32"] if span is None else int_type_holding(*span)
-            model.set_tensor_datatype(node.output[0], odtype)
-        elif node.op_type == "Sign":
-            # always produces bipolar outputs
-            model.set_tensor_datatype(node.output[0], DataType["BIPOLAR"])
-        elif node.op_type in mac_like_optypes:
-            possible_negation = node.op_type in ["Sub"]
-            odtype_orig = model.get_tensor_datatype(node.output[0])
-            odtype = infer_mac_result_dtype(idtypes, odtype_orig, possible_negation=possible_negation)
-            model.set_tensor_datatype(node.output[0], odtype)
-        elif node.op_type in ["Resize", "Upsample"]:
-            mode = get_by_name(node.attribute, "mode").s
-            if mode is None:
-                mode = "nearest"
-            else:
-                mode = mode.decode("UTF-8")
-            if mode == "nearest":
-                # set output dtype = input dtype
-                idtype = model.get_tensor_datatype(node.input[0])
-                model.set_tensor_datatype(node.output[0], idtype)
-        elif node.op_type in dt_identity_optypes:
-            # set output dtype = input dtype
-            idtype = model.get_tensor_datatype(node.input[0])
-            model.set_tensor_datatype(node.output[0], idtype)
-        elif node.op_type == "QuantizeLinear":
-            # retrieve from output tensor dtype
-            ovi = model.get_tensor_valueinfo(node.output[0])
-            (bitwidth, signed, _) = extract_elem_type(ovi.type.tensor_type.elem_type)
-            prefix = "INT" if signed else "UINT"
-            ret = DataType["%s%d" % (prefix, bitwidth)]
-            model.set_tensor_datatype(node.output[0], ret)
-        elif node.op_type == "DequantizeLinear":
-            # retrieve from input tensor dtype
-            ivi = model.get_tensor_valueinfo(node.input[0])
-            (bitwidth, signed, _) = extract_elem_type(ivi.type.tensor_type.elem_type)
-            ret = DataType["SCALEDINT<%d>" % (bitwidth)]
-            model.set_tensor_datatype(node.output[0], ret)
-        else:
-            # unknown, assume node produces float32 outputs
-            for o in node.output:
-                # check if output datatype is already set to a value != FLOAT32
-                odtype = model.get_tensor_datatype(o)
-                if odtype is not None and odtype != DataType["FLOAT32"]:
-                    # don't change data type
-                    model.set_tensor_datatype(o, odtype)
-                else:
-                    model.set_tensor_datatype(o, DataType["FLOAT32"])
-    # if scaled-int dtype inference is disabled, replace those with FLOAT32
-    if not allow_scaledint_dtypes:
+        facts = {}
         for out in node.output:
-            if "SCALEDINT" in model.get_tensor_datatype(out).get_canonical_name():
-                model.set_tensor_datatype(out, DataType["FLOAT32"])
-    # compare old and new output dtypes to see if anything changed
-    new_odtypes = list(map(lambda x: model.get_tensor_datatype(x), node.output))
-    graph_modified = new_odtypes != odtypes
-    return graph_modified
+            if not allow_scaledint_dtypes and "SCALEDINT" in ranges.datatype(model, out).get_canonical_name():
+                facts[out] = (DataType["FLOAT32"], ranges.stated(model, out))
+    else:
+        facts = _standard_facts(model, node, dt_identity_optypes, mac_like_optypes, allow_scaledint_dtypes)
+    for out, (dtype, value) in facts.items():
+        model.set_tensor_datatype(out, dtype, value)
+    # compare old and new output datatypes and ranges to see if anything changed
+    return [_fact(model, name) for name in node.output] != before
+
+
+def _standard_facts(
+    model: ModelWrapper,
+    node: NodeProto,
+    dt_identity_optypes: list[str],
+    mac_like_optypes: list[str],
+    allow_scaledint_dtypes: bool,
+) -> dict[str, tuple[BaseDataType, Optional[TensorRange]]]:
+    """Each output's datatype and range for a standard op (infer_node_datatype)."""
+    idtypes = [ranges.datatype(model, name) for name in node.input]
+    out = node.output[0]
+
+    def final(dtype: BaseDataType) -> BaseDataType:
+        # if scaled-int dtype inference is disabled, replace those with FLOAT32
+        if not allow_scaledint_dtypes and "SCALEDINT" in dtype.get_canonical_name():
+            return DataType["FLOAT32"]
+        return dtype
+
+    if node.op_type in _range_rules and _integer_inputs(model, node):
+        span = _range_rules[node.op_type](model, node)
+        if span is not None:
+            return {out: (int_type_holding(*span), TensorRange(*span))}
+        dtype = DataType["FLOAT32"]
+        return {out: (dtype, _arithmetic(model, node, dtype))}
+    if node.op_type == "Sign":
+        # always produces bipolar outputs
+        return {out: (DataType["BIPOLAR"], None)}
+    if node.op_type in mac_like_optypes:
+        possible_negation = node.op_type in ["Sub"]
+        odtype_orig = ranges.datatype(model, out)
+        dtype = final(infer_mac_result_dtype(idtypes, odtype_orig, possible_negation=possible_negation))
+        return {out: (dtype, _arithmetic(model, node, dtype))}
+    if node.op_type in ["Resize", "Upsample"]:
+        mode = get_by_name(node.attribute, "mode").s
+        if mode is None:
+            mode = "nearest"
+        else:
+            mode = mode.decode("UTF-8")
+        if mode == "nearest":
+            # set output dtype = input dtype
+            return {out: (final(idtypes[0]), _passed(model, node))}
+        return {}
+    if node.op_type in dt_identity_optypes:
+        # set output dtype = input dtype
+        return {out: (final(idtypes[0]), _passed(model, node))}
+    if node.op_type == "QuantizeLinear":
+        # retrieve from output tensor dtype
+        ovi = model.get_tensor_valueinfo(out)
+        (bitwidth, signed, _) = extract_elem_type(ovi.type.tensor_type.elem_type)
+        prefix = "INT" if signed else "UINT"
+        return {out: (DataType["%s%d" % (prefix, bitwidth)], None)}
+    if node.op_type == "DequantizeLinear":
+        # retrieve from input tensor dtype
+        ivi = model.get_tensor_valueinfo(node.input[0])
+        (bitwidth, signed, _) = extract_elem_type(ivi.type.tensor_type.elem_type)
+        return {out: (final(DataType["SCALEDINT<%d>" % (bitwidth)]), None)}
+    # unknown, assume node produces float32 outputs
+    facts: dict[str, tuple[BaseDataType, Optional[TensorRange]]] = {}
+    passed = _passed(model, node) if node.op_type in ("Relu", "Neg", "Max", "Min") else None
+    for o in node.output:
+        # check if output datatype is already set to a value != FLOAT32
+        odtype = ranges.datatype(model, o)
+        dtype = odtype if odtype is not None and odtype != DataType["FLOAT32"] else DataType["FLOAT32"]
+        facts[o] = (final(dtype), passed)
+    return facts
 
 
 class InferDataTypes(Transformation):
-    """Infer QONNX DataType info for all intermediate/output tensors based on
-    inputs and node type."""
+    """Infer QONNX DataType info, with each tensor's range (qonnx.core.ranges), for
+    all intermediate/output tensors based on inputs and node type. Each pass
+    recomputes every node's; it stops changing the graph where a node's
+    recomputed datatypes and ranges equal what is stored."""
 
     def __init__(self, allow_scaledint_dtypes=False):
         super().__init__()
@@ -407,6 +640,7 @@ class InferDataTypes(Transformation):
     def apply(self, model):
         graph = model.graph
         graph_modified = False
-        for node in graph.node:
-            graph_modified |= infer_node_datatype(model, node, self.allow_scaledint_dtypes)
+        with ranges.one_pass(model):
+            for node in graph.node:
+                graph_modified |= infer_node_datatype(model, node, self.allow_scaledint_dtypes)
         return (model, graph_modified)
