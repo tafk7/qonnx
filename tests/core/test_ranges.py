@@ -33,16 +33,19 @@ import pytest
 
 import math
 import numpy as np
+import subprocess
+import sys
 import warnings
 from fractions import Fraction
 from onnx import StringStringEntryProto, TensorProto, helper
 
 import qonnx.transformation.infer_datatypes as infer_datatypes
-from qonnx.core import metadata, ranges
+from qonnx.core import metadata, ranges, tensor_ranges
 from qonnx.core.datatype import DataType
 from qonnx.core.metadata import MetadataError
 from qonnx.core.modelwrapper import ModelWrapper
-from qonnx.core.ranges import RANGE, RangeContradiction, TensorRange
+from qonnx.core.ranges import RangeContradiction, TensorRange
+from qonnx.core.tensor_ranges import RANGE
 from qonnx.transformation.general import RemoveUnusedTensors
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.util.basic import get_by_name, qonnx_make_model
@@ -182,11 +185,11 @@ def test_a_datatype_set_without_its_range_clears_the_range():
     model.set_tensor_datatype("m", DataType["INT7"], TensorRange(-39, 36))
     assert model.get_tensor_range("m") == TensorRange(-39, 36)
     model.set_tensor_datatype("m", DataType["INT7"])
-    assert ranges.stated(model, "m") is None
+    assert tensor_ranges.stated(model, "m") is None
     assert model.get_tensor_range("m") == TensorRange(-64, 63)
     model.set_tensor_datatype("m", DataType["INT7"], TensorRange(-39, 36))
     model.set_tensor_datatype("m", DataType["INT8"])
-    assert ranges.stated(model, "m") is None
+    assert tensor_ranges.stated(model, "m") is None
     model.set_tensor_datatype("m", DataType["INT7"], TensorRange(-39, 36))
     model.set_tensor_datatype("m", None)
     assert get_by_name(model.graph.quantization_annotation, "m", "tensor_name").quant_parameter_tensor_names == []
@@ -206,7 +209,7 @@ def test_a_datatype_set_without_its_range_clears_the_range():
 def test_a_datatype_s_full_range_is_its_range_when_none_is_stated_and_is_not_stored(datatype, full):
     model = chain()
     model.set_tensor_datatype("m", DataType[datatype], full)
-    assert ranges.stated(model, "m") is None
+    assert tensor_ranges.stated(model, "m") is None
     assert model.get_tensor_range("m") == full
 
 
@@ -217,7 +220,7 @@ def test_a_writer_stating_a_range_its_datatype_does_not_hold_is_named_and_nothin
         match=r"tensor 'm' not stated: MatMul_0 \(MatMul\) states \[0, 2\], which its datatype INT2 does not hold",
     ):
         model.set_tensor_datatype("m", DataType["INT2"], TensorRange(0, 2))
-    assert ranges.stated(model, "m") is None
+    assert tensor_ranges.stated(model, "m") is None
     assert model.get_tensor_datatype("m") == DataType["INT2"]
 
 
@@ -247,7 +250,7 @@ def test_inference_states_each_rule_s_exact_range_with_its_datatype():
     model = inferred(chain())
     assert (model.get_tensor_datatype("m"), model.get_tensor_range("m")) == (DataType["INT7"], TensorRange(-39, 36))
     assert (model.get_tensor_datatype("y"), model.get_tensor_range("y")) == (DataType["INT7"], TensorRange(-44, 41))
-    assert ranges.stated(model, "x") is None
+    assert tensor_ranges.stated(model, "x") is None
 
 
 def test_a_narrowed_range_flows_forward_and_narrows_the_next_datatype():
@@ -351,7 +354,7 @@ def test_mixed_and_float_arithmetic_states_an_unbounded_range(op, inputs, initia
 def test_float_arithmetic_on_a_float_that_may_be_infinite_may_make_nan():
     model = inferred(single("Add", "FLOAT32", inputs=["c"], c=[1.0]))
     assert model.get_tensor_range("y") == TensorRange(-math.inf, math.inf, nan=True)
-    assert ranges.stated(model, "y") is None  # FLOAT32's full range
+    assert tensor_ranges.stated(model, "y") is None  # FLOAT32's full range
 
 
 def test_a_float_datatype_is_never_narrowed():
@@ -393,18 +396,18 @@ def thresholded(out_dtype, steps=3, **attributes):
 def test_multithreshold_states_out_bias_plus_out_scale_times_its_count(out_dtype, attributes, expected):
     model = inferred(thresholded(out_dtype, **attributes))
     assert model.get_tensor_datatype("y") == DataType[out_dtype]
-    assert ranges.stated(model, "y") == TensorRange(*expected)
+    assert tensor_ranges.stated(model, "y") == TensorRange(*expected)
 
 
 def test_multithreshold_whose_range_is_its_datatype_s_states_none():
     model = inferred(thresholded("UINT2"))
-    assert ranges.stated(model, "y") is None and model.get_tensor_range("y") == TensorRange(0, 3)
+    assert tensor_ranges.stated(model, "y") is None and model.get_tensor_range("y") == TensorRange(0, 3)
 
 
 def test_multithreshold_with_a_fractional_scale_states_no_range():
     model = inferred(thresholded("INT4", out_scale=0.5))
     assert model.get_tensor_datatype("y") == DataType["FLOAT32"]
-    assert ranges.stated(model, "y") is None
+    assert tensor_ranges.stated(model, "y") is None
 
 
 def test_multithreshold_whose_out_dtype_cannot_hold_its_count_is_named_once_per_pass():
@@ -416,7 +419,7 @@ def test_multithreshold_whose_out_dtype_cannot_hold_its_count_is_named_once_per_
     assert [str(w.message) for w in caught if w.category is RangeContradiction] == [
         "qonnx.tensor/range of tensor 'y' not stated: MultiThreshold states [0, 2], which its datatype INT2 does not hold"
     ] * 2
-    assert model.get_tensor_datatype("y") == DataType["INT2"] and ranges.stated(model, "y") is None
+    assert model.get_tensor_datatype("y") == DataType["INT2"] and tensor_ranges.stated(model, "y") is None
 
 
 def test_a_narrow_range_out_of_multithreshold_narrows_the_matmul_after_it_through_a_reshape():
@@ -430,8 +433,8 @@ def test_a_narrow_range_out_of_multithreshold_narrows_the_matmul_after_it_throug
     model.set_initializer("w", np.array([[3], [3]], dtype=np.float32))
     model.set_tensor_datatype("w", DataType["UINT2"])
     model = inferred(model)
-    assert ranges.stated(model, "y") == TensorRange(-1, 1)
-    assert ranges.stated(model, "r") == TensorRange(-1, 1)
+    assert tensor_ranges.stated(model, "y") == TensorRange(-1, 1)
+    assert tensor_ranges.stated(model, "r") == TensorRange(-1, 1)
     assert (model.get_tensor_datatype("z"), model.get_tensor_range("z")) == (DataType["INT4"], TensorRange(-6, 6))
 
 
@@ -440,14 +443,14 @@ def test_a_narrow_range_out_of_multithreshold_narrows_the_matmul_after_it_throug
 
 def test_the_range_is_renamed_and_removed_with_its_tensor():
     model = inferred(chain())
-    m = ranges.stated(model, "m")
+    m = tensor_ranges.stated(model, "m")
     model.rename_tensor("m", "renamed")
-    assert ranges.stated(model, "renamed") == m and ranges.stated(model, "m") is None
+    assert tensor_ranges.stated(model, "renamed") == m and tensor_ranges.stated(model, "m") is None
     model.graph.value_info.append(helper.make_tensor_value_info("unused", F, [1]))
     model.set_tensor_datatype("unused", DataType["INT4"], TensorRange(0, 1))
     after = model.transform(RemoveUnusedTensors())
     assert get_by_name(after.graph.quantization_annotation, "unused", "tensor_name") is None
-    assert ranges.stated(after, "renamed") == m
+    assert tensor_ranges.stated(after, "renamed") == m
 
 
 def test_the_range_follows_its_tensor_into_a_cut():
@@ -456,3 +459,18 @@ def test_the_range_follows_its_tensor_into_a_cut():
     props = list(annotation.quant_parameter_tensor_names)
     metadata.cut(props)
     assert {prop.key for prop in props} >= {"qonnx.tensor/range", "qonnx.tensor/@version", "qonnx.tensor/@follow"}
+
+
+def test_the_range_module_loads_no_onnx():
+    """qonnx.core.ranges is the value alone: a value layer holds ranges as it holds
+    datatypes, without loading ONNX (the model half is qonnx.core.tensor_ranges)."""
+    script = "\n".join(
+        (
+            "import sys",
+            "import qonnx.core.ranges",
+            "loaded = sorted(name for name in sys.modules if name == 'onnx' or name.startswith('onnx.'))",
+            "raise SystemExit('loaded: ' + ', '.join(loaded) if loaded else 0)",
+        )
+    )
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stdout + completed.stderr

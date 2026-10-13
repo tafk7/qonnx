@@ -29,7 +29,7 @@
 import numpy as np
 import onnx.helper as helper
 
-from qonnx.core import ranges
+from qonnx.core import ranges, tensor_ranges
 from qonnx.core.datatype import DataType
 from qonnx.custom_op.base import CustomOp
 
@@ -131,7 +131,7 @@ class MultiThreshold(CustomOp):
     def output_range(self, model):
         """``out_bias + out_scale * [0, N]`` for integer ``out_scale`` and
         ``out_bias``, while the number of thresholds N is known; else None."""
-        thresholds = ranges.initializer(model, self.onnx_node.input[1])
+        thresholds = tensor_ranges.initializer(model, self.onnx_node.input[1])
         shape = list(thresholds.dims) if thresholds is not None else model.get_tensor_shape(self.onnx_node.input[1])
         if not shape or shape[-1] <= 0:
             return None

@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 import qonnx.util.basic as util
 import qonnx.util.onnx as onnxutil
-from qonnx.core import metadata, ranges
+from qonnx.core import metadata, ranges, tensor_ranges
 from qonnx.core.datatype import BaseDataType, DataType
 from qonnx.custom_op.registry import getCustomOp, is_custom_op
 from qonnx.transformation.double_to_single_float import DoubleToSingleFloat
@@ -354,7 +354,7 @@ class ModelWrapper:
         datatype does not hold is not stored, and is named (RangeContradiction).
         A datatype of None removes the datatype annotation and the range (other
         annotations of the tensor, such as its layout, stay)."""
-        qa = ranges.annotation(self, tensor_name)
+        qa = tensor_ranges.annotation(self, tensor_name)
         if qa is None:
             if datatype is None:
                 return
@@ -371,13 +371,13 @@ class ModelWrapper:
         if datatype is None:
             if ret_dt is not None:
                 props.remove(ret_dt)
-            metadata.clear(props, ranges.TENSOR)
+            metadata.clear(props, tensor_ranges.TENSOR)
             return
         if ret_dt is None:
             props.append(onnx.StringStringEntryProto(key="finn_datatype", value=datatype.name))
         elif ret_dt.value != datatype.name:
             ret_dt.value = datatype.name
-        ranges.write(self, tensor_name, props, datatype, range)
+        tensor_ranges.write(self, tensor_name, props, datatype, range)
 
     def get_tensor_range(self, tensor_name: str) -> ranges.TensorRange:
         """The range of the tensor with given name (qonnx.core.ranges): the one it
@@ -387,7 +387,7 @@ class ModelWrapper:
         values = self.get_initializer(tensor_name)
         if values is not None:
             return ranges.values_range(values)
-        return ranges.tensor_range(self, tensor_name)
+        return tensor_ranges.tensor_range(self, tensor_name)
 
     def get_tensor_valueinfo(self, tensor_name: str) -> ValueInfoProto | None:
         """Returns ValueInfoProto of tensor with given name, if it has one."""
