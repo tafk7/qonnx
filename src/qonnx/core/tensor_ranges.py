@@ -161,6 +161,18 @@ def digest(model: ModelWrapper, tensor: str) -> Optional[bytes]:
     return found
 
 
+def element_type(model: ModelWrapper, tensor: str) -> Optional[int]:
+    """``tensor``'s ONNX element type (``TensorProto.FLOAT``, ...), the one its
+    values are held and computed in: its value info's, else its initializer's;
+    None where neither states one. By the pass's index inside ``one_pass``."""
+    index = _pass(model)
+    info = index.infos.get(tensor) if index is not None else model.get_tensor_valueinfo(tensor)
+    if info is not None and info.type.tensor_type.elem_type:
+        return info.type.tensor_type.elem_type
+    proto = initializer(model, tensor)
+    return proto.data_type if proto is not None and proto.data_type else None
+
+
 def datatype(model: ModelWrapper, tensor: str) -> BaseDataType:
     """``model.get_tensor_datatype(tensor)``, by the pass's index inside ``one_pass``."""
     found = annotation(model, tensor)
@@ -259,6 +271,7 @@ __all__ = [
     "contradiction",
     "datatype",
     "digest",
+    "element_type",
     "initializer",
     "one_pass",
     "stated",

@@ -44,8 +44,9 @@ float, fixed-point or scaled-integer value is one exactly), or an infinity
 (``math.inf``, ``-math.inf``). Integers are exact at any width.
 
 This module is the value and its rules alone: the range, a datatype's full
-range and what a datatype holds, the exact range of an array's values, and the
-range's stored text. It loads no ONNX, so a value layer that holds ranges (as it
+range and what a datatype holds, the exact range of an array's values, the
+rounding of an exact value into a binary float format (``FloatFormat``), and
+the range's stored text. It loads no ONNX, so a value layer that holds ranges (as it
 holds datatypes, ``qonnx.core.datatype``) need not. Where a range is stored on a
 model and read back, inside an inference pass, is ``qonnx.core.tensor_ranges``.
 
@@ -184,7 +185,58 @@ def _decode(text: str) -> TensorRange:
     return TensorRange(_parse(pair[0]), _parse(pair[1]), data["nan"])
 
 
-def _is_float(datatype: BaseDataType) -> bool:
+@dataclass(frozen=True)
+class FloatFormat:
+    """A binary floating-point format as IEEE 754 defines one: a sign, ``mantissa``
+    fraction bits, normal exponents ``emin`` to ``emax``, subnormals below them and
+    an infinity of each sign beyond its largest finite value."""
+
+    mantissa: int
+    emin: int
+    emax: int
+
+    @property
+    def largest(self) -> Endpoint:
+        """The largest finite value, (2 - 2^-mantissa) * 2^emax."""
+        return endpoint((2 - Fraction(1, 2**self.mantissa)) * Fraction(2) ** self.emax)
+
+    def nearest(self, value: Union[int, Fraction, float]) -> Endpoint:
+        """``value``, an exact rational or an infinity, rounded once into the format
+        as IEEE 754's round to nearest, ties to even, does: past the largest finite
+        value by half its spacing or more, to the infinity of its sign. A zero
+        result is 0 (a range does not tell -0 from +0)."""
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise ValueError("NaN is not rounded into a range")
+            if math.isinf(value):
+                return value
+            value = Fraction(value)
+        value = Fraction(value)
+        if value == 0:
+            return 0
+        size = abs(value)
+        # the exponent of size's leading bit, exactly: 2^exponent <= size < 2^(exponent + 1)
+        exponent = size.numerator.bit_length() - size.denominator.bit_length()
+        if size < Fraction(2) ** exponent:
+            exponent -= 1
+        # the spacing of the format's values at size: its normal binade's, or the subnormals'
+        spacing = Fraction(2) ** (max(exponent, self.emin) - self.mantissa)
+        rounded = round(size / spacing) * spacing  # round() of a Fraction: ties to even
+        if rounded > self.largest:
+            return math.inf if value > 0 else -math.inf
+        return endpoint(rounded if value > 0 else -rounded)
+
+
+# The formats of ONNX's float element types.
+BINARY16 = FloatFormat(10, -14, 15)
+BINARY32 = FloatFormat(23, -126, 127)
+BINARY64 = FloatFormat(52, -1022, 1023)
+BFLOAT16 = FloatFormat(7, -126, 127)
+
+
+def is_float(datatype: BaseDataType) -> bool:
+    """Whether ``datatype`` is a float: neither an integer, a fixed-point nor a
+    scaled-integer datatype."""
     return not (datatype.is_integer() or datatype.is_fixed_point() or isinstance(datatype, ScaledIntType))
 
 
@@ -204,7 +256,7 @@ def holds(datatype: BaseDataType, value: TensorRange) -> bool:
     datatype holds integer ranges within its bounds; a fixed-point one, finite
     ranges within its bounds; a scaled integer, any range without NaN; a float,
     any range."""
-    if _is_float(datatype):
+    if is_float(datatype):
         return True
     if value.nan:
         return False
@@ -233,13 +285,19 @@ def values_range(values: np.ndarray) -> TensorRange:
 
 
 __all__ = [
+    "BFLOAT16",
+    "BINARY16",
+    "BINARY32",
+    "BINARY64",
     "Endpoint",
+    "FloatFormat",
     "RangeContradiction",
     "TensorRange",
     "endpoint",
     "full",
     "holds",
     "hull",
+    "is_float",
     "unbounded",
     "values_range",
 ]

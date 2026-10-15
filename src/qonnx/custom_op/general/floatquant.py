@@ -28,8 +28,11 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
+from fractions import Fraction
 from onnx import TensorProto, helper
+from typing import Optional
 
+from qonnx.core import ranges, tensor_ranges
 from qonnx.core.datatype import DataType
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.general.quant import resolve_rounding_mode
@@ -46,6 +49,13 @@ def compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias=None):
     max_mantissa = np.sum((2.0 ** np.arange(0, -1.0 * mantissa_bitwidth - 1.0, -1.0)))
     max_val = max_mantissa * (2**max_exponent)
     return max_val
+
+
+def clip_value(exponent_bitwidth, mantissa_bitwidth, exponent_bias=None, max_val=None):
+    """The largest magnitude float_quant outputs before its scale: the format's
+    largest value (compute_max_val), or max_val where that is less."""
+    max_value = compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias)
+    return max_value if max_val is None else np.minimum(max_value, max_val)
 
 
 def float_quant(
@@ -102,8 +112,7 @@ def float_quant(
         X / internal_scale
     )  # self.float_to_int_impl(x / internal_scale)
 
-    max_value = compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias)
-    max_value = max_value if max_val is None else np.minimum(max_value, max_val)
+    max_value = clip_value(exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val)
     min_value = 0.0 if not signed else -max_value
 
     # Compute masks
@@ -250,12 +259,76 @@ class FloatQuant(CustomOp):
         return finn_dt
 
     def infer_node_datatype(self, model):
+        """The output's datatype is FLOAT<e,m,b> for a unit scale (get_output_dtype),
+        else FLOAT32; its range is stated with it (get_output_range)."""
         try:
             finn_dt = self.get_output_dtype(model)
         except AssertionError:
             finn_dt = DataType["FLOAT32"]
         node = self.onnx_node
-        model.set_tensor_datatype(node.output[0], finn_dt)
+        model.set_tensor_datatype(node.output[0], finn_dt, self.get_output_range(model))
+
+    def get_output_range(self, model) -> Optional[ranges.TensorRange]:
+        """The values the node outputs, as execute_node computes them in float32.
+
+        M, the clip value (clip_value of the exponent and mantissa widths, the
+        exponent bias and max_val), bounds each value before its scale, and the
+        output is that value times the scale, rounded into float32. So:
+
+        - saturating: [-M * s, M * s], s the scale's largest magnitude, the ends
+          rounded into float32 as the product is;
+        - not saturating, with has_inf: unbounded, its values beyond M becoming
+          infinities;
+        - not saturating, with has_nan only: as saturating, NaN possible (its
+          values beyond M becoming NaN).
+
+        NaN is possible where the input may be NaN or infinite, or the input over
+        the scale may overflow float32 or divide by 0 (execution makes NaN of an
+        infinity). None (no range stated) where the scale, the widths, the bias or
+        max_val is not an initializer, where M or the scale is not exact in
+        float32, where the input is held in another type than float32 or
+        float64, or where execution raises (neither saturating, has_inf nor
+        has_nan)."""
+        node = self.onnx_node
+        constants = [model.get_initializer(name) if name else None for name in node.input[1:6]]
+        if len(constants) < 5 or any(value is None for value in constants):
+            return None
+        scale, exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val = constants
+        saturation, has_inf, has_nan = (self.get_nodeattr(key) for key in ("saturation", "has_inf", "has_nan"))
+        if not (saturation or has_inf or has_nan):
+            return None
+        held = tensor_ranges.element_type(model, node.input[0])
+        if held not in (None, TensorProto.FLOAT, TensorProto.DOUBLE) or scale.dtype != np.float32:
+            return None
+        with np.errstate(all="ignore"):
+            clip = np.abs(np.asarray(clip_value(exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val)))
+        scales = ranges.values_range(np.abs(scale))
+        if np.isnan(clip).any() or scales.nan or isinstance(scales.greatest, float):
+            return ranges.unbounded(True)
+        f32 = ranges.BINARY32
+        bound = ranges.endpoint(float(clip.max()))
+        if f32.nearest(bound) != bound:
+            return None
+        x = model.get_tensor_range(node.input[0])
+        divided = ranges.BINARY64 if held == TensorProto.DOUBLE else f32
+        largest = max(abs(x.least), abs(x.greatest))
+        nan = (
+            x.nan
+            or isinstance(largest, float)
+            or scales.least == 0
+            or isinstance(divided.nearest(Fraction(largest) / Fraction(scales.least)), float)
+        )
+        if scales.greatest == 0 or bound == 0:
+            end = 0
+        elif isinstance(bound, float):
+            end = bound
+        else:
+            end = f32.nearest(Fraction(bound) * Fraction(scales.greatest))
+        if saturation:
+            return ranges.TensorRange(-end, end, nan)
+        if has_inf:
+            return ranges.unbounded(nan)
+        return ranges.TensorRange(-end, end, True)
 
     def verify_node(self) -> list[str]:
         return []

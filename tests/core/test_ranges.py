@@ -337,15 +337,24 @@ def test_a_mul_by_a_power_of_two_scales_an_integer_range_into_its_float_result()
     assert model.get_tensor_range("y") == TensorRange(-16, Fraction(127, 8))
 
 
+def f32(value):
+    """``value`` rounded into float32, as an endpoint."""
+    return ranges.endpoint(float(np.float32(value)))
+
+
 @pytest.mark.parametrize(
     "op, inputs, initializers, expected",
     [
-        ("Mul", ["c"], {"c": [3.0]}, TensorRange(-math.inf, math.inf)),
-        ("Add", ["c"], {"c": [0.1]}, TensorRange(-math.inf, math.inf)),
+        ("Mul", ["c"], {"c": [3.0]}, TensorRange(-384, 381)),
+        ("Div", ["c"], {"c": [4.0]}, TensorRange(-32, Fraction(127, 4))),
+        # each end rounded once into float32, as float32 arithmetic rounds it
+        ("Add", ["c"], {"c": [0.1]}, TensorRange(f32(np.float32(-128) + np.float32(0.1)), f32(127 + np.float32(0.1)))),
+        ("Div", ["c"], {"c": [3.0]}, TensorRange(f32(np.float32(-128) / 3), f32(np.float32(127) / 3))),
+        # a sum rounds in an order ONNX leaves open: no bound
         ("MatMul", ["w"], {"w": np.full((4, 4), 0.1)}, TensorRange(-math.inf, math.inf, nan=True)),
     ],
 )
-def test_mixed_and_float_arithmetic_states_an_unbounded_range(op, inputs, initializers, expected):
+def test_mixed_arithmetic_states_its_exact_range_rounded_into_float32(op, inputs, initializers, expected):
     model = inferred(single(op, "INT8", inputs=inputs, **initializers))
     assert model.get_tensor_datatype("y") == DataType["FLOAT32"]
     assert model.get_tensor_range("y") == expected
@@ -355,6 +364,106 @@ def test_float_arithmetic_on_a_float_that_may_be_infinite_may_make_nan():
     model = inferred(single("Add", "FLOAT32", inputs=["c"], c=[1.0]))
     assert model.get_tensor_range("y") == TensorRange(-math.inf, math.inf, nan=True)
     assert tensor_ranges.stated(model, "y") is None  # FLOAT32's full range
+
+
+def binary(op, x_range, z_range, elem=F, datatype="FLOAT32"):
+    """x and z (``datatype``, their ranges stated) -> op -> y, all held as ``elem``;
+    y's datatype and range inferred."""
+    graph = helper.make_graph(
+        [helper.make_node(op, ["x", "z"], ["y"], name=f"{op}_0")],
+        "binary",
+        [helper.make_tensor_value_info(name, elem, [4]) for name in ("x", "z")],
+        [helper.make_tensor_value_info("y", elem, [4])],
+    )
+    model = ModelWrapper(qonnx_make_model(graph))
+    model.set_tensor_datatype("x", DataType[datatype], x_range)
+    model.set_tensor_datatype("z", DataType[datatype], z_range)
+    model = inferred(model)
+    assert ranges.is_float(model.get_tensor_datatype("y"))
+    return model.get_tensor_range("y")
+
+
+INF = math.inf
+LARGEST32 = ranges.endpoint(float(np.finfo(np.float32).max))
+
+
+@pytest.mark.parametrize(
+    "op, x, z, expected",
+    [
+        # exact: no rounding
+        ("Add", TensorRange(1, 2), TensorRange(Fraction(1, 4), Fraction(1, 2)), TensorRange(Fraction(5, 4), Fraction(5, 2))),
+        ("Sub", TensorRange(1, 2), TensorRange(-3, 5), TensorRange(-4, 5)),
+        ("Mul", TensorRange(-2, 3), TensorRange(-5, 4), TensorRange(-15, 12)),
+        ("Div", TensorRange(-3, 6), TensorRange(Fraction(1, 2), 4), TensorRange(-6, 12)),
+        # overflow: an end past float32's largest value rounds to infinity, as IEEE 754 does
+        ("Mul", TensorRange(0, 2**127), TensorRange(0, 4), TensorRange(0, INF)),
+        # half float32's spacing past its largest value: to infinity (ties to even); less: to the largest
+        ("Add", TensorRange(LARGEST32, LARGEST32), TensorRange(2**103, 2**103), TensorRange(INF, INF)),
+        ("Add", TensorRange(LARGEST32, LARGEST32), TensorRange(2**102, 2**102), TensorRange(LARGEST32, LARGEST32)),
+        ("Add", TensorRange(1, INF), TensorRange(1, INF), TensorRange(2, INF)),
+        ("Mul", TensorRange(1, 2), TensorRange(1, INF), TensorRange(1, INF)),
+        # NaN only where the intervals admit inf - inf, 0 * inf, 0 / 0 or inf / inf, or an input may be NaN
+        ("Add", TensorRange(0, INF), TensorRange(-INF, 0), TensorRange(-INF, INF, nan=True)),
+        ("Sub", TensorRange(0, INF), TensorRange(0, INF), TensorRange(-INF, INF, nan=True)),
+        ("Mul", TensorRange(0, 1), TensorRange(1, INF), TensorRange(0, INF, nan=True)),
+        ("Div", TensorRange(0, 1), TensorRange(0, 1), TensorRange(-INF, INF, nan=True)),
+        ("Div", TensorRange(1, INF), TensorRange(1, INF), TensorRange(0, INF, nan=True)),
+        ("Add", TensorRange(0, 1, nan=True), TensorRange(0, 1), TensorRange(0, 2, nan=True)),
+        # a divisor interval holding 0: unbounded both ways (a range does not tell -0 from +0),
+        # NaN only where 0 / 0 or inf / inf is admitted
+        ("Div", TensorRange(1, 2), TensorRange(-1, 1), TensorRange(-INF, INF)),
+        ("Div", TensorRange(1, INF), TensorRange(0, 1), TensorRange(-INF, INF)),
+        ("Div", TensorRange(1, INF), TensorRange(0, INF), TensorRange(-INF, INF, nan=True)),
+    ],
+)
+def test_float_elementwise_arithmetic_rounds_its_exact_interval_once(op, x, z, expected):
+    assert binary(op, x, z) == expected
+
+
+def test_float_elementwise_arithmetic_rounds_into_the_format_it_computes_in():
+    x, z = TensorRange(1, 1), TensorRange(Fraction(1, 2**11), Fraction(1, 2**11))
+    # 1 + 2^-11 is exact in float32, and a tie in float16, which rounds to even: the
+    # format is the one the tensors are held and computed in
+    assert binary("Add", x, z) == TensorRange(Fraction(2**11 + 1, 2**11), Fraction(2**11 + 1, 2**11))
+    assert binary("Add", x, z, TensorProto.FLOAT16, "FLOAT16") == TensorRange(1, 1)
+    # 300 * 300 overflows float16
+    assert binary("Mul", TensorRange(0, 300), TensorRange(0, 300), TensorProto.FLOAT16, "FLOAT16") == TensorRange(0, INF)
+
+
+def test_the_float_rule_bounds_what_onnx_runtime_computes():
+    from qonnx.core.onnx_exec import execute_onnx
+
+    xs = np.array([-3.0, 0.1, 7.5, 1e-3], dtype=np.float32)
+    zs = np.array([0.3, -7.0, 0.7, 3.0], dtype=np.float32)
+    for op in ("Add", "Sub", "Mul", "Div"):
+        graph = helper.make_graph(
+            [helper.make_node(op, ["x", "z"], ["y"])],
+            "binary",
+            [helper.make_tensor_value_info(name, F, [4]) for name in ("x", "z")],
+            [helper.make_tensor_value_info("y", F, [4])],
+        )
+        model = ModelWrapper(qonnx_make_model(graph))
+        model.set_tensor_datatype("x", DataType["FLOAT32"], ranges.values_range(xs))
+        model.set_tensor_datatype("z", DataType["FLOAT32"], ranges.values_range(zs))
+        model = inferred(model)
+        stated = model.get_tensor_range("y")
+        computed = ranges.values_range(execute_onnx(model, {"x": xs, "z": zs})["y"])
+        assert stated.least <= computed.least and computed.greatest <= stated.greatest and not computed.nan
+
+
+def test_a_float_rule_is_not_applied_to_integers_held_in_integer_types():
+    """An integer Div truncates: 7 / 2 is 3 on INT64 tensors, not 3.5."""
+    graph = helper.make_graph(
+        [helper.make_node("Div", ["a", "b"], ["y"])],
+        "ints",
+        [],
+        [helper.make_tensor_value_info("y", TensorProto.INT64, [1])],
+    )
+    model = ModelWrapper(qonnx_make_model(graph))
+    model.set_initializer("a", np.array([7], dtype=np.int64))
+    model.set_initializer("b", np.array([2], dtype=np.int64))
+    model = inferred(model)
+    assert model.get_tensor_range("y") == TensorRange(-INF, INF)
 
 
 def test_a_float_datatype_is_never_narrowed():

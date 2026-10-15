@@ -32,7 +32,7 @@ import math
 import numpy as np
 from collections import Counter, OrderedDict
 from fractions import Fraction
-from onnx import NodeProto
+from onnx import NodeProto, TensorProto, helper
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Optional
 
 from qonnx.core import ranges, tensor_ranges
@@ -420,22 +420,9 @@ def _power_of_two(value: Fraction) -> bool:
     return size != 0 and (size.numerator == 1 or size.denominator == 1) and (size.numerator & (size.numerator - 1)) == 0
 
 
-def _exact_in(datatype: BaseDataType, value: ranges.Endpoint) -> bool:
-    """Whether ``datatype`` holds ``value`` exactly (an infinity as a float's)."""
-    if isinstance(value, float):
-        return True
-    container = {"FLOAT32": np.float32, "FLOAT16": np.float16}.get(datatype.get_canonical_name())
-    if container is None:
-        return False
-    stored = float(container(float(value)))
-    return math.isfinite(stored) and Fraction(stored) == value
-
-
-def _scaled_by_power_of_two(model: ModelWrapper, node: NodeProto, datatype: BaseDataType) -> Optional[TensorRange]:
-    """A Mul by a constant power of two (every element the same +-2^k): its input's
-    range scaled exactly, where ``datatype`` holds the scaled ends exactly (a
-    float's rounding is monotone, so values between them stay between them);
-    else None."""
+def _scaled_by_power_of_two(model: ModelWrapper, node: NodeProto) -> Optional[TensorRange]:
+    """A Mul by a constant power of two (every element the same +-2^k) into a
+    scaled integer: its input's range scaled exactly; else None."""
     for scale, other in ((1, 0), (0, 1)):
         if tensor_ranges.initializer(model, node.input[scale]) is None:
             continue
@@ -447,30 +434,117 @@ def _scaled_by_power_of_two(model: ModelWrapper, node: NodeProto, datatype: Base
             continue
         x = _tensor_range(model, node.input[other])
         ends = sorted((x.least * factor, x.greatest * factor))
-        scaled = TensorRange(ends[0], ends[1], x.nan)
-        if ranges.full(datatype).nan and not all(_exact_in(datatype, end) for end in scaled.span):
-            return None
-        return scaled
+        return TensorRange(ends[0], ends[1], x.nan)
     return None
 
 
+# The formats ONNX's float element types compute in.
+_FLOAT_FORMATS = {
+    TensorProto.FLOAT: ranges.BINARY32,
+    TensorProto.FLOAT16: ranges.BINARY16,
+    TensorProto.BFLOAT16: ranges.BFLOAT16,
+    TensorProto.DOUBLE: ranges.BINARY64,
+}
+
+
+def _computed_in(model: ModelWrapper, node: NodeProto, datatype: BaseDataType) -> Optional[ranges.FloatFormat]:
+    """The float format a node's output is computed and rounded in: its element
+    type's (the output's, else the first input's that states one), else the
+    container of ``datatype``. None for an element type that is not one of
+    ONNX's binary floats (an integer one included)."""
+    for name in (*node.output[:1], *node.input):
+        found = tensor_ranges.element_type(model, name) if name else None
+        if found is not None:
+            return _FLOAT_FORMATS.get(found)
+    return _FLOAT_FORMATS.get(helper.np_dtype_to_tensor_dtype(datatype.to_numpy_dt()))
+
+
+def _sign(value: ranges.Endpoint) -> int:
+    return (value > 0) - (value < 0)
+
+
+def _exact(op: str, a: ranges.Endpoint, b: ranges.Endpoint) -> Optional[ranges.Endpoint]:
+    """``a op b`` exactly (a rational, or an infinity), None where IEEE 754 makes
+    NaN (inf - inf, 0 * inf, inf / inf). A divisor is never 0."""
+    if op == "Sub":
+        op, b = "Add", -b
+    infinite = isinstance(a, float) or isinstance(b, float)
+    if op == "Add":
+        if not infinite:
+            return a + b
+        if isinstance(a, float) and isinstance(b, float) and a != b:
+            return None
+        return a if isinstance(a, float) else b
+    if op == "Mul":
+        if not infinite:
+            return Fraction(a) * Fraction(b)
+        sign = _sign(a) * _sign(b)
+        return None if sign == 0 else sign * math.inf
+    if isinstance(a, float) and isinstance(b, float):
+        return None
+    if isinstance(a, float):
+        return _sign(a) * _sign(b) * math.inf
+    return 0 if isinstance(b, float) else Fraction(a) / Fraction(b)
+
+
+def _contains_zero(value: TensorRange) -> bool:
+    return value.least <= 0 <= value.greatest
+
+
+def _infinite(value: TensorRange) -> bool:
+    return isinstance(value.least, float) or isinstance(value.greatest, float)
+
+
+def _float_elementwise(op: str, x: TensorRange, y: TensorRange, form: ranges.FloatFormat) -> TensorRange:
+    """The range of a float Add, Sub, Mul or Div of x and y, computed in ``form``:
+    the exact interval of its results, each end rounded once into ``form`` (to
+    nearest, as IEEE 754 rounds each result; rounding is monotone, so the
+    rounded ends bound every rounded result, and an end past the largest finite
+    value is an infinity). NaN where an input may be NaN, or where the intervals
+    admit inf - inf, 0 * inf, 0 / 0 or inf / inf. A Div by an interval holding
+    0 is unbounded both ways: a range does not tell -0 from +0."""
+    nan = x.nan or y.nan
+    if op == "Div" and _contains_zero(y):
+        nan = nan or _contains_zero(x) or (_infinite(x) and _infinite(y))
+        return ranges.unbounded(nan)
+    if op == "Mul":
+        nan = nan or (_contains_zero(x) and _infinite(y)) or (_contains_zero(y) and _infinite(x))
+    # each op is monotone in each argument where it is a number, so its extremes
+    # over the two intervals are at their ends; inf - inf and inf / inf are too
+    corners = [_exact(op, a, b) for a in x.span for b in y.span]
+    results = [value for value in corners if value is not None]
+    nan = nan or len(results) < len(corners)
+    if not results:
+        return ranges.unbounded(True)
+    return TensorRange(form.nearest(min(results)), form.nearest(max(results)), nan)
+
+
 def _arithmetic(model: ModelWrapper, node: NodeProto, datatype: BaseDataType) -> TensorRange:
-    """A mixed or float arithmetic op's range (MatMul, Gemm, Conv, Add, Sub, Mul):
-    unbounded, as no rounding model is applied. For a float result, NaN possible
-    where an input may be NaN or infinite, or the op sums products (a MatMul's,
-    Gemm's or Conv's partial sums may reach both infinities); a scaled-integer
-    result has none. A Mul by a power of two scales its input's range."""
-    if node.op_type == "Mul":
-        scaled = _scaled_by_power_of_two(model, node, datatype)
-        if scaled is not None:
-            return scaled
-    if not ranges.full(datatype).nan:
-        # a scaled-integer result: no NaN, no infinity
+    """A mixed or float arithmetic op's range (MatMul, Gemm, Conv, Add, Sub, Mul,
+    Div).
+
+    For a float result, an Add, Sub, Mul or Div of two inputs computed in one of
+    ONNX's binary float formats states the exact interval of its results, its
+    ends rounded once into that format (_float_elementwise). A MatMul, Gemm or
+    Conv, whose sums round in an order ONNX leaves open, states an unbounded
+    range, NaN possible: its partial sums may reach both infinities. Any other
+    float result is unbounded, NaN possible where an input may be NaN or
+    infinite.
+
+    A scaled-integer result has no NaN and no infinity, and is unbounded but for
+    a Mul by a power of two, which scales its input's range."""
+    if not ranges.is_float(datatype):
+        if node.op_type == "Mul":
+            scaled = _scaled_by_power_of_two(model, node)
+            if scaled is not None:
+                return scaled
         return ranges.unbounded(False)
     inputs = [_tensor_range(model, name) for name in node.input if name]
-    nan = node.op_type in ("MatMul", "Gemm", "Conv") or any(
-        item.nan or math.isinf(item.least) or math.isinf(item.greatest) for item in inputs
-    )
+    if node.op_type in ("Add", "Sub", "Mul", "Div") and len(inputs) == 2:
+        form = _computed_in(model, node, datatype)
+        if form is not None:
+            return _float_elementwise(node.op_type, inputs[0], inputs[1], form)
+    nan = node.op_type in ("MatMul", "Gemm", "Conv") or any(item.nan or _infinite(item) for item in inputs)
     return ranges.unbounded(nan)
 
 
@@ -501,10 +575,15 @@ def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dt
     - an op that passes values through without rounding (Relu, Neg, Max, Min,
       Clip, Concat, Pad, Scatter and the identity and shape ops) states the range
       of what it passes, for any datatype;
-    - a mixed or float MatMul, Gemm, Conv, Add, Sub or Mul states an unbounded
-      range, NaN possible where it can make one; a Mul by a constant power of two
-      scales its input's range where its datatype holds the scaled ends exactly;
-    - any other op states none. A custom op states its own.
+    - a float Add, Sub, Mul or Div states the exact interval of its results, its
+      ends rounded once into the float format it computes in, NaN possible only
+      where an input may be NaN or the intervals admit inf - inf, 0 * inf, 0 / 0
+      or inf / inf; a float MatMul, Gemm or Conv states an unbounded range, NaN
+      possible (its rounding depends on its summation order); a scaled-integer
+      result is unbounded, but for a Mul by a constant power of two, which
+      scales its input's range;
+    - any other op states none. A custom op states its own
+      (CustomOp.infer_node_datatype).
 
     The datatype and the range are written together (set_tensor_datatype); an
     output's range is never kept from before. A float datatype is never
@@ -622,8 +701,11 @@ def _standard_facts(
     for o in node.output:
         # check if output datatype is already set to a value != FLOAT32
         odtype = tensor_ranges.datatype(model, o)
-        dtype = odtype if odtype is not None and odtype != DataType["FLOAT32"] else DataType["FLOAT32"]
-        facts[o] = (final(dtype), passed)
+        dtype = final(odtype if odtype is not None and odtype != DataType["FLOAT32"] else DataType["FLOAT32"])
+        if node.op_type == "Div" and ranges.is_float(dtype):
+            facts[o] = (dtype, _arithmetic(model, node, dtype))
+        else:
+            facts[o] = (dtype, passed)
     return facts
 
 
