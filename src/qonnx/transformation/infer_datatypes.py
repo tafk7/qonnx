@@ -573,8 +573,9 @@ def infer_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dt
     makes the result FLOAT32. Other inputs keep the rules below, with ranges:
 
     - an op that passes values through without rounding (Relu, Neg, Max, Min,
-      Clip, Concat, Pad, Scatter and the identity and shape ops) states the range
-      of what it passes, for any datatype;
+      Clip, Concat, Pad, Scatter, Split and the identity and shape ops) states
+      the range of what it passes, for any datatype; each of a Split's outputs
+      keeps its input's datatype and range;
     - a float Add, Sub, Mul or Div states the exact interval of its results, its
       ends rounded once into the float format it computes in, NaN possible only
       where an input may be NaN or the intervals admit inf - inf, 0 * inf, 0 / 0
@@ -695,6 +696,10 @@ def _standard_facts(
         ivi = model.get_tensor_valueinfo(node.input[0])
         (bitwidth, signed, _) = extract_elem_type(ivi.type.tensor_type.elem_type)
         return {out: (final(DataType["SCALEDINT<%d>" % (bitwidth)]), None)}
+    if node.op_type == "Split":
+        # every output holds values of input 0
+        passed = _tensor_range(model, node.input[0])
+        return {o: (final(idtypes[0]), passed) for o in node.output}
     # unknown, assume node produces float32 outputs
     facts: dict[str, tuple[BaseDataType, Optional[TensorRange]]] = {}
     passed = _passed(model, node) if node.op_type in ("Relu", "Neg", "Max", "Min") else None

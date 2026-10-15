@@ -466,6 +466,31 @@ def test_a_float_rule_is_not_applied_to_integers_held_in_integer_types():
     assert model.get_tensor_range("y") == TensorRange(-INF, INF)
 
 
+# -- Split
+
+
+@pytest.mark.parametrize(
+    "datatype, value",
+    [("INT4", TensorRange(0, 3)), ("FLOAT32", TensorRange(Fraction(-1, 2), INF, nan=True))],
+)
+def test_each_output_of_a_split_keeps_its_input_s_datatype_and_range(datatype, value):
+    graph = helper.make_graph(
+        [helper.make_node("Split", ["x", "split"], ["a", "b", "c"], axis=1)],
+        "split",
+        [helper.make_tensor_value_info("x", F, [1, 6])],
+        [helper.make_tensor_value_info(name, F, [1, 2]) for name in ("a", "b", "c")],
+    )
+    model = ModelWrapper(qonnx_make_model(graph, opset_imports=[helper.make_opsetid("", 13)]))
+    model.set_initializer("split", np.array([2, 2, 2], dtype=np.int64))
+    model.set_tensor_datatype("x", DataType[datatype], value)
+    for name in ("a", "b", "c"):
+        # a stale fact on each output is replaced
+        model.set_tensor_datatype(name, DataType["INT8"], TensorRange(-100, 100))
+    model = inferred(model)
+    for name in ("a", "b", "c"):
+        assert (model.get_tensor_datatype(name), model.get_tensor_range(name)) == (DataType[datatype], value)
+
+
 def test_a_float_datatype_is_never_narrowed():
     model = single("Relu", "FLOAT32")
     model.set_tensor_datatype("x", DataType["FLOAT32"], TensorRange(0, 3))
