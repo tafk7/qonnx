@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import inspect
 from pathlib import Path
@@ -36,6 +37,7 @@ import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as np_helper
 import os
+import re
 import warnings
 import numpy as np
 from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar, cast
@@ -59,6 +61,102 @@ from qonnx.transformation.general import (
 
 
 from qonnx.core import metadata, ranges, tensor_facts, tensor_ranges
+
+
+class _AnnotationScalars(ast.NodeTransformer):
+    """Replace narrowly recognized NumPy scalar representations with literals."""
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in ("True_", "False_"):
+            return ast.Constant(node.attr == "True_")
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        scalar_names = {
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "intp",
+            "int_",
+            "byte",
+            "short",
+            "intc",
+            "long",
+            "longlong",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintp",
+            "uint",
+            "ubyte",
+            "ushort",
+            "uintc",
+            "ulong",
+            "ulonglong",
+            "float16",
+            "float32",
+            "float64",
+            "float_",
+            "half",
+            "single",
+            "double",
+            "bool",
+            "bool_",
+        }
+        extended_names = {"longdouble", "longfloat", "float96", "float128"}
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "np"
+            and func.attr in scalar_names | extended_names
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return node
+        argument = ast.literal_eval(node.args[0])
+        if isinstance(argument, str) and func.attr in extended_names:
+            decimal = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+            if re.fullmatch(decimal, argument) is None:
+                raise ValueError("not a decimal number")
+            argument = float(argument)
+        if type(argument) not in (int, float, bool) or isinstance(argument, float) and not np.isfinite(argument):
+            raise ValueError("not a finite scalar literal")
+        return ast.Constant(argument)
+
+
+def _literal_annotation(value: str, key: str, tensor_name: str) -> Any:
+    """Read literal layouts and sparsity annotations without running model code.
+    Sparsity annotations hold indices and counts. NumPy integer, float and bool
+    scalar representations from upstream writers read as plain Python numbers;
+    extended floats also admit a decimal string, but never inf or nan.
+    """
+    try:
+        tree = ast.parse(value.lstrip(" \t"), mode="eval")
+        return ast.literal_eval(_AnnotationScalars().visit(tree))
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as e:
+        raise ValueError(f"{key} annotation of tensor {tensor_name} is not a Python literal: {value!r}") from e
+
+
+def _plain_annotation_numbers(value: Any) -> Any:
+    """Normalize NumPy indices and counts before writing a literal annotation."""
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, dict):
+        return {_plain_annotation_numbers(k): _plain_annotation_numbers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain_annotation_numbers(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_plain_annotation_numbers(v) for v in value)
+    if isinstance(value, set):
+        return {_plain_annotation_numbers(v) for v in value}
+    return value
 
 
 class _SharedParent:
@@ -999,7 +1097,7 @@ class ModelWrapper:
                 ret.quant_parameter_tensor_names, "tensor_layout", "key"
             )
             if ret is not None:
-                return eval(ret.value)
+                return _literal_annotation(ret.value, "tensor_layout", tensor_name)
         return None
 
     def set_tensor_layout(self, tensor_name: str, data_layout: list[str]) -> None:
@@ -1018,13 +1116,14 @@ class ModelWrapper:
                 ret.quant_parameter_tensor_names, "tensor_sparsity", "key"
             )
             if ret is not None:
-                return eval(ret.value)
+                return _literal_annotation(ret.value, "tensor_sparsity", tensor_name)
         return None
 
     def set_tensor_sparsity(
         self, tensor_name: str, sparsity_dict: dict[str, Any]
     ) -> None:
-        """Sets the sparsity annotation of a tensor with given name."""
+        """Sets a tensor's sparsity indices and counts as plain Python literals."""
+        sparsity_dict = _plain_annotation_numbers(sparsity_dict)
         graph = self._model_proto.graph
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
