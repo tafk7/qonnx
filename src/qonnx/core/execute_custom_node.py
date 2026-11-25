@@ -71,5 +71,8 @@ def execute_custom_node(
             inst = _custom_op_for(model, node)
         inst.execute_node(context, graph)
     except KeyError:
+        if registry.retired(node.domain, op_type) is not None:
+            # a name the domain's provider retired: its refusal, with the reason
+            raise
         # exception if op_type is not supported
         raise Exception("Custom op_type %s is currently not supported." % op_type)

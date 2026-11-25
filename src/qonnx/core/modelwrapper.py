@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 import qonnx.util.basic as util
 import qonnx.util.onnx as onnxutil
 from qonnx.core.datatype import BaseDataType, DataType
-from qonnx.custom_op.registry import getCustomOp, is_custom_op
+from qonnx.custom_op.registry import RENAMED, getCustomOp, is_custom_op
 from qonnx.transformation.double_to_single_float import DoubleToSingleFloat
 from qonnx.transformation.general import (
     GiveUniqueParameterTensors,
@@ -233,21 +233,18 @@ class ModelWrapper:
         self.fix_float64 = fix_float64
 
     def temporary_fix_oldstyle_domain(self) -> None:
+        """Rename the old-style domains of the graph's top-level nodes by qonnx's
+        table of them (qonnx.custom_op.registry.RENAMED), warning once where the
+        graph holds any, and for each node whose domain cannot be renamed."""
         found_oldstyle = False
         for n in self.graph.node:
-            if n.domain == "finn":
-                n_backend = util.get_by_name(n.attribute, "backend")
-                if n_backend is not None:
-                    backend_value = n_backend.s.decode("UTF-8")
-                    if backend_value == "fpgadataflow":
-                        n.domain = "finn.custom_op.fpgadataflow"
-                    else:
-                        warnings.warn("Can't fix domain for node " + str(n))
+            rename = RENAMED.get(n.domain)
+            if rename is not None:
+                new_domain = rename(n)
+                if new_domain is not None:
+                    n.domain = new_domain
                 else:
-                    n.domain = "qonnx.custom_op.general"
-                found_oldstyle = True
-            elif n.domain == "finn.custom_op.general":
-                n.domain = "qonnx.custom_op.general"
+                    warnings.warn("Can't fix domain for node " + str(n))
                 found_oldstyle = True
         if found_oldstyle:
             warnings.warn(

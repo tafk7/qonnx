@@ -29,8 +29,10 @@
 import importlib
 import inspect
 import warnings
+from importlib.metadata import EntryPoint, entry_points
 from threading import RLock
-from typing import Dict, List, Optional, Tuple, Type
+from types import MappingProxyType
+from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple, Type
 from onnx import NodeProto
 from qonnx.custom_op.base import CustomOp
 
@@ -67,6 +69,198 @@ def resolve_domain(domain: str) -> str:
         Resolved module path
     """
     return _DOMAIN_ALIASES.get(domain, domain)
+
+
+#: The entry-point group of custom op domain providers. An entry is named for the
+#: domain it provides; its object is called with that domain's Registration, once,
+#: on the domain's first lookup.
+PROVIDERS = "qonnx.custom_op.domains"
+
+# The domains whose providers have loaded, and what they declared beyond their ops
+_PROVIDED: Set[str] = set()
+_DECLARED: Dict[str, int] = {}
+_RETIRED: Dict[Tuple[str, Optional[str]], str] = {}
+# The op types each domain's providers declared: listed from their bound versions alone
+_PROVIDER_OPS: Dict[str, Set[str]] = {}
+# The domains whose providers are loading (on the thread holding the lock), each
+# with the declarations staged so far
+_LOADING: Dict[str, "Registration"] = {}
+# The add_op_to_domain registrations made for a domain while its providers loaded,
+# in order: held, invisible, until a load of the domain succeeds, this one or a
+# later one (a module that made one is imported once)
+_HELD: Dict[str, List[Tuple[str, int, Type[CustomOp]]]] = {}
+
+
+def _oldstyle_finn(node: NodeProto) -> Optional[str]:
+    """The domain an old-style ``finn`` node is renamed to, by its backend
+    attribute; None for a backend that has no new-style domain."""
+    backend = next((a for a in node.attribute if a.name == "backend"), None)
+    if backend is None:
+        return "qonnx.custom_op.general"
+    if backend.s.decode("UTF-8") == "fpgadataflow":
+        return "finn.custom_op.fpgadataflow"
+    return None
+
+
+#: qonnx's own old-style domain names, which ModelWrapper renames when it loads a
+#: model (ModelWrapper.temporary_fix_oldstyle_domain): each maps to the rule giving a
+#: node's new domain, or None where the node cannot be renamed. A provider cannot
+#: retire these names.
+RENAMED: Mapping[str, Callable[[NodeProto], Optional[str]]] = MappingProxyType(
+    {
+        "finn": _oldstyle_finn,
+        "finn.custom_op.general": lambda node: "qonnx.custom_op.general",
+    }
+)
+
+
+class Registration:
+    """What the providers of one domain declare: its ops, its opset version and its
+    retired names.
+
+    A provider is an entry point of the group ``qonnx.custom_op.domains`` (PROVIDERS)
+    named for the domain, whose object is a callable taking a Registration. In a
+    package's pyproject.toml::
+
+        [project.entry-points."qonnx.custom_op.domains"]
+        "my.domain" = "my_package.ops:provide"
+
+    The registry calls each provider of a domain once, on the domain's first lookup,
+    in a fixed order. Their declarations take effect together once all of them have
+    returned; a provider that raises leaves none of them, and the next lookup of the
+    domain calls the providers again. An add_op_to_domain for the domain made while
+    they run (by a provider, or by a module it imports) is held with the load: it
+    takes effect, as a run-time registration winning its version, once a load of the
+    domain succeeds, this one or a later one. A provider looking up its own domain is
+    a RuntimeError. Contradicting declarations are refused with ValueError."""
+
+    def __init__(self, domain: str) -> None:
+        self.domain = domain
+        self._version: Optional[int] = None
+        self._ops: Dict[str, Dict[int, Type[CustomOp]]] = {}
+        self._retired: Dict[Optional[str], str] = {}
+
+    def version(self, version: int) -> None:
+        """The domain's opset version: what a model using its newest ops imports it
+        at (get_domain_opset_version). ValueError if it is not a positive integer, or
+        if another provider stated a different one."""
+        if type(version) is not int or version < 1:
+            raise ValueError(f"{self.domain}: the opset version must be a positive integer, not {version!r}")
+        if self._version is not None and self._version != version:
+            raise ValueError(f"{self.domain}: its providers state the opset versions {self._version} and {version}")
+        self._version = version
+
+    def op(self, op_class: Type[CustomOp], op_type: Optional[str] = None, op_version: Optional[int] = None) -> None:
+        """An op of the domain: op_class, registered under op_type and op_version
+        where given, else under what the class states in its own body or its name
+        gives (op_identity). ValueError for a class that is not a CustomOp, a
+        malformed identity, or a different class declared for the same op type and
+        version; declaring the same class again changes nothing."""
+        if not (inspect.isclass(op_class) and issubclass(op_class, CustomOp)):
+            raise ValueError(f"{self.domain}: {op_class!r} must be a subclass of CustomOp")
+        op_type, op_version = op_identity(op_class, op_type, op_version)
+        versions = self._ops.setdefault(op_type, {})
+        declared = versions.get(op_version)
+        if declared is not None and declared is not op_class:
+            raise ValueError(
+                f"{self.domain}.{op_type} version {op_version} is declared as both "
+                f"{declared.__name__} and {op_class.__name__}"
+            )
+        versions[op_version] = op_class
+
+    def retire(self, reason: str, op_type: Optional[str] = None) -> None:
+        """A stored name no longer read: the whole domain (op_type None) or one op
+        type of it. A lookup of it raises KeyError with ``reason``, which should say
+        what to do instead; loading a model holding it refuses nothing (see
+        retired). ValueError for a name qonnx renames when it loads a model (RENAMED),
+        or a second, different reason for the same name."""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(f"{self.domain}: a retirement's reason must be a nonempty string, not {reason!r}")
+        if op_type is not None:
+            _checked_op_type(op_type)
+        if self.domain in RENAMED:
+            raise ValueError(f"{self.domain} is renamed when a model is loaded, so it cannot be retired")
+        stated = self._retired.get(op_type)
+        if stated is not None and stated != reason:
+            name = self.domain if op_type is None else f"{self.domain}.{op_type}"
+            raise ValueError(f"{name} is retired for two reasons: {stated!r} and {reason!r}")
+        self._retired[op_type] = reason
+
+
+def _entry_order(entry: EntryPoint) -> Tuple[str, str]:
+    dist = getattr(entry, "dist", None)
+    return (dist.name if dist is not None else "", entry.value)
+
+
+def _commit(staged: Registration) -> None:
+    """Every declaration staged for a domain, and every registration held for it,
+    at once. A run-time registration, already there or held, wins its version."""
+    domain = staged.domain
+    for op_type, versions in staged._ops.items():
+        bound = _OP_REGISTRY.setdefault(domain, {}).setdefault(op_type, {})
+        for version, op_class in versions.items():
+            bound.setdefault(version, op_class)
+    for op_type, version, op_class in _HELD.pop(domain, []):
+        _OP_REGISTRY.setdefault(domain, {}).setdefault(op_type, {})[version] = op_class
+    _PROVIDER_OPS[domain] = set(staged._ops)
+    if staged._version is not None:
+        _DECLARED[domain] = staged._version
+    for retired_type, reason in staged._retired.items():
+        _RETIRED[(domain, retired_type)] = reason
+
+
+def _provide(domain: str) -> None:
+    """Load the domain's providers on its first lookup. A provider's failure
+    propagates as itself: nothing it or another provider of the domain declared is
+    kept, and the domain is not marked, so the next lookup loads them again. The
+    registrations held for the domain stay held for that load."""
+    if domain in ("", "ai.onnx"):
+        return
+    with _REGISTRY_LOCK:
+        if domain in _PROVIDED:
+            return
+        if domain in _LOADING:
+            raise RuntimeError(f"a provider of {domain} looked up {domain} while loading")
+        staged = Registration(domain)
+        _LOADING[domain] = staged
+        try:
+            for entry in sorted(entry_points(group=PROVIDERS, name=domain), key=_entry_order):
+                entry.load()(staged)
+            _commit(staged)
+            _PROVIDED.add(domain)
+        finally:
+            del _LOADING[domain]
+
+
+def _retirement(domain: str, op_type: Optional[str]) -> Optional[str]:
+    """The reason a provider retired the name, the op type's before the domain's."""
+    if op_type is not None and (domain, op_type) in _RETIRED:
+        return _RETIRED[(domain, op_type)]
+    return _RETIRED.get((domain, None))
+
+
+def _refuse_retired(label: Optional[str], domain: str, op_type: Optional[str]) -> None:
+    """KeyError where a provider retired the name, with its reason."""
+    reason = _retirement(domain, op_type)
+    if reason is not None:
+        name = domain if op_type is None else f"{domain}.{op_type}"
+        prefix = f"{label}: " if label else ""
+        raise KeyError(f"{prefix}stored identity {name} is retired; {reason}")
+
+
+def retired(domain: str, op_type: Optional[str] = None) -> Optional[str]:
+    """Why a provider of ``domain`` retired a stored name: the reason given for
+    ``domain.op_type``, else the one for the whole domain; None if neither is
+    retired. The domain's providers load first.
+
+    Loading a model refuses nothing, and a lookup of a retired name raises KeyError.
+    An application that refuses a model holding one when it opens it reads this,
+    over every node of the model."""
+    if not domain:
+        return None
+    with _REGISTRY_LOCK:
+        _provide(domain)
+        return _retirement(domain, op_type)
 
 
 def _get_op_type_for_class(cls: Type[CustomOp]) -> str:
@@ -355,7 +549,8 @@ def add_op_to_domain(
 
     A registered op type is served from the registry: the domain's module is not
     imported for it. A later registration of the same op type and version replaces
-    the earlier one; its other versions stay.
+    the earlier one; its other versions stay. While the domain's providers load
+    (Registration), the registration is held until a load of the domain succeeds.
 
     Args:
         domain: ONNX domain name (e.g., "qonnx.custom_op.general")
@@ -380,6 +575,15 @@ def add_op_to_domain(
     op_version = _get_op_version_for_class(op_class) if op_version is None else _checked_op_version(op_version)
 
     with _REGISTRY_LOCK:
+        if domain in _LOADING:
+            # the domain's providers are loading, on this thread: held with the load
+            _HELD.setdefault(domain, []).append((op_type, op_version, op_class))
+            return
+        held = _HELD.get(domain)
+        if held:
+            # this later registration replaces a held one for its version
+            held[:] = [entry for entry in held if entry[:2] != (op_type, op_version)]
+
         # Ensure nested dict structure exists
         if domain not in _OP_REGISTRY:
             _OP_REGISTRY[domain] = {}
@@ -393,7 +597,10 @@ def getCustomOp(node: NodeProto, onnx_opset_version: int | None = None) -> Custo
     """Get a custom op instance for an ONNX node.
 
     Uses "since version" semantics: selects highest version <= requested opset.
-    Lazy loads only the requested op_type using __all__ for efficiency.
+    The domain's providers (Registration) load first; a name they retire is
+    refused. An op type registered or declared by a provider is served from the
+    registry; any other is looked up in the domain's module, lazily, using __all__
+    for efficiency.
 
     Args:
         node: ONNX node with domain and op_type attributes
@@ -403,12 +610,15 @@ def getCustomOp(node: NodeProto, onnx_opset_version: int | None = None) -> Custo
         CustomOp instance for the node
 
     Raises:
-        KeyError: If op_type not found in domain or no suitable version available
+        KeyError: If op_type not found in domain, no suitable version available, or
+            the name retired by the domain's provider
     """
     op_type = node.op_type
     domain = node.domain
 
     with _REGISTRY_LOCK:
+        _provide(domain)
+        _refuse_retired(node.name or op_type, domain, op_type)
         # O(1) nested dict lookup to check cache
         if domain in _OP_REGISTRY and op_type in _OP_REGISTRY[domain]:
             cached_versions = _OP_REGISTRY[domain][op_type]
@@ -448,9 +658,11 @@ def get_supported_versions(domain: str, op_type: str) -> List[int]:
         Sorted list of opset versions
 
     Raises:
-        KeyError: If op not found
+        KeyError: If op not found, or its name retired by the domain's provider
     """
     with _REGISTRY_LOCK:
+        _provide(domain)
+        _refuse_retired(op_type, domain, op_type)
         # O(1) check if cached
         if domain in _OP_REGISTRY and op_type in _OP_REGISTRY[domain]:
             return sorted(_OP_REGISTRY[domain][op_type].keys())
@@ -478,16 +690,21 @@ def is_custom_op(domain: str, op_type: Optional[str] = None) -> bool:
 
     Returns:
         True if the specific op exists (when op_type given) or
-        if any ops exist for the domain (when op_type=None), False otherwise
+        if any ops exist for the domain (when op_type=None), False otherwise.
+        A name a provider retired, and a domain its providers declare anything
+        of, count as existing, so that a lookup reaches the refusal.
     """
     # Empty domain means standard ONNX op
     if not domain:
         return False
 
     with _REGISTRY_LOCK:
+        _provide(domain)
         if op_type is not None:
             # Check for specific op - O(1) with nested dict
             if domain in _OP_REGISTRY and op_type in _OP_REGISTRY[domain]:
+                return True
+            if _retirement(domain, op_type) is not None:
                 return True
             # Try to discover
             versions = _discover_custom_op_versions(domain, op_type)
@@ -495,6 +712,8 @@ def is_custom_op(domain: str, op_type: Optional[str] = None) -> bool:
         else:
             # Check if domain has any registered ops
             if domain in _OP_REGISTRY and _OP_REGISTRY[domain]:
+                return True
+            if domain in _DECLARED or any(d == domain for d, _ in _RETIRED):
                 return True
             # Try to import the domain module as fallback
             module_path = resolve_domain(domain)
@@ -544,10 +763,12 @@ def get_domain_opset_version(domain: str) -> int:
     """The opset version of a custom op domain: the version a model using the
     domain's newest ops imports it at.
 
-    A domain module may state it (``opset_version = N``). Otherwise it is the
-    highest since-version among the ops registered to the domain and those its
-    module exports. The module's exports are all read, as get_ops_in_domain reads
-    them.
+    The domain's providers may declare it (Registration.version), and its module
+    is then not imported. Otherwise a domain module may state it
+    (``opset_version = N``). Otherwise it is the highest since-version among the
+    ops registered to the domain and those its module exports, but for the op types
+    its providers declare. The module's exports are all read, as get_ops_in_domain
+    reads them.
 
     Args:
         domain: ONNX domain name
@@ -556,12 +777,23 @@ def get_domain_opset_version(domain: str) -> int:
         The domain's opset version
 
     Raises:
-        KeyError: If the domain has no module and no registered op
-        ValueError: If a stated opset_version is not an integer or is below an op's
-            since-version
+        KeyError: If the domain has no module and no registered op, or its provider
+            retired it
+        ValueError: If a declared or stated opset version is not an integer or is
+            below an op's since-version
     """
     with _REGISTRY_LOCK:
+        _provide(domain)
+        _refuse_retired(None, domain, None)
         versions = [max(found) for found in _OP_REGISTRY.get(domain, {}).values() if found]
+        if domain in _DECLARED:
+            declared = _DECLARED[domain]
+            if declared < max(versions, default=1):
+                raise ValueError(
+                    f"{domain}: its declared opset version {declared} is below its ops' highest "
+                    f"since-version {max(versions)}"
+                )
+            return declared
         try:
             module = importlib.import_module(resolve_domain(domain))
         except ModuleNotFoundError:
@@ -570,7 +802,9 @@ def get_domain_opset_version(domain: str) -> int:
             raise KeyError(f"Domain '{domain}' has no module and no registered op")
         stated = getattr(module, "opset_version", None)
         if module is not None:
-            versions += [version for _, version in _exported_versions(module)]
+            # an op type a provider declared is not read from the module
+            declared_ops = _PROVIDER_OPS.get(domain, set())
+            versions += [version for op_type, version in _exported_versions(module) if op_type not in declared_ops]
         highest = max(versions, default=1)
         if stated is None:
             return highest
@@ -585,7 +819,10 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
     """Get all CustomOp classes available in a domain.
 
     Note: Returns unique op_types. If multiple versions exist, returns the highest version.
-    This function eagerly loads all ops in the domain.
+    This function eagerly loads all ops in the domain. The domain's providers load
+    first; an op type they retire is left out, and a domain they retire is a
+    KeyError. An op type they declare is listed as lookup serves it: the class at
+    its highest bound version, which the module's exports never replace.
 
     Args:
         domain: ONNX domain name (e.g., "qonnx.custom_op.general")
@@ -607,6 +844,10 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
     listed_versions: Dict[str, int] = {}
 
     with _REGISTRY_LOCK:
+        _provide(domain)
+        _refuse_retired(None, domain, None)
+        # An op type the providers declared is listed from its bound versions alone
+        declared_ops = _PROVIDER_OPS.get(domain, set())
         # Strategy 1: Get cached ops (fast path) - use highest version
         if domain in _OP_REGISTRY:
             for op_type, versions in _OP_REGISTRY[domain].items():
@@ -632,6 +873,8 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
                     continue
 
                 op_type = _get_op_type_for_class(obj)
+                if op_type in declared_ops:
+                    continue
                 try:
                     version = _get_op_version_for_class(obj)
                 except ValueError:
@@ -651,4 +894,5 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
         except ModuleNotFoundError:
             pass  # Domain doesn't exist as module, return cached ops only
 
-    return list(ops_dict.items())
+        # A name a provider retired is not an op of the domain
+        return [(op_type, cls) for op_type, cls in ops_dict.items() if (domain, op_type) not in _RETIRED]

@@ -45,6 +45,13 @@ Custom Operations/Nodes
 
 QONNX uses many custom operations (op_type in ONNX NodeProto) that are not defined in the ONNX operator schema. These custom nodes are marked with domain="qonnx.*" in the protobuf to identify them as such. These nodes can represent specific operations that we need for low-bit networks, or operations that are specific to a particular hardware backend. To get more familiar with custom operations and how they are created, please take a look in the Jupyter notebook about CustomOps (see chapter :ref:`tutorials` for details) or directly in the module :py:mod:`qonnx.custom_op`.
 
+A custom op domain is looked up as a Python module of the same name (``qonnx.custom_op.general``, with ``onnx.brevitas`` as an alias of it). A package may instead provide a domain through the entry-point group ``qonnx.custom_op.domains``: each entry is named for the domain and names a function that is called once, on the domain's first lookup, with a :py:class:`qonnx.custom_op.registry.Registration`. The function declares the domain's ops (``registration.op(MyOp)``), its opset version (``registration.version(2)``) and the stored names it no longer reads (``registration.retire("rebuild the model with MyOp", op_type="OldOp")``). An op it declares is served without importing a module of the domain's name; a retired name raises ``KeyError`` with its reason when it is looked up, and loading a model that holds it refuses nothing (:py:func:`qonnx.custom_op.registry.retired` answers the reason for a model's nodes).
+
+::
+
+  [project.entry-points."qonnx.custom_op.domains"]
+  "my.domain" = "my_package.ops:provide"
+
 
 Custom ONNX Execution Flow
 ==========================

@@ -30,7 +30,7 @@ import onnx.shape_inference as si
 from onnx import NodeProto
 
 from qonnx.core.modelwrapper import ModelWrapper, _custom_op_for
-from qonnx.custom_op.registry import is_custom_op
+from qonnx.custom_op.registry import is_custom_op, retired
 from qonnx.transformation.base import Transformation
 
 
@@ -45,6 +45,9 @@ def _make_shape_compatible_op(node: NodeProto, model: ModelWrapper) -> NodeProto
         inst = _custom_op_for(model, node)
         return inst.make_shape_compatible_op(model)
     except KeyError:
+        if retired(node.domain, op_type) is not None:
+            # a name the domain's provider retired: its refusal, with the reason
+            raise
         # exception if op_type is not supported
         raise Exception("Custom op_type %s is currently not supported." % op_type)
 
