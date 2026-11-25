@@ -78,6 +78,35 @@ NaN. No other datatype contains an infinity or NaN. A negative zero is the value
 datatype without exact bounds (a scaled integer, a nonsense width, a datatype past the
 envelope) contains nothing. ``allowed`` keeps its own answers, which differ from these for
 the float datatypes and for bools.
+
+Codes and values
+----------------
+``codes(values)`` gives each value as the ``bitwidth()``-wide pattern the hardware carries,
+as ``uint64``; ``values(codes)`` gives each code's value back. Both are exact:
+``codes`` raises ``ValueError`` for a value the datatype does not contain, and ``values``
+for a code wider than the datatype or one no value has (TERNARY's 2);
+``values(codes(v))`` equals ``v`` for every member ``v``. An integer's code is its two's
+complement in ``bitwidth()`` bits; BINARY's is its value; BIPOLAR's -1 and +1 are 0 and
+1; TERNARY's values are two's complement in two bits; a fixed point's code is its value
+times ``2**(w - i)`` in two's complement; an IEEE float's is its bit pattern, a negative
+zero's sign included. An IEEE float value given in its own container is coded by its bits
+as they are, a NaN's payload included; one given in another type is converted first,
+exactly for every value but a NaN, which becomes a NaN of its sign. Codes exist for
+integer, bipolar, ternary and fixed-point datatypes of at most 64 bits and for FLOAT16 and
+FLOAT32; elsewhere both methods raise ``ValueError``.
+
+Containers
+----------
+``container()`` is the numpy type ``codes`` takes values in and ``values`` returns them in,
+exact for every value; ``ValueError`` where there is none. An integer's is the smallest
+numpy integer type of at most 64 bits that holds it; BIPOLAR's and TERNARY's ``int8``;
+FLOAT16's and FLOAT32's their own; a FLOAT<e,m,b>'s ``float32`` where float32 holds every
+value. A FIXED<w,i> of at most 54 bits is ``float64``, exact because its codes fit
+float64's significand and its scale fits float64's exponents. A wider one, to 64 bits, is
+carried as its codes (``carried_as_codes()``): ``int64`` holding the value times
+``2**(w - i)``, given to ``codes`` and returned by ``values`` alike. ``to_numpy_dt()``
+keeps its answers (``float32`` for every fixed point); ``FIXED<32,16>.values(16777217)``
+is ``256.0000152587890625``, where float32 holds only ``256.0``.
 """
 
 import math
@@ -414,6 +443,98 @@ def _float_integers(datatype: "BaseDataType", values: np.ndarray) -> np.ndarray:
         return datatype._floats(values.astype(np.float64))
 
 
+def _as_array(values: object) -> np.ndarray:
+    """``values`` as an array: an array as it is, a numpy scalar as a 0-d array of its
+    type, anything else as a 0-d object array holding it."""
+    if isinstance(values, np.ndarray):
+        return values
+    if isinstance(values, np.generic):
+        return np.asarray(values)
+    found = np.empty((), dtype=object)
+    found[()] = values
+    return found
+
+
+def _code_array(codes: object) -> np.ndarray:
+    """Codes as uint64: integers from 0 below 2**64, of any integer type; ValueError for
+    anything else."""
+    array = _as_array(codes)
+    if array.dtype.kind == "u":
+        return array.astype(np.uint64)
+    if array.dtype.kind == "i":
+        if (array < 0).any():
+            raise ValueError("a code is not negative")
+        return array.astype(np.uint64)
+    if array.dtype.kind == "O":
+        found = np.empty(array.shape, dtype=np.uint64)
+        for index, code in np.ndenumerate(array):
+            value = _exact(code)
+            if not isinstance(value, int) or isinstance(code, (float, np.floating, Fraction)):
+                raise ValueError(f"a code is an integer, not {code!r}")
+            if not 0 <= value < 1 << 64:
+                raise ValueError(f"{code} is no 64-bit code")
+            found[index] = value
+        return found
+    raise ValueError(f"codes are integers, not {array.dtype}")
+
+
+def _signed_codes(codes: np.ndarray, bits: int) -> np.ndarray:
+    """``bits``-wide codes read as two's complement, as int64."""
+    if bits == 64:
+        return codes.view(np.int64)
+    values = codes.astype(np.int64)
+    return values - ((values >> (bits - 1)) << bits)
+
+
+def _from_ints(values: np.ndarray, code: Callable[[Union[int, Fraction]], int]) -> np.ndarray:
+    """The codes of an array of members given as objects, one at a time."""
+    found = np.empty(values.shape, dtype=np.uint64)
+    for index, value in np.ndenumerate(values):
+        found[index] = code(_exact(value))
+    return found
+
+
+def _integer_codes(values: np.ndarray, bits: int, signed: bool) -> np.ndarray:
+    """The two's complement codes, ``bits`` wide, of an array of integer members."""
+    mask = (1 << bits) - 1
+    kind = values.dtype.kind
+    if kind == "u":
+        return values.astype(np.uint64) & np.uint64(mask)
+    if kind == "i" or (kind == "f" and values.dtype.itemsize <= 8 and signed):
+        return values.astype(np.int64).view(np.uint64) & np.uint64(mask)
+    if kind == "f" and values.dtype.itemsize <= 8:
+        return values.astype(np.uint64)
+    return _from_ints(values, lambda value: int(value) & mask)
+
+
+def _ieee_codes(container: np.dtype, values: np.ndarray) -> np.ndarray:
+    """An IEEE float's codes: a value given in the container by its bits, a NaN's payload
+    and a zero's sign included; one given otherwise converted, exactly for a member, a NaN
+    to a NaN of its sign."""
+    pattern = np.uint16 if container == np.float16 else np.uint32
+    if values.dtype == container:
+        return values.view(pattern).astype(np.uint64)
+    if values.dtype.kind in "iuf" and values.dtype.itemsize <= 8:
+        with np.errstate(invalid="ignore"):
+            converted = values.astype(np.float64).astype(container)
+        return converted.view(pattern).astype(np.uint64)
+    found = np.empty(values.shape, dtype=np.uint64)
+    for index, value in np.ndenumerate(values):
+        if isinstance(value, np.floating) and value.dtype == container:
+            found[index] = int(np.asarray(value).view(pattern))
+            continue
+        number = float(value) if isinstance(value, (float, np.floating)) else float(_exact(value))
+        with np.errstate(invalid="ignore"):
+            found[index] = int(np.asarray(number).astype(container).view(pattern))
+    return found
+
+
+def _ieee_values(container: np.dtype, codes: np.ndarray) -> np.ndarray:
+    """An IEEE float's values of its bit patterns."""
+    pattern = np.uint16 if container == np.float16 else np.uint32
+    return codes.astype(pattern).view(container)
+
+
 class BaseDataType(ABC):
     "Base class for QONNX data types."
 
@@ -479,6 +600,56 @@ class BaseDataType(ABC):
         if isinstance(values, np.ndarray):
             return np.asarray(self._contains_array(values), dtype=np.bool_).reshape(values.shape)
         return bool(self._holds(_exact(values)))
+
+    def codes(self, values: object) -> np.ndarray:
+        """Returns each value as the bitwidth()-wide pattern the hardware carries, as uint64
+        (see the module's docstring). Raises ValueError for a value this datatype does not
+        contain, and for a datatype that has no codes."""
+        self._require_codes()
+        array = _as_array(values)
+        members = self._container_members(array)
+        if not members.all():
+            bad = array.flat[int(np.flatnonzero(~members.reshape(-1))[0])]
+            raise ValueError(f"{bad!r} is not a {self} value")
+        return self._encode(array)
+
+    def values(self, codes: object) -> np.ndarray:
+        """Returns each bitwidth()-wide code's value, in container(). Raises ValueError for
+        a code wider than bitwidth() or one no value has, and for a datatype that has no
+        codes."""
+        self._require_codes()
+        raw = _code_array(codes)
+        bits = int(self.bitwidth())
+        if bits < 64 and (raw >> np.uint64(bits)).any():
+            raise ValueError(f"a code wider than {self}'s {bits} bits")
+        return self._decode(raw)
+
+    def container(self) -> np.dtype:
+        """Returns the numpy type codes() takes values in and values() returns them in,
+        exact for every value. Raises ValueError where there is none. to_numpy_dt() keeps
+        its answers."""
+        raise ValueError(f"{self} has no exact numpy container")
+
+    def carried_as_codes(self) -> bool:
+        """Returns whether container() holds this datatype's codes, not its values (a
+        FIXED wider than 54 bits): codes() takes and values() gives its values so."""
+        return False
+
+    def _require_codes(self) -> None:
+        """Raises ValueError for a datatype that has no codes."""
+        raise ValueError(f"{self} has no codes")
+
+    def _container_members(self, values: np.ndarray) -> np.ndarray:
+        """Whether each element is a value codes() takes."""
+        return np.asarray(self.contains(values))
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        """The codes of an array of members."""
+        raise NotImplementedError
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        """The values of an array of uint64 codes, each at most bitwidth() bits wide."""
+        raise NotImplementedError
 
     # Exact membership: the private tests allowed() runs on. A family defines _holds, and
     # may define _integers and _floats to decide whole arrays without leaving numpy.
@@ -588,6 +759,18 @@ class FloatType(BaseDataType):
         values = values.astype(np.float64, copy=False)
         return ~np.isfinite(values) | _representable(BINARY32, values)
 
+    def container(self) -> np.dtype:
+        return np.dtype(np.float32)
+
+    def _require_codes(self) -> None:
+        pass
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        return _ieee_codes(self.container(), values)
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        return _ieee_values(self.container(), codes)
+
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         if isinstance(value, np.ndarray):
             return np.ones(value.shape, dtype=bool)
@@ -693,6 +876,12 @@ class ArbPrecFloatType(BaseDataType):
     def _floats(self, values: np.ndarray) -> np.ndarray:
         return _representable(self._format(), values.astype(np.float64, copy=False))
 
+    def container(self) -> np.dtype:
+        fmt = self._format()
+        if fmt.mantissa <= 23 and fmt.emax <= 127 and fmt.emin - fmt.mantissa >= -149:
+            return np.dtype(np.float32)
+        raise ValueError(f"{self} has no exact numpy container: float32 does not hold every value")
+
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         # fp32 format parameters
         fp32_exponent_bias = 127
@@ -769,6 +958,18 @@ class Float16Type(BaseDataType):
     def _floats(self, values: np.ndarray) -> np.ndarray:
         values = values.astype(np.float64, copy=False)
         return ~np.isfinite(values) | _representable(BINARY16, values)
+
+    def container(self) -> np.dtype:
+        return np.dtype(np.float16)
+
+    def _require_codes(self) -> None:
+        pass
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        return _ieee_codes(self.container(), values)
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        return _ieee_values(self.container(), codes)
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         if isinstance(value, np.ndarray):
@@ -853,6 +1054,25 @@ class IntType(BaseDataType):
         low, high = values.dtype.type(float(least)), values.dtype.type(float(greatest))
         return (np.rint(values) == values) & (values >= low) & (values <= high)
 
+    def container(self) -> np.dtype:
+        bits = _valued_width(self, self.bitwidth())
+        for width in (8, 16, 32, 64):
+            if bits <= width:
+                return np.dtype(f"{'i' if self._signed else 'u'}{width // 8}")
+        raise ValueError(f"{self} has no exact numpy container: wider than 64 bits")
+
+    def _require_codes(self) -> None:
+        if _valued_width(self, self.bitwidth()) > 64:
+            raise ValueError(f"{self} has no codes: wider than 64 bits")
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        return _integer_codes(values, int(self.bitwidth()), self._signed)
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        if self._signed:
+            return _signed_codes(codes, int(self.bitwidth())).astype(self.container())
+        return codes.astype(self.container())
+
     def get_num_possible_values(self) -> int:
         return int(abs(self.min()) + abs(self.max()) + 1)
 
@@ -915,6 +1135,20 @@ class BipolarType(BaseDataType):
     def _floats(self, values: np.ndarray) -> np.ndarray:
         return (values == -1.0) | (values == 1.0)
 
+    def container(self) -> np.dtype:
+        return np.dtype(np.int8)
+
+    def _require_codes(self) -> None:
+        pass
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        if values.dtype.kind in "iuf":
+            return (values > 0).astype(np.uint64)
+        return _from_ints(values, lambda value: int(value > 0))
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        return np.where(codes == 1, 1, -1).astype(np.int8)
+
     def get_num_possible_values(self) -> int:
         return 2
 
@@ -960,6 +1194,20 @@ class TernaryType(BaseDataType):
 
     def _floats(self, values: np.ndarray) -> np.ndarray:
         return (values == -1.0) | (values == 0.0) | (values == 1.0)
+
+    def container(self) -> np.dtype:
+        return np.dtype(np.int8)
+
+    def _require_codes(self) -> None:
+        pass
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        return _integer_codes(values, 2, True)
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        if (codes == 2).any():
+            raise ValueError("code 2 is no TERNARY value")
+        return _signed_codes(codes, 2).astype(np.int8)
 
     def get_num_possible_values(self) -> int:
         return 3
@@ -1074,6 +1322,56 @@ class FixedPointType(IntType):
             found &= (codes != 0) | (values == 0)
         return found
 
+    def carried_as_codes(self) -> bool:
+        return self.bitwidth() > 54
+
+    def container(self) -> np.dtype:
+        self.bounds()
+        if self.bitwidth() <= 54:
+            return np.dtype(np.float64)
+        if self.bitwidth() <= 64:
+            return np.dtype(np.int64)
+        raise ValueError(f"{self} has no exact numpy container: wider than 64 bits")
+
+    def _require_codes(self) -> None:
+        self.bounds()
+        if self.bitwidth() > 64:
+            raise ValueError(f"{self} has no codes: wider than 64 bits")
+
+    def _container_members(self, values: np.ndarray) -> np.ndarray:
+        if not self.carried_as_codes():
+            return super()._container_members(values)
+        top = 1 << (int(self.bitwidth()) - 1)
+        least, greatest = -top, top - 1
+        if values.dtype.kind in "iu":
+            return _between(values, least, greatest)
+        return _each(
+            values,
+            lambda value: (
+                isinstance(value, (int, np.integer))
+                and not isinstance(value, (bool, np.bool_))
+                and least <= int(value) <= greatest
+            ),
+        )
+
+    def _encode(self, values: np.ndarray) -> np.ndarray:
+        bits, fraction = int(self.bitwidth()), self._fraction()
+        mask = (1 << bits) - 1
+        if self.carried_as_codes():
+            if values.dtype.kind in "iu":
+                return values.astype(np.int64).view(np.uint64) & np.uint64(mask)
+            return _from_ints(values, lambda value: int(value) & mask)
+        if values.dtype.kind == "f" and values.dtype.itemsize <= 8:
+            scaled = np.ldexp(values.astype(np.float64), fraction)
+            return scaled.astype(np.int64).view(np.uint64) & np.uint64(mask)
+        return _from_ints(values, lambda value: int(Fraction(value) * (1 << fraction)) & mask)
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        signed = _signed_codes(codes, int(self.bitwidth()))
+        if self.carried_as_codes():
+            return signed
+        return np.ldexp(signed.astype(np.float64), -self._fraction())
+
     def is_integer(self) -> bool:
         return False
 
@@ -1105,6 +1403,12 @@ class ScaledIntType(IntType):
 
     def bounds(self) -> tuple[Union[int, Fraction], Union[int, Fraction]]:
         raise ValueError(f"{self} has no value set: a scaled integer's scale is not stated")
+
+    def container(self) -> np.dtype:
+        raise ValueError(f"{self} has no exact numpy container: it has no value set")
+
+    def _require_codes(self) -> None:
+        raise ValueError(f"{self} has no codes: it has no value set")
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         raise Exception("Undefined for ScaledIntType")
