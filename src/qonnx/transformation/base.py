@@ -53,6 +53,7 @@ from __future__ import annotations
 import copy
 import multiprocessing as mp
 from abc import ABC, abstractmethod
+from traceback import format_exception
 from typing import TYPE_CHECKING
 
 from qonnx.core.findings import Finding, collect_findings, collecting_findings, report_finding
@@ -62,6 +63,10 @@ if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
 
 from qonnx.util.basic import get_num_default_workers
+
+
+class _RemoteTraceback(Exception):
+    """The formatted stack of a failed call in a worker process."""
 
 
 class Transformation(ABC):
@@ -121,6 +126,13 @@ class NodeLocalTransformation(Transformation):
                 return node, False, tuple(found), error
         return (*result, tuple(found), None)
 
+    def _carried_in_pool(self, node: NodeProto) -> tuple[NodeProto, bool, tuple[Finding, ...], Exception | None, str]:
+        """Carry the worker's stack along with its reports and error."""
+        result = self._carried(node)
+        error = result[3]
+        remote_traceback = "" if error is None else '\n"""\n' + "".join(format_exception(error)) + '"""'
+        return (*result, remote_traceback)
+
     def apply(self, model: ModelWrapper) -> tuple[ModelWrapper, bool]:
         # make a detached copy of the input model that applyNodeLocal
         # can use for read-only access
@@ -133,7 +145,12 @@ class NodeLocalTransformation(Transformation):
         if collecting_findings():
             if self._num_workers > 1:
                 with mp.Pool(self._num_workers) as p:
-                    carried = p.map(self._carried, old_nodes, chunksize=1)
+                    pooled = p.map(self._carried_in_pool, old_nodes, chunksize=1)
+                carried = []
+                for node, run, found, error, remote_traceback in pooled:
+                    if error is not None:
+                        error.__cause__ = _RemoteTraceback(remote_traceback)
+                    carried.append((node, run, found, error))
             else:
                 carried = []
                 for node in old_nodes:
