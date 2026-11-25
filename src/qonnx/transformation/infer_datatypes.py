@@ -896,6 +896,8 @@ def _node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes:
         else:
             # unknown, assume node produces float32 outputs
             for o in node.output:
+                if not o:
+                    continue
                 # check if output datatype is already set to a value != FLOAT32
                 odtype = model.get_tensor_datatype(o)
                 if odtype is not None and odtype != DataType["FLOAT32"]:
@@ -906,7 +908,7 @@ def _node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes:
     # if scaled-int dtype inference is disabled, replace those with FLOAT32
     if not allow_scaledint_dtypes:
         for out in node.output:
-            if "SCALEDINT" in model.get_tensor_datatype(out).get_canonical_name():
+            if out and "SCALEDINT" in model.get_tensor_datatype(out).get_canonical_name():
                 model.set_tensor_datatype(out, DataType["FLOAT32"])
     # compare old and new output dtypes to see if anything changed
     new_odtypes = list(map(lambda x: model.get_tensor_datatype(x), node.output))

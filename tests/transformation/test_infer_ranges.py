@@ -576,9 +576,9 @@ def test_an_absent_optional_output_is_no_tensor() -> None:
     assert model.get_tensor_datatype("y") == DataType["FLOAT32"]
     assert all(annotation.tensor_name for annotation in model.graph.quantization_annotation)
     assert list(model.graph.node[0].output) == ["y", ""]
-    # the default rules, as before exact ranges, annotate it
+    # Default inference also leaves an absent output without an annotation.
     default = ModelWrapper(source).transform(InferDataTypes())
-    assert get_by_name(default.graph.quantization_annotation, "", "tensor_name") is not None
+    assert get_by_name(default.graph.quantization_annotation, "", "tensor_name") is None
 
 
 # an output no rule states
