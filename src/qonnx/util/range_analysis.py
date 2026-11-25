@@ -31,7 +31,7 @@ import itertools
 import numpy as np
 import pprint
 from onnx import NodeProto
-from typing import Any
+from typing import Annotated, Any, Union
 from warnings import warn
 
 from qonnx.core.modelwrapper import ModelWrapper
@@ -347,14 +347,14 @@ report_mode_options = clize.parameters.mapped(
 
 
 def range_analysis(
-    model_filename_or_wrapper,
+    model_filename_or_wrapper: Annotated[Union[str, ModelWrapper], clize.Clize[str]],
     *,
-    irange="",
+    irange: Annotated[Union[str, tuple[Any, Any]], clize.Clize[str]] = "",
     key_filter: str = "",
     report_mode: report_mode_options = REPORT_MODE_STUCKCHANNEL,
-    prettyprint=False,
-    do_cleanup=False
-):
+    prettyprint: bool = False,
+    do_cleanup: bool = False
+) -> Union[dict[str, Any], str]:
     assert report_mode in report_modes, "Unrecognized report_mode, must be " + str(report_modes)
     if isinstance(model_filename_or_wrapper, ModelWrapper):
         model = model_filename_or_wrapper
@@ -389,12 +389,12 @@ def range_analysis(
     for inp in model.graph.input:
         iname = inp.name
         if range_min is None or range_max is None:
-            # use idt annotation
+            # no irange given: use each input's own idt annotation
             idt = model.get_tensor_datatype(iname)
             assert idt is not None, "Could not infer irange, please specify"
-            range_min = idt.min()
-            range_max = idt.max()
-        range_dict[iname] = (range_min, range_max)
+            range_dict[iname] = (idt.min(), idt.max())
+        else:
+            range_dict[iname] = (range_min, range_max)
 
     for node in model.graph.node:
         dyn_inputs = [x for x in node.input if is_dyn_input(x, model)]
