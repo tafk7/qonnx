@@ -30,10 +30,13 @@ from __future__ import annotations
 
 import numpy as np
 import onnx.helper as helper
-from typing import TYPE_CHECKING, Optional
+from functools import lru_cache
+from onnx import GraphProto
+from typing import TYPE_CHECKING, Any, Optional
 
 from qonnx.core import tensor_ranges
 from qonnx.core.datatype import DataType
+from qonnx.core.onnx_exec import exact_integers_enabled
 from qonnx.core.ranges import Range
 from qonnx.custom_op.base import CustomOp
 from qonnx.util.basic import get_by_name
@@ -101,6 +104,84 @@ def multithreshold(v, thresholds, out_scale=None, out_bias=None, channels_last=F
     return out_scale * ret + out_bias
 
 
+def _integral(value: Any) -> bool:
+    """Whether a scalar is an integer; a non-finite one is not."""
+    if isinstance(value, (int, np.integer)):
+        return True
+    return bool(np.isfinite(value) and np.trunc(value) == value)
+
+
+def _affine_container(input_dtype: np.dtype, scale: Any, bias: Any) -> np.dtype:
+    """The numpy type multithreshold's result takes: that of scale times a count held in
+    the input's type, plus bias."""
+    with np.errstate(all="ignore"):
+        return np.dtype((scale * np.zeros(1, dtype=input_dtype) + bias).dtype)
+
+
+@lru_cache(maxsize=512)
+def _check_output(name: str, count: int, scale: Any, bias: Any, container: str) -> None:
+    """Raises ValueError where out_dtype (name; none where empty) does not hold the
+    result at some count in [0, count], or, for an integer scale and bias, where the
+    container does not hold an exact result. A fractional result declared FLOAT32 is
+    not checked against it: it keeps its floating precision."""
+    declared = DataType[name] if name else None
+    integer = _integral(scale) and _integral(bias)
+    carried_as = np.dtype(container)
+    with np.errstate(all="ignore"):
+        for value in range(count + 1):
+            if integer:
+                result = int(scale) * value + int(bias)
+            else:
+                result = (scale * np.asarray([value], dtype=carried_as) + bias)[0]
+            floating = not integer and name == "FLOAT32"
+            if declared is not None and not floating and not declared.contains(result):
+                raise ValueError(
+                    f"out_dtype {declared.name} cannot hold {result} at count {value} "
+                    f"(scale {scale}, bias {bias}, counts [0, {count}])"
+                )
+            if integer:
+                if carried_as.kind in "iu":
+                    limits = np.iinfo(carried_as)
+                    exact = limits.min <= result <= limits.max
+                else:
+                    carried = np.asarray(result, dtype=carried_as).item()
+                    exact = bool(np.isfinite(carried)) and int(carried) == result
+                if not exact:
+                    raise ValueError(
+                        f"the {carried_as.name} container cannot hold exact result {result} "
+                        f"at count {value} (scale {scale}, bias {bias}, counts [0, {count}])"
+                    )
+
+
+def _exact_multithreshold(
+    v: np.ndarray, thresholds: np.ndarray, out_scale: Any, out_bias: Any, out_dtype: str
+) -> np.ndarray:
+    """multithreshold with exact integers: the count is exact (not cast to the input's
+    type), and for an integer out_scale and out_bias the affine result is computed in
+    exact integers, then held in the type multithreshold's result takes. A fractional
+    out_scale or out_bias computes in that type. Raises ValueError where out_dtype does
+    not hold the result at every count from 0 to the number of thresholds, or, for an
+    integer result, where its container does not hold it exactly."""
+    vm = np.expand_dims(np.moveaxis(v, source=1, destination=-1), axis=-1)
+    counts = np.moveaxis(np.count_nonzero(vm >= thresholds, axis=-1), source=-1, destination=1)
+    assert counts.shape == v.shape, "Shape changed during thresholding!"
+    scale = 1.0 if out_scale is None else out_scale
+    bias = 0.0 if out_bias is None else out_bias
+    container = _affine_container(v.dtype, scale, bias)
+    _check_output(out_dtype, int(thresholds.shape[-1]), scale, bias, container.str)
+    if _integral(scale) and _integral(bias):
+        scale, bias = int(scale), int(bias)
+        limits = np.iinfo(np.int64)
+        largest = int(counts.max()) if counts.size else 0
+        ends = (0, scale, scale * largest, bias, scale * largest + bias)
+        if min(ends) < limits.min or max(ends) > limits.max:
+            counts = counts.astype(object)
+        result = counts * scale + bias
+    else:
+        result = scale * counts.astype(container) + bias
+    return result.astype(container)
+
+
 class MultiThreshold(CustomOp):
     """Class that corresponds to a multithresholding node."""
 
@@ -152,7 +233,7 @@ class MultiThreshold(CustomOp):
         ends = sorted((int(bias), int(bias) + int(scale) * shape[-1]))
         return Range(ends[0], ends[1])
 
-    def execute_node(self, context, graph):
+    def execute_node(self, context: dict[str, Any], graph: GraphProto) -> None:
         node = self.onnx_node
         # save inputs
         v = context[node.input[0]]
@@ -183,7 +264,10 @@ class MultiThreshold(CustomOp):
         orig_shape = v.shape
         v = v.swapaxes(cdim, 1)
         # Now we can use the multithreshold function to calculate output
-        output = multithreshold(v, thresholds, out_scale, out_bias)
+        if exact_integers_enabled():
+            output = _exact_multithreshold(v, thresholds, out_scale, out_bias, self.get_nodeattr("out_dtype"))
+        else:
+            output = multithreshold(v, thresholds, out_scale, out_bias)
         # Rearrange the output back to the original layout
         output = output.swapaxes(cdim, 1)
         assert output.shape == orig_shape, "Shape changed during thresholding!"

@@ -26,12 +26,38 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
+
+from onnx import GraphProto, NodeProto
+from typing import TYPE_CHECKING, Any
+
 import qonnx.custom_op.registry as registry
 
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
 
-def execute_custom_node(node, context, graph, onnx_opset_version):
+
+def execute_custom_node(
+    node: NodeProto,
+    context: dict[str, Any],
+    graph: GraphProto,
+    onnx_opset_version: int,
+    *,
+    model: ModelWrapper | None = None,
+    exact_integers: bool | None = None,
+) -> None:
     """Call custom implementation to execute a single custom node.
-    Input/output provided via context."""
+    Input/output provided via context.
+
+    model is the ModelWrapper the node belongs to, where the caller has it; the
+    custom op is chosen as without it. exact_integers switches exact integers for
+    this node (see qonnx.core.onnx_exec.exact_integers); None, the default, keeps the
+    setting around the call."""
+    if exact_integers is not None:
+        import qonnx.core.onnx_exec as onnx_exec
+
+        with onnx_exec.exact_integers(exact_integers):
+            return execute_custom_node(node, context, graph, onnx_opset_version, model=model)
     op_type = node.op_type
     try:
         # lookup op_type in registry of CustomOps

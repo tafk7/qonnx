@@ -28,9 +28,11 @@
 
 import numpy as np
 import onnxruntime as rt
-from onnx import TensorProto, helper
+from onnx import GraphProto, TensorProto, helper
+from typing import Any
 
 from qonnx.core.datatype import DataType
+from qonnx.core.onnx_exec import exact_integers_enabled
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.general.maxpoolnhwc import compute_pool_output_dim
 from qonnx.util.basic import get_preferred_onnx_opset, qonnx_make_model
@@ -105,12 +107,16 @@ class QuantAvgPool2d(CustomOp):
         shift_bits = shift_bits if shift_bits >= 0 else 0
         return shift_bits
 
-    def execute_node(self, context, graph):
+    def execute_node(self, context: dict[str, Any], graph: GraphProto) -> None:
         # create a standard average pooling node to help calculate the result
         node = self.onnx_node
         k = self.get_nodeattr("kernel")
         s = self.get_nodeattr("stride")
         inp_values = context[node.input[0]]
+        if exact_integers_enabled():
+            # Exact integers may give the input in float64; the pooling stays float32,
+            # for ONNX Runtime has no float64 AveragePool.
+            inp_values = inp_values.astype(np.float32)
         oshape = context[node.output[0]].shape
         if self.get_nodeattr("data_layout") == "NHWC":
             inp_values = inp_values.transpose(0, 3, 1, 2)
