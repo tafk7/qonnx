@@ -33,6 +33,7 @@ from onnx import NodeProto
 from typing import TYPE_CHECKING, Any, Optional
 
 import qonnx.core.onnx_exec as oxe
+from qonnx.core.findings import Finding, Refusal, collecting_findings, report_finding
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.infer_shapes import InferShapes
@@ -41,7 +42,22 @@ if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
 
 
-def _folded(model: ModelWrapper, node: NodeProto, context: dict[str, Any], opset_version: int) -> Optional[np.ndarray]:
+def _report_unfolded(
+    model: ModelWrapper, node: NodeProto, owner: type[Transformation], code: str, message: str, **details: object
+) -> None:
+    report_finding(
+        Finding(
+            code,
+            owner.__name__,
+            message,
+            tuple(dict(details, graph=model.graph.name, node=node.name or node.op_type, tensor=node.output[0]).items()),
+        )
+    )
+
+
+def _folded(
+    model: ModelWrapper, node: NodeProto, context: dict[str, Any], opset_version: int, owner: type[Transformation]
+) -> Optional[np.ndarray]:
     """The value constant folding stores for node's first output, or None where the node
     is left unfolded.
 
@@ -58,14 +74,28 @@ def _folded(model: ModelWrapper, node: NodeProto, context: dict[str, Any], opset
     stored in the element type the graph states for the output, where that type holds
     it exactly; where it does not, the node is left unfolded, for an initializer would
     round it. A custom node is evaluated with the caller's setting, and its value
-    stored as computed."""
+    stored as computed. When collecting findings, a refused exact evaluation reports
+    fold-unproved; a value its stated container cannot hold reports
+    fold-unrepresentable. Both reports name their graph, node and first output."""
     name = node.output[0]
     if is_custom_op(node.domain, node.op_type):
         oxe.execute_node(node, context, model.graph, opset_version=opset_version, model=model)
         return context[name]
     try:
         oxe.execute_node(node, context, model.graph, opset_version=opset_version, model=model, exact_integers=True)
-    except (ArithmeticError, NotImplementedError):
+    except (ArithmeticError, NotImplementedError) as error:
+        if collecting_findings():
+            reason = error.findings[0] if isinstance(error, Refusal) else None
+            message = reason.message if reason is not None else str(error)
+            _report_unfolded(
+                model,
+                node,
+                owner,
+                "fold-unproved",
+                f"{node.name or node.op_type}: exact folding is unproved: {message}",
+                refusal_code=reason.code if reason is not None else None,
+                refusal_message=message,
+            )
         return None
     value = context[name]
     info = model.get_tensor_valueinfo(name)
@@ -76,6 +106,16 @@ def _folded(model: ModelWrapper, node: NodeProto, context: dict[str, Any], opset
         return value
     held = value.astype(stated)
     if not np.array_equal(held, value):
+        if collecting_findings():
+            _report_unfolded(
+                model,
+                node,
+                owner,
+                "fold-unrepresentable",
+                f"{node.name or node.op_type}: {name} cannot be stored exactly in its stated {stated} container",
+                element_type=info.type.tensor_type.elem_type,
+                container=str(stated),
+            )
         return None
     return held
 
@@ -111,7 +151,7 @@ class FoldConstantsFiltered(Transformation):
             if (is_all_constant_inputs or is_const_shape) and eligible:
                 # this node has no dynamic inputs, only constant ones -- so we can
                 # do constant folding.
-                folded = _folded(model, n, execution_context, opset_version)
+                folded = _folded(model, n, execution_context, opset_version, type(self))
                 if folded is None:
                     continue
                 # use the execution result as an initializer
@@ -176,7 +216,7 @@ class FoldConstants(Transformation):
                 # are populated, we 'touch' the shape of all inputs first below.
                 for inp in n.input:
                     model.get_tensor_shape(inp, fix_missing_init_shape=True)
-                folded = _folded(model, n, execution_context, opset_version)
+                folded = _folded(model, n, execution_context, opset_version, type(self))
                 if folded is None:
                     continue
                 # use the execution result as an initializer

@@ -45,6 +45,7 @@ Guide to writing QONNX transformations
 * If you cannot guarantee that the transformation will reach a fixed point,
   you must declare this, return model_was_changed = False and let the user
   manually re-apply the transform.
+* Report what you find without refusing with report_finding; never return it.
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ import copy
 import multiprocessing as mp
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
+
+from qonnx.core.findings import Finding, collect_findings, collecting_findings, report_finding
 
 if TYPE_CHECKING:
     from onnx import NodeProto
@@ -88,6 +91,11 @@ class NodeLocalTransformation(Transformation):
     * None: use NUM_DEFAULT_WORKERS environment variable
     * 0: use all available CPU cores
     * (any other int>0): set number of parallel workers
+
+    When a caller collects findings, workers' reports are carried back in
+    processing order, including those of the first node that raises. Findings
+    crossing the process pool must pickle, so define subclasses at module level.
+    Without a collector the pool carries only nodes and flags, as usual.
     """
 
     def __init__(self, num_workers: int | None = None) -> None:
@@ -104,6 +112,15 @@ class NodeLocalTransformation(Transformation):
     def applyNodeLocal(self, node) -> tuple[NodeProto, bool]:
         pass
 
+    def _carried(self, node: NodeProto) -> tuple[NodeProto, bool, tuple[Finding, ...], Exception | None]:
+        """Carry a node call's reports and error when the caller collects findings."""
+        with collect_findings(propagate=False) as found:
+            try:
+                result = self.applyNodeLocal(node)
+            except Exception as error:
+                return node, False, tuple(found), error
+        return (*result, tuple(found), None)
+
     def apply(self, model: ModelWrapper) -> tuple[ModelWrapper, bool]:
         # make a detached copy of the input model that applyNodeLocal
         # can use for read-only access
@@ -113,8 +130,24 @@ class NodeLocalTransformation(Transformation):
         for i in range(len(model.graph.node)):
             old_nodes.append(model.graph.node.pop())
 
+        if collecting_findings():
+            if self._num_workers > 1:
+                with mp.Pool(self._num_workers) as p:
+                    carried = p.map(self._carried, old_nodes, chunksize=1)
+            else:
+                carried = []
+                for node in old_nodes:
+                    carried.append(self._carried(node))
+                    if carried[-1][3] is not None:
+                        break
+            for _, _, found, error in carried:
+                for finding in found:
+                    report_finding(finding)
+                if error is not None:
+                    raise error
+            new_nodes_and_bool = [(node, run) for node, run, _, _ in carried]
         # Execute transformation in parallel
-        if self._num_workers > 1:
+        elif self._num_workers > 1:
             with mp.Pool(self._num_workers) as p:
                 new_nodes_and_bool = p.map(self.applyNodeLocal, old_nodes, chunksize=1)
         # execute without mp.Pool in case of 1 worker to simplify debugging
