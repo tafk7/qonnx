@@ -65,6 +65,19 @@ equals, as it does on its own, and an element that is no number is not allowed. 
 datatypes' ``allowed`` is unchanged: FLOAT32 and FLOAT16 allow every value, and
 FLOAT<e,m,b> keeps its float32-based test. Past the envelope, and for any other kind of
 input, ``allowed`` answers as it always has.
+
+Membership
+----------
+``contains(values)`` says whether each value is one of the datatype's, decided exactly
+for Python ``int``, ``float`` and ``Fraction``, numpy integers and floats of every width,
+and arrays of them, object arrays included. A scalar gives a ``bool``, an array a bool
+array of its shape. Anything else (a ``bool``, a string, ``None``, a complex number, a
+list) is not a member, and nothing raises. For an IEEE float datatype, membership is
+representability: ``FLOAT32`` does not contain ``0.1``, and does contain each infinity and
+NaN. No other datatype contains an infinity or NaN. A negative zero is the value zero. A
+datatype without exact bounds (a scaled integer, a nonsense width, a datatype past the
+envelope) contains nothing. ``allowed`` keeps its own answers, which differ from these for
+the float datatypes and for bools.
 """
 
 import math
@@ -380,6 +393,27 @@ def _is_integral(value: object) -> bool:
     return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
 
 
+def _in_format(fmt: FloatFormat, value: Optional[_Exact]) -> bool:
+    """Whether an exactly read value is a finite value of a binary float format."""
+    return _finite(value) and fmt.nearest(value) == value
+
+
+def _representable(fmt: FloatFormat, values: np.ndarray) -> np.ndarray:
+    """Whether each element of a float64 array is a finite value of a binary float
+    format: within its largest value, and a multiple of the spacing at its exponent."""
+    spacing = np.maximum(_leading_exponents(values), fmt.emin) - fmt.mantissa
+    return np.isfinite(values) & (np.abs(values) <= _at_most(fmt.largest)) & _multiples(values, spacing)
+
+
+def _float_integers(datatype: "BaseDataType", values: np.ndarray) -> np.ndarray:
+    """Membership of each element of an integer array in a float datatype: through float64
+    where every element converts exactly, else element by element."""
+    if values.size and max(-int(values.min()), int(values.max())) > 1 << 53:
+        return _each(values, lambda value: datatype._holds(_exact(value)))
+    with np.errstate(invalid="ignore", over="ignore"):
+        return datatype._floats(values.astype(np.float64))
+
+
 class BaseDataType(ABC):
     "Base class for QONNX data types."
 
@@ -432,6 +466,19 @@ class BaseDataType(ABC):
         if not (_finite(least) and _finite(greatest)):
             raise ValueError(f"{self} has no finite bounds")
         return least, greatest
+
+    def contains(self, values: object) -> Union[bool, np.ndarray]:
+        """Returns whether each value is one of this datatype's values, decided exactly: a
+        bool for a scalar, a bool array of an array's shape. A value that is no number is
+        not a member, and nothing raises (see the module's docstring). A subclass defined
+        elsewhere states its membership by overriding this method."""
+        try:
+            self.bounds()
+        except ValueError:
+            return np.zeros(values.shape, dtype=np.bool_) if isinstance(values, np.ndarray) else False
+        if isinstance(values, np.ndarray):
+            return np.asarray(self._contains_array(values), dtype=np.bool_).reshape(values.shape)
+        return bool(self._holds(_exact(values)))
 
     # Exact membership: the private tests allowed() runs on. A family defines _holds, and
     # may define _integers and _floats to decide whole arrays without leaving numpy.
@@ -531,6 +578,16 @@ class FloatType(BaseDataType):
         largest = BINARY32.largest
         return -largest, largest
 
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        return isinstance(value, float) or _in_format(BINARY32, value)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _float_integers(self, values)
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        values = values.astype(np.float64, copy=False)
+        return ~np.isfinite(values) | _representable(BINARY32, values)
+
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         if isinstance(value, np.ndarray):
             return np.ones(value.shape, dtype=bool)
@@ -627,6 +684,15 @@ class ArbPrecFloatType(BaseDataType):
             raise ValueError(f"{self} is past the envelope: its greatest value rounds past float64's") from None
         return found
 
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        return _in_format(self._format(), value)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _float_integers(self, values)
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        return _representable(self._format(), values.astype(np.float64, copy=False))
+
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         # fp32 format parameters
         fp32_exponent_bias = 127
@@ -693,6 +759,16 @@ class Float16Type(BaseDataType):
     def bounds(self) -> tuple[Union[int, Fraction], Union[int, Fraction]]:
         largest = BINARY16.largest
         return -largest, largest
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        return isinstance(value, float) or _in_format(BINARY16, value)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _float_integers(self, values)
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        values = values.astype(np.float64, copy=False)
+        return ~np.isfinite(values) | _representable(BINARY16, values)
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         if isinstance(value, np.ndarray):
