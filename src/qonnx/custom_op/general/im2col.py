@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
+from onnx import GraphProto
 
 import qonnx.util.basic as util
 from qonnx.core.datatype import DataType
@@ -193,7 +194,7 @@ class Im2Col(CustomOp):
         dtype = model.get_tensor_datatype(node.input[0])
         model.set_tensor_datatype(node.output[0], dtype)
 
-    def execute_node(self, context, graph):
+    def execute_node(self, context: dict[str, np.ndarray], graph: GraphProto) -> None:
         node = self.onnx_node
         k_h, k_w = self.get_nodeattr("kernel_size")  # Assumption: Height x Width
         stride_h, stride_w = self.get_nodeattr("stride")
@@ -233,6 +234,32 @@ class Im2Col(CustomOp):
 
         out_dim_h = compute_conv_output_dim(h, k_h, stride_h, pad_h, dilation_h)
         out_dim_w = compute_conv_output_dim(w, k_w, stride_w, pad_w, dilation_w)
+        # The first and last sampled coordinates bound all windows, including
+        # dilated kernels. Trailing padding cropped by the stride is not read.
+        samples_padding = (
+            n > 0
+            and c > 0
+            and out_dim_h > 0
+            and out_dim_w > 0
+            and (
+                pad[0] > 0
+                or pad[1] > 0
+                or (out_dim_h - 1) * stride_h + (k_h - 1) * dilation_h - pad[0] >= h
+                or (out_dim_w - 1) * stride_w + (k_w - 1) * dilation_w - pad[1] >= w
+            )
+        )
+        if samples_padding:
+            assert idt.contains(pad_val), "Im2Col dtype must allow pad_val"
+            # np.pad writes into the input's container, which may be narrower
+            # than the declared datatype. Compare Python scalars to avoid numpy
+            # promoting the integer to an already rounded floating value.
+            try:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    stored_pad = np.asarray(pad_val, dtype=x.dtype).item()
+                container_holds = stored_pad == pad_val
+            except (OverflowError, ValueError):
+                container_holds = False
+            assert container_holds, "Im2Col dtype must allow pad_val"
         # internally convert input to NCHW
         x = x.transpose(0, 3, 1, 2)
         # call NCHW im2col implementation
