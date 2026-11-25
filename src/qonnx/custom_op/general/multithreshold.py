@@ -45,7 +45,13 @@ if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
 
 
-def multithreshold(v, thresholds, out_scale=None, out_bias=None, channels_last=False):
+def multithreshold(
+    v: np.ndarray,
+    thresholds: np.ndarray,
+    out_scale: Optional[float] = None,
+    out_bias: Optional[float] = None,
+    channels_last: bool = False,
+) -> np.ndarray:
     """Given a set of threshold values t={t_0, t_1 ... t_n} the successive
     thresholding maps any real number x to an integer in the interval [0, n],
     where the returned integer is the number of thresholds x is greater than
@@ -89,9 +95,20 @@ def multithreshold(v, thresholds, out_scale=None, out_bias=None, channels_last=F
     cmp = vm >= thresholds
     # replace last axis by count of nonzero values (True)
     # N_CT -> N_C
-    # note the .astype cast to ensure type remains the same
-    # TODO enforce ints instead?
-    ret = np.count_nonzero(cmp, axis=-1).astype(v.dtype)
+    # Keep upstream's count container whenever it holds every possible count.
+    count = thresholds.shape[-1]
+    if v.dtype.kind in "iu":
+        count_fits = count <= np.iinfo(v.dtype).max
+    elif v.dtype.kind == "b":
+        count_fits = count <= 1
+    elif v.dtype.kind in "fc":
+        count_fits = count <= 2 ** (np.finfo(v.dtype).nmant + 1)
+    else:
+        count_fits = True
+    if count_fits:
+        ret = np.count_nonzero(cmp, axis=-1).astype(v.dtype)
+    else:
+        ret = np.count_nonzero(cmp, axis=-1).astype(np.int64)
     if not channels_last:
         # move the channels axis back to index 1
         ret = np.moveaxis(ret, source=-1, destination=1)
