@@ -58,7 +58,7 @@ from qonnx.transformation.general import (
 )
 
 
-from qonnx.core import metadata
+from qonnx.core import metadata, ranges, tensor_ranges
 
 
 class _SharedParent:
@@ -353,9 +353,23 @@ class ModelWrapper:
         else:
             return DataType["FLOAT32"]
 
-    def set_tensor_datatype(self, tensor_name: str, datatype: BaseDataType | None) -> None:
-        """Sets the QONNX DataType of tensor with given name. None removes the
-        annotation (other annotations of the tensor, such as its layout, stay)."""
+    def set_tensor_datatype(
+        self, tensor_name: str, datatype: BaseDataType | None, *, range: ranges.Range | None = None
+    ) -> None:
+        """Sets the QONNX DataType of tensor with given name, and its range with it
+        (qonnx.core.tensor_ranges): the two are one fact. Without ``range`` (or with
+        the datatype's full range) the tensor states no range, and a range it stated
+        before is cleared. A range the datatype does not hold is not stored, and is
+        named (RangeContradiction). None removes the datatype annotation and the
+        range (other annotations of the tensor, such as its layout, stay); a range
+        with None is a ValueError. A range is checked before anything is written: a
+        refusal, or its RangeContradiction raised as an error, leaves the model as it
+        was."""
+        if datatype is None and range is not None:
+            raise ValueError(f"tensor {tensor_name!r}: a range is stated with a datatype, not with None")
+        if range is not None:
+            # checked, and named if its datatype does not hold it, before anything is written
+            range = tensor_ranges.prepare(self, tensor_name, datatype, range)
         graph = self._model_proto.graph
         qnt_annotations = graph.quantization_annotation
         ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
@@ -381,6 +395,29 @@ class ModelWrapper:
             qa.tensor_name = tensor_name
             qa.quant_parameter_tensor_names.append(dt)
             qnt_annotations.append(qa)
+        tensor_ranges.write(self, tensor_name, range)
+
+    def get_tensor_range(self, tensor_name: str) -> ranges.Range:
+        """The range of the tensor with given name (qonnx.core.ranges): for an
+        initializer, the exact range of its values; else the range it states with its
+        datatype, or its datatype's full range. MetadataError for a stored range that
+        is malformed or that its datatype does not hold."""
+        values = self.get_initializer(tensor_name)
+        if values is not None:
+            return ranges.values_range(values)
+        return tensor_ranges.tensor_range(self, tensor_name)
+
+    def get_stated_tensor_range(self, tensor_name: str) -> ranges.Range | None:
+        """The range stored with the datatype of the tensor with given name, None
+        where it states none; an initializer's values are not read. MetadataError
+        for a stored range that is malformed."""
+        return tensor_ranges.stated(self, tensor_name)
+
+    def get_tensor_annotation_range(self, tensor_name: str) -> ranges.Range:
+        """The range the tensor with given name states, or its datatype's full range,
+        without reading an initializer's values. MetadataError as get_tensor_range,
+        its message showing the range as qonnx.core.ranges does."""
+        return tensor_ranges.tensor_range(self, tensor_name, numeric_text=True)
 
     def get_tensor_valueinfo(self, tensor_name: str) -> ValueInfoProto | None:
         """Returns ValueInfoProto of tensor with given name, if it has one."""
