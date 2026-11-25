@@ -37,6 +37,12 @@ import qonnx.util.basic as util
 from qonnx.transformation.base import Transformation
 
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
+
+
 class MovePadAttributeToTensor(Transformation):
     "Move padding info from attribute into input tensor for Pad nodes."
 
@@ -194,7 +200,7 @@ class GiveUniqueParameterTensors(Transformation):
     """Make every parameter tensor unique. The aim is to avoid affecting
     other nodes apart from the one the system is currently operating on."""
 
-    def apply(self, model):
+    def apply(self, model: "ModelWrapper") -> "tuple[ModelWrapper, bool]":
         graph = model.graph
         graph_modified = False
         seen_parameters = []
@@ -217,6 +223,11 @@ class GiveUniqueParameterTensors(Transformation):
                 new_param_name = model.make_new_valueinfo_name()
 
                 model.set_initializer(new_param_name, input_init)
+                # the copy carries the parameter's annotations, its typed metadata among them
+                original = util.get_by_name(graph.quantization_annotation, node_input, "tensor_name")
+                if original is not None:
+                    copied = graph.quantization_annotation.add(tensor_name=new_param_name)
+                    copied.quant_parameter_tensor_names.extend(original.quant_parameter_tensor_names)
                 model.set_tensor_datatype(new_param_name, model.get_tensor_datatype(node_input))
 
                 # point node input to new tensor
