@@ -108,3 +108,7 @@ def test_a_deferred_import_cannot_hide_a_dependency() -> None:
     with pytest.raises(subprocess.CalledProcessError) as refused:
         check_import("qonnx.core.ranges", "def deferred():\n    import onnx\n")
     assert "non-numeric import statement: onnx" in refused.value.stderr
+
+
+def test_range_rules_are_numpy_only() -> None:
+    check_import("qonnx.core.range_rules")
