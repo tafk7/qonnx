@@ -32,6 +32,7 @@ from onnx import GraphProto, NodeProto
 from typing import TYPE_CHECKING, Any
 
 import qonnx.custom_op.registry as registry
+from qonnx.core.modelwrapper import _custom_op_for
 
 if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
@@ -49,8 +50,11 @@ def execute_custom_node(
     """Call custom implementation to execute a single custom node.
     Input/output provided via context.
 
-    model is the ModelWrapper the node belongs to, where the caller has it; the
-    custom op is chosen as without it. exact_integers switches exact integers for
+    model is the ModelWrapper the node belongs to, where the caller has it. Given it,
+    the custom op is built at the version the model imports for the node's domain,
+    else at the preferred qonnx opset, and onnx_opset_version is not read; an op that
+    sets wants_model is given the model. Without it, the op is built at
+    onnx_opset_version. exact_integers switches exact integers for
     this node (see qonnx.core.onnx_exec.exact_integers); None, the default, keeps the
     setting around the call."""
     if exact_integers is not None:
@@ -60,8 +64,11 @@ def execute_custom_node(
             return execute_custom_node(node, context, graph, onnx_opset_version, model=model)
     op_type = node.op_type
     try:
-        # lookup op_type in registry of CustomOps
-        inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
+        if model is None:
+            # lookup op_type in registry of CustomOps
+            inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
+        else:
+            inst = _custom_op_for(model, node)
         inst.execute_node(context, graph)
     except KeyError:
         # exception if op_type is not supported

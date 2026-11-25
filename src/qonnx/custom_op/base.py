@@ -65,7 +65,34 @@ class CustomOp(ABC):
 
             class IntQuant_v4(CustomOp):
                 pass  # Version 4, covers opset v4+
+
+        A model states the version of each custom op domain it uses by its opset
+        import. Wherever qonnx builds a node's op for a model it holds
+        (ModelWrapper.get_customop_wrapper, the inference passes, constant folding,
+        range analysis, execution and the other transformations), it builds it at the
+        version the model imports for the node's domain, else at the preferred version
+        (qonnx.util.basic.get_preferred_qonnx_opset); get_customop_wrapper warns where
+        the model does not import the domain. A bare getCustomOp(node) does not see the
+        model: without a requested version it takes the highest.
+
+    Graph context:
+        An op that answers from the graph around its node (its inputs' shapes,
+        datatypes or initializer values) rather than from its own attributes alone
+        sets ``wants_model = True``. An op built for a model (as above) is then given
+        it by ``attach_model`` before it is used; a bare getCustomOp never attaches.
+        The op borrows the model: attaching and answering do not change the graph,
+        except that infer_node_datatype writes its node's output annotations. It
+        answers from the model it was given and does not follow a copy of it
+        (ModelWrapper.transform copies by default); qonnx holds no op instances.
+        Attaching the same model again changes nothing, and attaching a different
+        one replaces whatever the op derived from the first.
     """
+
+    # Set True by an op that answers from its model (see "Graph context" above).
+    wants_model: bool = False
+
+    # The model given to attach_model; None until one is attached.
+    _model: "ModelWrapper | None" = None
 
     def __init__(
         self,
@@ -75,6 +102,13 @@ class CustomOp(ABC):
         super().__init__()
         self.onnx_node: NodeProto = onnx_node
         self.onnx_opset_version: int = onnx_opset_version
+
+    def attach_model(self, model: "ModelWrapper") -> "CustomOp":
+        """Give this op the model its node belongs to, and return the op. The default
+        keeps the model as ``_model``; an op that derives state from its model
+        overrides it to derive that state again (see "Graph context" on CustomOp)."""
+        self._model = model
+        return self
 
     def get_nodeattr_def(
         self, name: str

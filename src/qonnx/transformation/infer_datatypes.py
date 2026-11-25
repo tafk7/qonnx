@@ -36,7 +36,6 @@ from fractions import Fraction
 from onnx import TensorProto, helper, numpy_helper
 from typing import TYPE_CHECKING, Any, Callable, Hashable, Optional, Union
 
-import qonnx.custom_op.registry as registry
 from qonnx.core import ranges
 from qonnx.core.datatype import (
     BFLOAT16,
@@ -52,6 +51,7 @@ from qonnx.core.datatype import (
     IntType,
     ScaledIntType,
 )
+from qonnx.core.modelwrapper import _custom_op_for
 from qonnx.core.range_rules import column_range, dot_range, range_dtype
 from qonnx.core.ranges import Range
 from qonnx.core.tensor_ranges import RANGE, element_type, inferring, one_pass, stated, tensor_range
@@ -720,8 +720,9 @@ def _exact_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_d
     before = [_fact(model, name) for name in node.output]
     if is_custom_op(node.domain):
         try:
-            # lookup op_type in registry of CustomOps
-            inst = registry.getCustomOp(node)
+            # the op at the version the model imports for its domain, given the model
+            # where it wants it
+            inst = _custom_op_for(model, node)
             inst.infer_node_datatype(model)
         except KeyError:
             # exception if op_type is not supported
@@ -851,8 +852,9 @@ def _node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes:
     if is_custom_op(node.domain):
         # handle DataType inference for CustomOp
         try:
-            # lookup op_type in registry of CustomOps
-            inst = registry.getCustomOp(node)
+            # the op at the version the model imports for its domain, given the model
+            # where it wants it
+            inst = _custom_op_for(model, node)
             inst.infer_node_datatype(model)
         except KeyError:
             # exception if op_type is not supported

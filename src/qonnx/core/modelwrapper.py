@@ -160,6 +160,20 @@ def _plain_annotation_numbers(value: Any) -> Any:
     return value
 
 
+def _custom_op_for(model: ModelWrapper, node: NodeProto, fallback_version: int | None = None) -> CustomOp:
+    """The custom op of ``node`` in ``model``, built at the version the model imports
+    for the node's domain, else at ``fallback_version`` (the preferred qonnx opset
+    when None), without a warning; given the model where the op sets wants_model.
+    KeyError for an op its domain does not have."""
+    if fallback_version is None:
+        fallback_version = util.get_preferred_qonnx_opset()
+    version = model.get_opset_imports().get(node.domain, fallback_version)
+    inst = getCustomOp(node, onnx_opset_version=version)
+    if inst.wants_model:
+        inst.attach_model(model)
+    return inst
+
+
 class _SharedParent:
     """Keep a subgraph body's parent shared when its wrapper is copied."""
 
@@ -1172,18 +1186,15 @@ class ModelWrapper:
         """Return CustomOp instance for given node, respecting the
         imported opset version in the model protobuf. If the node's domain
         is not found in the model's opset imports, fallback_customop_version
-        will be used."""
-        opset_imports = self.get_opset_imports()
-        try:
-            opset_import = opset_imports[node.domain]
-            return getCustomOp(node, onnx_opset_version=opset_import)
-        except KeyError:
+        will be used, with a warning. An op that sets wants_model is given this
+        model (CustomOp.attach_model). KeyError for an op its domain does not have."""
+        if node.domain not in self.get_opset_imports():
             # domain not found in imports, use fallback version
             warnings.warn(
                 f"Domain {node.domain} not found in model opset imports, "
                 f"using fallback_customop_version={fallback_customop_version}"
             )
-            return getCustomOp(node, onnx_opset_version=fallback_customop_version)
+        return _custom_op_for(self, node, fallback_customop_version)
 
     def set_opset_import(self, domain: str, version: int) -> None:
         """Sets the opset version for a given domain in the model's opset imports.

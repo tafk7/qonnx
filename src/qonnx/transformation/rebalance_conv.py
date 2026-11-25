@@ -29,7 +29,7 @@
 import numpy as np
 from onnx import TensorProto, helper
 
-from qonnx.custom_op.registry import getCustomOp
+from qonnx.core.modelwrapper import _custom_op_for
 from qonnx.transformation.base import Transformation
 
 
@@ -54,7 +54,7 @@ class RebalanceIm2Col(Transformation):
         for node in graph.node:
             node_ind += 1
             if node.op_type == "Im2Col":
-                inst = getCustomOp(node)
+                inst = _custom_op_for(model, node)
                 # list of conditions for rebalancing
                 # TODO can the following conditions be relaxed?
                 pads = inst.get_nodeattr("pad_amount")

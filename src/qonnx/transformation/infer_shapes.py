@@ -27,21 +27,22 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import onnx.shape_inference as si
+from onnx import NodeProto
 
-import qonnx.custom_op.registry as registry
-from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.core.modelwrapper import ModelWrapper, _custom_op_for
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.transformation.base import Transformation
 
 
-def _make_shape_compatible_op(node, model):
+def _make_shape_compatible_op(node: NodeProto, model: ModelWrapper) -> NodeProto:
     """Return a shape-compatible non-QONNX op for a given QONNX op. Used for
     shape inference with custom ops."""
     assert is_custom_op(node.domain), "Node domain is not a registered custom op domain"
     op_type = node.op_type
     try:
-        # lookup op_type in registry of CustomOps
-        inst = registry.getCustomOp(node)
+        # the op at the version the model imports for its domain, given the model
+        # where it wants it
+        inst = _custom_op_for(model, node)
         return inst.make_shape_compatible_op(model)
     except KeyError:
         # exception if op_type is not supported
