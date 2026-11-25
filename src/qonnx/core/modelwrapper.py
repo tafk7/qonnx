@@ -58,7 +58,7 @@ from qonnx.transformation.general import (
 )
 
 
-from qonnx.core import metadata, ranges, tensor_ranges
+from qonnx.core import metadata, ranges, tensor_facts, tensor_ranges
 
 
 class _SharedParent:
@@ -370,32 +370,49 @@ class ModelWrapper:
         if range is not None:
             # checked, and named if its datatype does not hold it, before anything is written
             range = tensor_ranges.prepare(self, tensor_name, datatype, range)
-        graph = self._model_proto.graph
-        qnt_annotations = graph.quantization_annotation
-        ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
-        if ret is not None:
-            ret_dt = util.get_by_name(
-                ret.quant_parameter_tensor_names, "finn_datatype", "key"
-            )
-            if ret_dt is not None:
-                if datatype is None:
-                    ret.quant_parameter_tensor_names.remove(ret_dt)
-                else:
-                    ret_dt.value = datatype.name
-            elif datatype is not None:
-                dt = onnx.StringStringEntryProto()
-                dt.key = "finn_datatype"
-                dt.value = datatype.name
-                ret.quant_parameter_tensor_names.append(dt)
-        elif datatype is not None:
-            qa = onnx.TensorAnnotation()
-            dt = onnx.StringStringEntryProto()
-            dt.key = "finn_datatype"
-            dt.value = datatype.name
-            qa.tensor_name = tensor_name
-            qa.quant_parameter_tensor_names.append(dt)
-            qnt_annotations.append(qa)
+        tensor_facts.write_entry(self, tensor_name, "finn_datatype", None if datatype is None else datatype.name)
         tensor_ranges.write(self, tensor_name, range)
+
+    def facts(self, tensor_name: str) -> tensor_facts.TensorFacts | tensor_facts.NonTensor:
+        """The facts the model states of the tensor with given name, in one read
+        (qonnx.core.tensor_facts.read): its shape, datatype (``element``), range,
+        layout and container, each None where none is stated; NonTensor for a value
+        that is not a tensor. FactRefused (a ValueError) where they contradict each
+        other or one is malformed."""
+        return tensor_facts.read(self, tensor_name)
+
+    def state(
+        self,
+        tensor_name: str,
+        *,
+        shape: Sequence[int] | None | tensor_facts._Omitted = tensor_facts._OMITTED,
+        element: BaseDataType | None | tensor_facts._Omitted = tensor_facts._OMITTED,
+        range: ranges.Range | None | tensor_facts._Omitted = tensor_facts._OMITTED,
+        layout: Sequence[str] | None | tensor_facts._Omitted = tensor_facts._OMITTED,
+        container: int | None | tensor_facts._Omitted = tensor_facts._OMITTED,
+    ) -> None:
+        """State only the facts given of the tensor with given name, all or none of
+        them (qonnx.core.tensor_facts.state); None removes one. Unlike the setters,
+        it admits only non-negative integer extents and a shape and container the
+        tensor's initializer agrees with, refuses the empty name, and keeps the rest
+        of a value info (doc string, denotations), a graph input's or output's
+        updated in place. FactRefused (a ValueError) for what it refuses.
+        ``container=None`` removes the element type, after which a graph input or
+        output does not pass ONNX's checker."""
+        given = (("shape", shape), ("element", element), ("range", range), ("layout", layout), ("container", container))
+        tensor_facts.state(
+            self, tensor_name, **{key: value for key, value in given if not isinstance(value, tensor_facts._Omitted)}
+        )
+
+    def unstate(self, tensor_name: str, fact: tensor_facts.Fact) -> None:
+        """Remove one fact ("shape", "element", "range", "layout" or "container") of
+        the tensor with given name, keeping the others."""
+        tensor_facts.unstate(self, tensor_name, fact)
+
+    def forget(self, tensor_name: str) -> None:
+        """Remove the value info and the annotation of the tensor with given name;
+        its initializer stays. FactRefused for a graph input or output."""
+        tensor_facts.forget(self, tensor_name)
 
     def get_tensor_range(self, tensor_name: str) -> ranges.Range:
         """The range of the tensor with given name (qonnx.core.ranges): for an
@@ -488,29 +505,9 @@ class ModelWrapper:
             else:
                 dtype = old_vi.type.tensor_type.elem_type
         new_vi = oh.make_tensor_value_info(tensor_name, dtype, tensor_shape)
-        # find what container this tensor's ValueInfo lives in
-        # if not found anywhere, we assume it's a new value_info
-        target_container = self.graph.value_info
-        ind = None
-        if util.get_by_name(self.graph.input, tensor_name) is not None:
-            target_container = self.graph.input
-            # create list from inputs to find index
-            inputs = [x.name for x in self.graph.input]
-            # save index of input to preserve order
-            ind = inputs.index(tensor_name)
-        if util.get_by_name(self.graph.output, tensor_name) is not None:
-            target_container = self.graph.output
-            # create list from inputs to find index
-            outputs = [x.name for x in self.graph.output]
-            # save index of input to preserve order
-            ind = outputs.index(tensor_name)
-        # remove from target container and add new
-        util.remove_by_name(target_container, tensor_name)
-        if target_container == self.graph.value_info:
-            target_container.append(new_vi)
-        else:
-            assert ind is not None, "set_tensor_shape: ind should not be None here"
-            target_container.insert(ind, new_vi)
+        # replace the old ValueInfo where it is (an input's or output's index kept),
+        # or add a new one (qonnx.core.tensor_facts.place_valueinfo)
+        tensor_facts.place_valueinfo(self, new_vi)
 
     def set_initializer(self, tensor_name: str, tensor_value: np.ndarray) -> None:
         """Sets the initializer value for tensor with given name."""
@@ -1007,28 +1004,7 @@ class ModelWrapper:
         """Sets the data layout annotation of tensor with given name. See
         get_tensor_layout for examples."""
         assert type(data_layout) is list, "data_layout must be a list"
-        graph = self._model_proto.graph
-        qnt_annotations = graph.quantization_annotation
-        ret = util.get_by_name(qnt_annotations, tensor_name, "tensor_name")
-        if ret is not None:
-            ret_tl = util.get_by_name(
-                ret.quant_parameter_tensor_names, "tensor_layout", "key"
-            )
-            if ret_tl is not None:
-                ret_tl.value = str(data_layout)
-            else:
-                tl = onnx.StringStringEntryProto()
-                tl.key = "tensor_layout"
-                tl.value = str(data_layout)
-                ret.quant_parameter_tensor_names.append(tl)
-        else:
-            qa = onnx.TensorAnnotation()
-            dt = onnx.StringStringEntryProto()
-            dt.key = "tensor_layout"
-            dt.value = str(data_layout)
-            qa.tensor_name = tensor_name
-            qa.quant_parameter_tensor_names.append(dt)
-            qnt_annotations.append(qa)
+        tensor_facts.write_entry(self, tensor_name, "tensor_layout", str(data_layout))
 
     def get_tensor_sparsity(self, tensor_name: str) -> dict[str, Any] | None:
         """Returns the sparsity of a given tensor as dictionary."""
