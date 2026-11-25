@@ -784,7 +784,8 @@ def execute_onnx_and_make_model(
     new_model = copy.deepcopy(model)
     # create value_info entries and initializers for everything
     for i in execution_context.keys():
-        new_model.set_initializer(i, execution_context[i])
+        if i:
+            new_model.set_initializer(i, execution_context[i])
     for vi in new_model.graph.value_info:
         new_model.graph.output.append(vi)
     return new_model
