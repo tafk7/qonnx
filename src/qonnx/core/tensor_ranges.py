@@ -71,6 +71,8 @@ __all__ = [
     "RANGE",
     "RangeContradiction",
     "TENSOR",
+    "element_type",
+    "inferring",
     "one_pass",
     "prepare",
     "stated",
@@ -174,7 +176,12 @@ def one_pass(model: ModelWrapper) -> Iterator[None]:
     """One inference pass over ``model``: inside it, a writer's contradiction
     (``RangeContradiction``) is named once per tensor. Entered again inside itself for
     the same model, it is the same pass. It holds no index of the model: every read
-    inside it reads the model as it is."""
+    inside it reads the model as it is.
+
+    It is also the signal for exact ranges (``inferring``): inside it, inference
+    (``InferDataTypes(exact_ranges=True)`` opens one) and a custom op's
+    ``infer_node_datatype`` state each output's range with its datatype. A hook may
+    enter it around a node's datatype step for the same."""
     if _pass(model) is not None:
         yield
         return
@@ -183,6 +190,24 @@ def one_pass(model: ModelWrapper) -> Iterator[None]:
         yield
     finally:
         _PASSES.reset(token)
+
+
+def inferring(model: ModelWrapper) -> bool:
+    """Whether an inference pass over ``model`` (``one_pass``) is open: where a writer
+    states ranges with its datatypes. Outside one, the rules before exact ranges
+    apply, and a custom op states no range."""
+    return _pass(model) is not None
+
+
+def element_type(model: ModelWrapper, tensor: str) -> Optional[int]:
+    """``tensor``'s ONNX element type (``TensorProto.FLOAT``, ...), the one its values
+    are held and computed in: its value info's, else its initializer's; None where
+    neither states one."""
+    info = model.get_tensor_valueinfo(tensor)
+    if info is not None and info.type.tensor_type.elem_type:
+        return int(info.type.tensor_type.elem_type)
+    proto = get_by_name(model.graph.initializer, tensor)
+    return int(proto.data_type) if proto is not None and proto.data_type else None
 
 
 def _annotation(model: ModelWrapper, tensor: str) -> Optional[TensorAnnotation]:

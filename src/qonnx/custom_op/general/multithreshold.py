@@ -26,11 +26,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
+
 import numpy as np
 import onnx.helper as helper
+from typing import TYPE_CHECKING, Optional
 
+from qonnx.core import tensor_ranges
 from qonnx.core.datatype import DataType
+from qonnx.core.ranges import Range
 from qonnx.custom_op.base import CustomOp
+from qonnx.util.basic import get_by_name
+
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
 
 
 def multithreshold(v, thresholds, out_scale=None, out_bias=None, channels_last=False):
@@ -107,7 +116,12 @@ class MultiThreshold(CustomOp):
         node = self.onnx_node
         return helper.make_node("Relu", [node.input[0]], [node.output[0]])
 
-    def infer_node_datatype(self, model):
+    def infer_node_datatype(self, model: ModelWrapper) -> None:
+        """The output's datatype is ``out_dtype``, or FLOAT32 where ``out_scale`` or
+        ``out_bias`` is not an integer. Where both are integers, inside an inference
+        pass (qonnx.core.tensor_ranges.inferring), its range is stated with it
+        (output_range); a range ``out_dtype`` does not hold is a contradiction: not
+        stated, and named."""
         node = self.onnx_node
         odt = self.get_nodeattr("out_dtype")
         is_float = False
@@ -120,7 +134,23 @@ class MultiThreshold(CustomOp):
         if is_float:
             model.set_tensor_datatype(node.output[0], DataType["FLOAT32"])
         else:
-            model.set_tensor_datatype(node.output[0], DataType[odt])
+            value = self.output_range(model) if tensor_ranges.inferring(model) else None
+            model.set_tensor_datatype(node.output[0], DataType[odt], range=value)
+
+    def output_range(self, model: ModelWrapper) -> Optional[Range]:
+        """``out_bias + out_scale * [0, N]`` for integer ``out_scale`` and ``out_bias``,
+        N the number of thresholds per channel, while N is known; else None."""
+        scale = self.get_nodeattr("out_scale")
+        bias = self.get_nodeattr("out_bias")
+        if int(scale) != scale or int(bias) != bias:
+            return None
+        name = self.onnx_node.input[1]
+        thresholds = get_by_name(model.graph.initializer, name)
+        shape = list(thresholds.dims) if thresholds is not None else model.get_tensor_shape(name)
+        if not shape or not isinstance(shape[-1], int) or shape[-1] <= 0:
+            return None
+        ends = sorted((int(bias), int(bias) + int(scale) * shape[-1]))
+        return Range(ends[0], ends[1])
 
     def execute_node(self, context, graph):
         node = self.onnx_node

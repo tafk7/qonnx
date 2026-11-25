@@ -44,6 +44,7 @@ from typing import Any, Optional, Union
 from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.core.ranges import Range
+from qonnx.core.tensor_ranges import RangeContradiction
 from qonnx.transformation.infer_datatypes import InferDataTypes, _infer_node_datatype, infer_node_datatype, int_type_holding
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.util.basic import qonnx_make_model
@@ -124,8 +125,10 @@ def test_a_stale_annotation_is_replaced() -> None:
 
 def test_float_inputs_keep_the_rules_before() -> None:
     assert infer("Relu", [("x", [4], None)]) == DataType["FLOAT32"]
-    # the unknown op's rule keeps a non-FLOAT32 annotation
-    assert infer("Relu", [("x", [4], None)], stale="INT20") == DataType["INT20"]
+    # the unknown op's rule keeps a non-FLOAT32 annotation, which cannot hold the float
+    # range Relu passes: a contradiction, named
+    with pytest.warns(RangeContradiction, match=r"Relu states \[0, inf\], or NaN, which its datatype INT20"):
+        assert infer("Relu", [("x", [4], None)], stale="INT20") == DataType["INT20"]
     assert infer("Add", [("x", [4], "INT4"), ("z", [4], None)]) == DataType["FLOAT32"]
     assert infer("Mul", [("x", [4], "INT4"), ("s", np.array([0.5]), None)]) == DataType["FLOAT32"]
     assert infer("MatMul", [("x", [1, 4], "INT4"), ("w", np.ones((4, 2)), None)]) == DataType["FLOAT32"]

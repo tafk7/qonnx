@@ -284,7 +284,14 @@ class CustomOp(ABC):
     @abstractmethod
     def infer_node_datatype(self, model: "ModelWrapper") -> None:
         """Set the DataType annotations corresponding to the outputs of this
-        node."""
+        node.
+
+        Inside an inference pass over ``model`` (qonnx.core.tensor_ranges.inferring:
+        ``InferDataTypes(exact_ranges=True)`` opens one, and a caller may enter
+        ``one_pass`` around this call), state each output's range (qonnx.core.ranges)
+        with its datatype, in one ``model.set_tensor_datatype(tensor, datatype,
+        range=value)``; None where it is not known. Outside one, state none. A datatype
+        stated alone clears the tensor's range."""
         pass
 
     @abstractmethod

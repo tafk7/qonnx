@@ -27,12 +27,22 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import numpy as np
-from onnx import TensorProto, helper
+from __future__ import annotations
 
-from qonnx.core.datatype import DataType
+import numpy as np
+import numpy.typing as npt
+from fractions import Fraction
+from onnx import TensorProto, helper
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+from qonnx.core import tensor_ranges
+from qonnx.core.datatype import BINARY32, BINARY64, DataType
+from qonnx.core.ranges import Range, endpoint, unbounded, values_range
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.general.quant import resolve_rounding_mode
+
+if TYPE_CHECKING:
+    from qonnx.core.modelwrapper import ModelWrapper
 
 
 def compute_default_exponent_bias(exponent_bitwidth):
@@ -48,23 +58,40 @@ def compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias=None):
     return max_val
 
 
+def clip_value(
+    exponent_bitwidth: npt.ArrayLike,
+    mantissa_bitwidth: npt.ArrayLike,
+    exponent_bias: Optional[npt.ArrayLike] = None,
+    max_val: Optional[npt.ArrayLike] = None,
+) -> Union[float, npt.NDArray[Any]]:
+    """The largest magnitude float_quant outputs before its scale: the format's
+    largest value (compute_max_val), or max_val where that is less."""
+    max_value = compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias)
+    return max_value if max_val is None else np.minimum(max_value, max_val)
+
+
 def float_quant(
-    X,
-    scale,
-    exponent_bitwidth,
-    mantissa_bitwidth,
-    exponent_bias=None,
-    signed=True,
-    max_val=None,
-    has_inf=False,
-    has_nan=False,
-    has_subnormal=False,
-    rounding_mode="ROUND",
-    saturation=True,
-):
+    X: npt.NDArray[np.floating[Any]],
+    scale: npt.ArrayLike,
+    exponent_bitwidth: npt.ArrayLike,
+    mantissa_bitwidth: npt.ArrayLike,
+    exponent_bias: Optional[npt.ArrayLike] = None,
+    signed: bool = True,
+    max_val: Optional[npt.ArrayLike] = None,
+    has_inf: bool = False,
+    has_nan: bool = False,
+    has_subnormal: bool = False,
+    rounding_mode: str = "ROUND",
+    saturation: bool = True,
+) -> Union[npt.NDArray[np.floating[Any]], np.floating[Any]]:
     # the comments are left to track the correspondence with the brevitas code
     # np version of brevitas function
-    def inf_nan_clamp(X, inf_mask, p_max_val_mask, n_max_val_mask):
+    def inf_nan_clamp(
+        X: npt.NDArray[np.floating[Any]],
+        inf_mask: npt.NDArray[np.bool_],
+        p_max_val_mask: npt.NDArray[np.bool_],
+        n_max_val_mask: npt.NDArray[np.bool_],
+    ) -> npt.NDArray[np.floating[Any]]:
         if has_inf:
             X[p_max_val_mask] = np.inf
             X[n_max_val_mask] = -np.inf
@@ -102,8 +129,7 @@ def float_quant(
         X / internal_scale
     )  # self.float_to_int_impl(x / internal_scale)
 
-    max_value = compute_max_val(exponent_bitwidth, mantissa_bitwidth, exponent_bias)
-    max_value = max_value if max_val is None else np.minimum(max_value, max_val)
+    max_value = clip_value(exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val)
     min_value = 0.0 if not signed else -max_value
 
     # Compute masks
@@ -118,6 +144,44 @@ def float_quant(
         x_q = inf_nan_clamp(x_q, inf_mask, p_max_val_mask, n_max_val_mask)
 
     return x_q * scale  # , self.saturating, self.inf_values, self.nan_values
+
+
+# For float32 and float64, the exponents of the smallest subnormal, the smallest
+# normal and the largest power of two.
+_EXPONENTS = ((-149, -126, 127), (-1074, -1022, 1023))
+
+
+def _floor_log2(value: Fraction) -> int:
+    """floor(log2(value)) for value > 0, exactly."""
+    exponent = value.numerator.bit_length() - value.denominator.bit_length()
+    return exponent - 1 if Fraction(2) ** exponent > value else exponent
+
+
+def _internal_scale_finite(largest: Fraction, mantissa_bitwidth: npt.ArrayLike, exponent_bias: npt.ArrayLike) -> bool:
+    """Whether float_quant's internal scale, 2 ** max(floor(log2(|x| + tiny)) - m,
+    1 - bias - m), is finite and nonzero for every |x| up to ``largest`` (the input
+    over its scale), computed in float32 or in float64. Where it is not, execution
+    makes NaN: inf * 0 when it overflows, 0 / 0 and 0 * inf when it underflows.
+
+    Conservative: the computed log2 may round up to the next integer, |x| + tiny is
+    at least tiny, and a mantissa width or bias that is not an integer keeps a
+    margin of one binade at each end. A width or bias that is not finite is not
+    proved."""
+    with np.errstate(all="ignore"):
+        widths = np.asarray(mantissa_bitwidth, dtype=np.float64)
+        biases = np.asarray(exponent_bias, dtype=np.float64)
+    if widths.size == 0 or biases.size == 0 or not (np.isfinite(widths).all() and np.isfinite(biases).all()):
+        return False
+    margin = 0 if (widths == np.round(widths)).all() and (biases == np.round(biases)).all() else 1
+    m_least, m_greatest = float(widths.min()), float(widths.max())
+    b_least, b_greatest = float(biases.min()), float(biases.max())
+    for subnormal, normal, top in _EXPONENTS:
+        floor_greatest = normal + 1 if largest == 0 else max(_floor_log2(largest) + 1, normal + 1)
+        least = max(normal - m_greatest, 1 - b_greatest - m_greatest)
+        greatest = max(floor_greatest - m_least, 1 - b_least - m_least)
+        if least < subnormal + margin or greatest > top - margin:
+            return False
+    return True
 
 
 class FloatQuant(CustomOp):
@@ -249,13 +313,81 @@ class FloatQuant(CustomOp):
         finn_dt = DataType[f"FLOAT<{exponent_bitwidth},{mantissa_bitwidth},{expoent_bias}>"]
         return finn_dt
 
-    def infer_node_datatype(self, model):
+    def infer_node_datatype(self, model: ModelWrapper) -> None:
+        """The output's datatype is FLOAT<e,m,b> for a unit scale (get_output_dtype),
+        else FLOAT32. Inside an inference pass (qonnx.core.tensor_ranges.inferring), its
+        range is stated with it (get_output_range)."""
         try:
             finn_dt = self.get_output_dtype(model)
         except AssertionError:
             finn_dt = DataType["FLOAT32"]
         node = self.onnx_node
-        model.set_tensor_datatype(node.output[0], finn_dt)
+        value = self.get_output_range(model) if tensor_ranges.inferring(model) else None
+        model.set_tensor_datatype(node.output[0], finn_dt, range=value)
+
+    def get_output_range(self, model: ModelWrapper) -> Optional[Range]:
+        """The values the node outputs, as execute_node computes them in float32.
+
+        M, the clip value (clip_value of the exponent and mantissa widths, the
+        exponent bias and max_val), bounds each value before its scale, and the
+        output is that value times the scale, rounded into float32. So:
+
+        - saturating: [-M * s, M * s], s the scale's largest magnitude, the ends
+          rounded into float32 as the product is;
+        - not saturating, with has_inf: unbounded, its values beyond M becoming
+          infinities;
+        - not saturating, with has_nan only: as saturating, NaN possible (its
+          values beyond M becoming NaN).
+
+        NaN is possible where the input may be NaN or infinite, or the input over
+        the scale may overflow float32 or divide by 0 (execution makes NaN of an
+        infinity), or float_quant's internal scale may overflow or underflow over
+        the input's range (_internal_scale_finite: unless proved finite and nonzero,
+        NaN is possible). None (no range stated) where the scale, the widths, the bias or
+        max_val is not an initializer, where M or the scale is not exact in
+        float32, where the input is held in another type than float32 or
+        float64, or where execution raises (neither saturating, has_inf nor
+        has_nan)."""
+        node = self.onnx_node
+        constants = [model.get_initializer(name) if name else None for name in node.input[1:6]]
+        if len(constants) < 5 or any(value is None for value in constants):
+            return None
+        scale, exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val = constants
+        saturation, has_inf, has_nan = (self.get_nodeattr(key) for key in ("saturation", "has_inf", "has_nan"))
+        if not (saturation or has_inf or has_nan):
+            return None
+        held = tensor_ranges.element_type(model, node.input[0])
+        if held not in (None, TensorProto.FLOAT, TensorProto.DOUBLE) or scale.dtype != np.float32:
+            return None
+        with np.errstate(all="ignore"):
+            clip = np.abs(np.asarray(clip_value(exponent_bitwidth, mantissa_bitwidth, exponent_bias, max_val)))
+        scales = values_range(np.abs(scale))
+        if np.isnan(clip).any() or scales.nan or isinstance(scales.greatest, float):
+            return unbounded(True)
+        bound = endpoint(float(clip.max()))
+        if BINARY32.nearest(bound) != bound:
+            return None
+        x = model.get_tensor_range(node.input[0])
+        divided = BINARY64 if held == TensorProto.DOUBLE else BINARY32
+        largest = max(abs(x.least), abs(x.greatest))
+        nan = (
+            x.nan
+            or isinstance(largest, float)
+            or scales.least == 0
+            or isinstance(divided.nearest(Fraction(largest) / Fraction(scales.least)), float)
+            or not _internal_scale_finite(Fraction(largest) / Fraction(scales.least), mantissa_bitwidth, exponent_bias)
+        )
+        if scales.greatest == 0 or bound == 0:
+            end = 0
+        elif isinstance(bound, float):
+            end = bound
+        else:
+            end = BINARY32.nearest(Fraction(bound) * Fraction(scales.greatest))
+        if saturation:
+            return Range(-end, end, nan)
+        if has_inf:
+            return unbounded(nan)
+        return Range(-end, end, True)
 
     def verify_node(self):
         pass
