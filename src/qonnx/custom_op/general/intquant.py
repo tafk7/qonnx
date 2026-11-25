@@ -305,5 +305,5 @@ class IntQuant(CustomOp):
         # set context according to output name
         context[node.output[0]] = ret
 
-    def verify_node(self):
+    def verify_node(self) -> None:
         pass

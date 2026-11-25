@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from onnx import AttributeProto, GraphProto, NodeProto, TensorProto, ValueInfoProto
 from onnxruntime.capi.onnxruntime_pybind11_state import NotImplemented as RuntimeNotImplemented
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Literal, Mapping, overload
 
 import qonnx.analysis.topology as ta
 import qonnx.core.execute_custom_node as ex_cu_node
@@ -661,15 +661,54 @@ def execute_node(
             context[outp] = output_list[list_ind]
 
 
+@overload
 def execute_onnx(
     model: ModelWrapper,
-    input_dict: Mapping[str, Any],
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: Literal[False] = False,
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+    *,
+    exact_integers: bool | None = None,
+) -> dict[str, np.ndarray]:
+    ...
+
+
+@overload
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: Literal[True],
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+    *,
+    exact_integers: bool | None = None,
+) -> dict[str, np.ndarray | None]:
+    ...
+
+
+@overload
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
+    return_full_exec_context: bool,
+    start_node: NodeProto | None = None,
+    end_node: NodeProto | None = None,
+    *,
+    exact_integers: bool | None = None,
+) -> dict[str, np.ndarray] | dict[str, np.ndarray | None]:
+    ...
+
+
+def execute_onnx(
+    model: ModelWrapper,
+    input_dict: Mapping[str, np.ndarray],
     return_full_exec_context: bool = False,
     start_node: NodeProto | None = None,
     end_node: NodeProto | None = None,
     *,
     exact_integers: bool | None = None,
-) -> dict[str, Any]:
+) -> dict[str, np.ndarray] | dict[str, np.ndarray | None]:
     """Executes given ONNX ModelWrapper with given named inputs.
 
     If return_full_exec_context is False, a dict of named outputs is returned
@@ -677,7 +716,8 @@ def execute_onnx(
 
     If return return_full_exec_context is True, the full set of tensors used by
     the execution (including inputs, weights, activations and final outputs)
-    will be returned as a dict.
+    will be returned as a dict; its entry for the empty name (an omitted
+    optional input) is None.
 
     When start_node and end_node are set to None, the whole graph is executed.
     If they are set to particular ONNX nodes, only the subgraph between (and
@@ -783,9 +823,9 @@ def execute_onnx_and_make_model(
     execution_context = execute_onnx(model, input_dict, True, exact_integers=exact_integers)
     new_model = copy.deepcopy(model)
     # create value_info entries and initializers for everything
-    for i in execution_context.keys():
-        if i:
-            new_model.set_initializer(i, execution_context[i])
+    for name, value in execution_context.items():
+        if name and value is not None:
+            new_model.set_initializer(name, value)
     for vi in new_model.graph.value_info:
         new_model.graph.output.append(vi)
     return new_model

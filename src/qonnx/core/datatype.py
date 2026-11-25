@@ -144,7 +144,7 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from fractions import Fraction
 from functools import lru_cache
-from typing import Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Union
 
 
 class DataTypeWarning(FutureWarning):
@@ -1642,28 +1642,45 @@ class DataTypeMeta(EnumMeta):
         return _resolve(name, False, stacklevel=3)
 
 
-class DataType(Enum, metaclass=DataTypeMeta):
-    """Enum class that contains QONNX data types to set the quantization annotation.
-    ONNX does not support data types smaller than 8-bit integers, whereas in QONNX we are
-    interested in smaller integers down to ternary and bipolar."""
+if TYPE_CHECKING:
 
-    @staticmethod
-    def get_accumulator_dt_cands() -> list[str]:
-        cands = ["BINARY"]
-        cands += ["UINT%d" % (x + 1) for x in range(64)]
-        cands += ["BIPOLAR", "TERNARY"]
-        cands += ["INT%d" % (x + 1) for x in range(64)]
-        return cands
+    class _DataTypeLookup(Protocol):
+        """The datatype values and accumulator helpers available through DataType."""
 
-    @staticmethod
-    def get_smallest_possible(value: Union[int, float]) -> BaseDataType:
-        """Returns smallest (fewest bits) possible DataType that can represent
-        value. Prefers unsigned integers where possible."""
-        if not int(value) == value:
-            return DataType["FLOAT32"]
-        cands = DataType.get_accumulator_dt_cands()
-        for cand in cands:
-            dt = DataType[cand]
-            if (dt.min() <= value) and (value <= dt.max()):
-                return dt
-        raise Exception("Could not find a suitable int datatype for " + str(value))
+        def __getitem__(self, name: str) -> BaseDataType:
+            ...
+
+        def get_accumulator_dt_cands(self) -> list[str]:
+            ...
+
+        def get_smallest_possible(self, value: Union[int, float]) -> BaseDataType:
+            ...
+
+    DataType: _DataTypeLookup
+else:
+
+    class DataType(Enum, metaclass=DataTypeMeta):
+        """Enum class that contains QONNX data types to set the quantization annotation.
+        ONNX does not support data types smaller than 8-bit integers, whereas in QONNX we are
+        interested in smaller integers down to ternary and bipolar."""
+
+        @staticmethod
+        def get_accumulator_dt_cands() -> list[str]:
+            cands = ["BINARY"]
+            cands += ["UINT%d" % (x + 1) for x in range(64)]
+            cands += ["BIPOLAR", "TERNARY"]
+            cands += ["INT%d" % (x + 1) for x in range(64)]
+            return cands
+
+        @staticmethod
+        def get_smallest_possible(value: Union[int, float]) -> BaseDataType:
+            """Returns smallest (fewest bits) possible DataType that can represent
+            value. Prefers unsigned integers where possible."""
+            if not int(value) == value:
+                return DataType["FLOAT32"]
+            cands = DataType.get_accumulator_dt_cands()
+            for cand in cands:
+                dt = DataType[cand]
+                if (dt.min() <= value) and (value <= dt.max()):
+                    return dt
+            raise Exception("Could not find a suitable int datatype for " + str(value))

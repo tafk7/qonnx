@@ -40,10 +40,11 @@ import os
 import re
 import warnings
 import numpy as np
-from typing import TYPE_CHECKING, Any, Callable, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence, TypeVar, cast, overload
 from onnx import GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto
 
 if TYPE_CHECKING:
+    from qonnx.custom_op.base import CustomOp
     from qonnx.transformation.base import Transformation
 
 import qonnx.util.basic as util
@@ -661,6 +662,20 @@ class ModelWrapper:
                 if node_output == old_name:
                     n.output[node_output_index] = new_name
 
+    @overload
+    def get_initializer(self, tensor_name: str, return_dtype: Literal[False] = False) -> np.ndarray | None:
+        ...
+
+    @overload
+    def get_initializer(self, tensor_name: str, return_dtype: Literal[True]) -> tuple[np.ndarray, int] | tuple[None, None]:
+        ...
+
+    @overload
+    def get_initializer(
+        self, tensor_name: str, return_dtype: bool
+    ) -> np.ndarray | tuple[np.ndarray, int] | tuple[None, None] | None:
+        ...
+
     def get_initializer(
         self, tensor_name: str, return_dtype: bool = False
     ) -> np.ndarray | tuple[np.ndarray, int] | tuple[None, None] | None:
@@ -1147,13 +1162,13 @@ class ModelWrapper:
             qa.quant_parameter_tensor_names.append(dt)
             qnt_annotations.append(qa)
 
-    def get_opset_imports(self):
+    def get_opset_imports(self) -> dict[str, int]:
         """Returns a list of imported opsets as a {domain, version} dictionary."""
         return {opset.domain: opset.version for opset in self._model_proto.opset_import}
 
     def get_customop_wrapper(
-        self, node, fallback_customop_version=util.get_preferred_qonnx_opset()
-    ):
+        self, node: NodeProto, fallback_customop_version: int = util.get_preferred_qonnx_opset()
+    ) -> CustomOp:
         """Return CustomOp instance for given node, respecting the
         imported opset version in the model protobuf. If the node's domain
         is not found in the model's opset imports, fallback_customop_version
@@ -1170,7 +1185,7 @@ class ModelWrapper:
             )
             return getCustomOp(node, onnx_opset_version=fallback_customop_version)
 
-    def set_opset_import(self, domain, version):
+    def set_opset_import(self, domain: str, version: int) -> None:
         """Sets the opset version for a given domain in the model's opset imports.
         If the domain already exists, its version will be updated. If not, a new
         opset import will be added.

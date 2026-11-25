@@ -301,7 +301,7 @@ class CustomOp(ABC):
         pass
 
     @abstractmethod
-    def verify_node(self) -> None:
+    def verify_node(self) -> list[str] | None:
         """Verifies that all attributes the node needs are there and
         that particular attributes are set correctly. Also checks if
         the number of inputs is equal to the expected number."""

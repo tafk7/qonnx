@@ -389,5 +389,5 @@ class FloatQuant(CustomOp):
             return unbounded(nan)
         return Range(-end, end, True)
 
-    def verify_node(self):
+    def verify_node(self) -> None:
         pass
