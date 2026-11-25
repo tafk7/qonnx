@@ -54,6 +54,17 @@ defines one: its ``largest`` finite value, and ``nearest(value)``, an exact valu
 once into the format by IEEE 754's round to nearest, ties to even. ``BINARY16``,
 ``BINARY32``, ``BINARY64`` and ``BFLOAT16`` are the formats of ONNX's float element types.
 FLOAT16's and FLOAT32's bounds come from their formats' ``largest``.
+
+allowed
+-------
+``allowed(value)`` keeps its meaning: for an integer, bipolar, ternary or fixed-point
+datatype, whether a number is one of the datatype's values. For these datatypes it is
+decided exactly for Python and numpy integers and floats of every width, and for arrays
+of them, object arrays included. In an object array a bool counts as the integer it
+equals, as it does on its own, and an element that is no number is not allowed. The float
+datatypes' ``allowed`` is unchanged: FLOAT32 and FLOAT16 allow every value, and
+FLOAT<e,m,b> keeps its float32-based test. Past the envelope, and for any other kind of
+input, ``allowed`` answers as it always has.
 """
 
 import math
@@ -62,7 +73,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from fractions import Fraction
-from typing import Optional, Union
+from functools import lru_cache
+from typing import Callable, Optional, Union
 
 # The envelope: the widest INT, UINT, FIXED, SCALEDINT or FLOAT<e,m,b>, and a FIXED's
 # most fraction bits and integer bits (float64's exponents).
@@ -209,6 +221,58 @@ def _at_least(bound: Union[int, Fraction]) -> float:
     return -_at_most(-bound)
 
 
+@lru_cache(maxsize=4096)
+def _at_most_in(dtype: np.dtype, bound: Union[int, Fraction]) -> np.floating:
+    """The greatest value of the float type ``dtype`` (at most 64 bits) not above ``bound``
+    (``-inf`` when there is none). Kept per type and bound: allowed() asks for the same
+    ones on every call."""
+    wide = _at_most(bound)
+    with np.errstate(over="ignore"):
+        found = dtype.type(wide)
+    if float(found) > wide:
+        found = np.nextafter(found, dtype.type(-np.inf))
+    return found
+
+
+def _at_least_in(dtype: np.dtype, bound: Union[int, Fraction]) -> np.floating:
+    """The least value of the float type ``dtype`` (at most 64 bits) not below ``bound``
+    (``inf`` when there is none)."""
+    return -_at_most_in(dtype, -bound)
+
+
+def _float64_exact(bound: Union[int, Fraction]) -> bool:
+    """Whether float64 holds ``bound`` exactly (and so does every wider float type)."""
+    try:
+        return float(bound) == bound
+    except OverflowError:
+        return False
+
+
+@lru_cache(maxsize=4096)
+def _fixed_point_bounds(bits: int, fraction: int) -> tuple[Union[int, Fraction], Union[int, Fraction]]:
+    """FIXED's exact bounds for a width and its fraction bits, kept: building them costs
+    more than allowed() on a small array."""
+    top, scale = 1 << (bits - 1), 1 << fraction
+    return _rational(Fraction(-top, scale)), _rational(Fraction(top - 1, scale))
+
+
+@lru_cache(maxsize=4096)
+def _fixed_point_limits(dtype: np.dtype, bits: int, fraction: int) -> tuple[np.floating, np.floating]:
+    """FIXED's bounds in the float type ``dtype``, kept per type and FIXED."""
+    least, greatest = _fixed_point_bounds(bits, fraction)
+    return _at_least_in(dtype, least), _at_most_in(dtype, greatest)
+
+
+@lru_cache(maxsize=4096)
+def _scale_in(dtype: np.dtype, bits: int, fraction: int) -> Optional[np.floating]:
+    """2**fraction in the float type ``dtype``, when it is a normal value there and the
+    codes of a ``bits``-wide FIXED are all finite in it; else None."""
+    info = np.finfo(dtype)
+    if bits >= info.maxexp or not info.minexp <= fraction < info.maxexp:
+        return None
+    return dtype.type(2.0**fraction)
+
+
 def _multiples(values: np.ndarray, power: Union[int, np.ndarray]) -> np.ndarray:
     """Whether each finite float64 is an integer multiple of ``2**power``.
 
@@ -242,6 +306,78 @@ def _keeps_range(datatype: "BaseDataType", family: type) -> bool:
     """Whether a datatype keeps its family's min() and max(). A subclass defined elsewhere
     that redefines them states its own range, and its bounds() reads them exactly."""
     return type(datatype).min is family.min and type(datatype).max is family.max
+
+
+def _each(values: np.ndarray, test: Callable[[object], bool]) -> np.ndarray:
+    """``test`` of each element, as a bool array of ``values``' shape."""
+    found = np.fromiter((test(value) for value in values.flat), np.bool_, values.size)
+    return found.reshape(values.shape)
+
+
+def _between(values: np.ndarray, least: Union[int, Fraction], greatest: Union[int, Fraction]) -> np.ndarray:
+    """Whether each element of an integer array lies in ``[least, greatest]``, exactly:
+    both ends are first rounded inward to integers and brought within the array's own
+    integer type."""
+    info = np.iinfo(values.dtype)
+    least, greatest = max(math.ceil(least), int(info.min)), min(math.floor(greatest), int(info.max))
+    if least > greatest:
+        return np.zeros(values.shape, dtype=np.bool_)
+    kind = values.dtype.type
+    # An end at the type's own limit holds for every element: no comparison for it.
+    if least == info.min:
+        if greatest == info.max:
+            return np.ones(values.shape, dtype=np.bool_)
+        return values <= kind(greatest)
+    if greatest == info.max:
+        return values >= kind(least)
+    return (values >= kind(least)) & (values <= kind(greatest))
+
+
+def _allowed_read(value: object) -> Optional[_Exact]:
+    """An element of an object array as ``allowed`` reads it: a bool as the integer it
+    equals, a number exactly, anything else as no number (None)."""
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    return _exact(value)
+
+
+def _exact_allowed(datatype: "BaseDataType", value: object) -> Optional[np.ndarray]:
+    """``allowed``'s answer decided exactly, as a bool array of ``value``'s shape (0-d for
+    a scalar). None for what is left to the original test: a datatype past the envelope,
+    and any input but a Python or numpy integer or float, or an array of them or of
+    objects."""
+    try:
+        datatype.bounds()
+    except ValueError:
+        return None
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind == "O":
+            return _each(value, lambda element: datatype._holds(_allowed_read(element)))
+        if value.dtype.kind in "iuf":
+            return np.asarray(datatype._contains_array(value))
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return np.asarray(datatype._holds(_exact(value)))
+    return None
+
+
+def _rounded_allowed(least: Union[int, float], greatest: Union[int, float], value: object) -> object:
+    """``IntType.allowed``'s original test of an integer range, for a fixed point's inputs
+    that are not decided exactly: rounding leaves the value as it is, and it lies within
+    the range as numpy compares them."""
+    value_is_integer = np.round(value) == value
+    value_is_bounded = np.logical_and(least <= value, value <= greatest)
+    return np.logical_and(value_is_integer, value_is_bounded)
+
+
+def _is_integral(value: object) -> bool:
+    """Whether ``value`` is a Python or numpy integer (not a bool) or an integer array:
+    the inputs ``np.isin`` mishandles for an unsigned 64-bit type on numpy 1.x."""
+    if isinstance(value, np.ndarray):
+        return value.dtype.kind in "iu"
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
 
 
 class BaseDataType(ABC):
@@ -296,6 +432,51 @@ class BaseDataType(ABC):
         if not (_finite(least) and _finite(greatest)):
             raise ValueError(f"{self} has no finite bounds")
         return least, greatest
+
+    # Exact membership: the private tests allowed() runs on. A family defines _holds, and
+    # may define _integers and _floats to decide whole arrays without leaving numpy.
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        """Whether one exactly read value (None for no number) is a member."""
+        raise NotImplementedError(f"{type(self).__name__} decides no membership exactly")
+
+    def _contains_array(self, values: np.ndarray) -> np.ndarray:
+        """Whether each element of an array is a member, exactly, as a bool array of its
+        shape: integer and float arrays as numbers, an object array element by element;
+        an array of any other kind holds no member."""
+        kind = values.dtype.kind
+        if kind in "iu":
+            return self._integers(values)
+        if kind == "f":
+            with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+                if values.dtype.itemsize <= 8:
+                    # float16 arithmetic is slow in numpy; float32 holds its values.
+                    if values.dtype.itemsize < 4:
+                        values = values.astype(np.float32)
+                    return np.asarray(self._floats(values), dtype=np.bool_)
+                return np.asarray(self._wide_floats(values), dtype=np.bool_)
+        if kind == "O":
+            return _each(values, lambda value: self._holds(_exact(value)))
+        return np.zeros(values.shape, dtype=np.bool_)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        """Membership of each element of an integer array."""
+        return _each(values, lambda value: self._holds(_exact(value)))
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        """Membership of each element of a float array of at most 64 bits."""
+        return _each(values, lambda value: self._holds(_exact(value)))
+
+    def _wide_floats(self, values: np.ndarray) -> np.ndarray:
+        """Membership of each element of a float array wider than 64 bits (longdouble):
+        the elements float64 holds exactly are decided with it, the rest one at a time."""
+        narrow = values.astype(np.float64)
+        found = np.asarray(self._floats(narrow), dtype=np.bool_)
+        kept = (narrow.astype(values.dtype) == values) | np.isnan(narrow)
+        if not kept.all():
+            found = found.copy()
+            found[~kept] = _each(values[~kept], lambda value: self._holds(_exact(value)))
+        return found
 
     @abstractmethod
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
@@ -565,9 +746,36 @@ class IntType(BaseDataType):
         return 0, (1 << bits) - 1
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
+        found = _exact_allowed(self, value)
+        if found is not None:
+            return found[()] if found.ndim == 0 else found
         value_is_integer = np.round(value) == value
         value_is_bounded = np.logical_and(self.min() <= value, value <= self.max())
         return np.logical_and(value_is_integer, value_is_bounded)
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        least, greatest = self.bounds()
+        return isinstance(value, int) and least <= value <= greatest
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _between(values, *self.bounds())
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        # In the array's own float type: its bounds there are exact for its values.
+        least, greatest = self.bounds()
+        low, high = _at_least_in(values.dtype, least), _at_most_in(values.dtype, greatest)
+        found = (np.floor(values) == values) & (values >= low) & (values <= high)
+        if not (np.isfinite(low) and np.isfinite(high)):
+            found &= np.isfinite(values)
+        return found
+
+    def _wide_floats(self, values: np.ndarray) -> np.ndarray:
+        # In the array's own type where float64 holds both bounds: then so does it.
+        least, greatest = self.bounds()
+        if not (_float64_exact(least) and _float64_exact(greatest)):
+            return super()._wide_floats(values)
+        low, high = values.dtype.type(float(least)), values.dtype.type(float(greatest))
+        return (np.rint(values) == values) & (values >= low) & (values <= high)
 
     def get_num_possible_values(self) -> int:
         return int(abs(self.min()) + abs(self.max()) + 1)
@@ -618,7 +826,18 @@ class BipolarType(BaseDataType):
         return -1, 1
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
+        if _is_integral(value):
+            return _exact_allowed(self, value)
         return np.isin(value, [-1, +1])
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        return isinstance(value, int) and value in (-1, 1)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _between(values, -1, 1) & (values != 0)
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        return (values == -1.0) | (values == 1.0)
 
     def get_num_possible_values(self) -> int:
         return 2
@@ -653,7 +872,18 @@ class TernaryType(BaseDataType):
         return -1, 1
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
+        if _is_integral(value):
+            return _exact_allowed(self, value)
         return np.isin(value, [-1, 0, +1])
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        return isinstance(value, int) and value in (-1, 0, 1)
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        return _between(values, -1, 1)
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        return (values == -1.0) | (values == 0.0) | (values == 1.0)
 
     def get_num_possible_values(self) -> int:
         return 3
@@ -710,12 +940,63 @@ class FixedPointType(IntType):
                 f"{self} is past the envelope: at most {_MAX_FRACTION_BITS} fraction bits "
                 f"and {_MAX_INTEGER_BITS} integer bits"
             )
-        top, scale = 1 << (bits - 1), 1 << fraction
-        return _rational(Fraction(-top, scale)), _rational(Fraction(top - 1, scale))
+        return _fixed_point_bounds(bits, fraction)
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
+        found = _exact_allowed(self, value)
+        if found is not None:
+            return found[()] if found.ndim == 0 else found
         int_value = value / self.scale_factor()
-        return IntType(self._bitwidth, True).allowed(int_value)
+        codes = IntType(self._bitwidth, True)
+        return _rounded_allowed(codes.min(), codes.max(), int_value)
+
+    def _holds(self, value: Optional[_Exact]) -> bool:
+        if not _finite(value):
+            return False
+        least, greatest = self.bounds()
+        number = Fraction(value)
+        return least <= number <= greatest and (number * (1 << self._fraction())).denominator == 1
+
+    def _integers(self, values: np.ndarray) -> np.ndarray:
+        least, greatest = self.bounds()
+        return _between(values, math.ceil(least), math.floor(greatest))
+
+    def _floats(self, values: np.ndarray) -> np.ndarray:
+        least, greatest = self.bounds()
+        bits, fraction = int(self.bitwidth()), self._fraction()
+        scale = _scale_in(values.dtype, bits, fraction)
+        if scale is None:
+            if values.dtype.itemsize < 8:
+                return self._floats(values.astype(np.float64))
+            on_grid = np.isfinite(values) & _multiples(values, -fraction)
+            return on_grid & (values >= _at_least(least)) & (values <= _at_most(greatest))
+        # In the array's own float type. 2**fraction is a normal value of it, and every
+        # code within the bounds is finite in it, so scaling a value within the bounds by
+        # 2**fraction is exact, but where it underflows: only a nonzero value scaled
+        # below 1 can, which is no code unless it rounds to 0.
+        if _keeps_range(self, FixedPointType):
+            low, high = _fixed_point_limits(values.dtype, bits, fraction)
+        else:
+            low, high = _at_least_in(values.dtype, least), _at_most_in(values.dtype, greatest)
+        codes = values * scale
+        found = (np.floor(codes) == codes) & (values >= low) & (values <= high)
+        if fraction < 0:
+            found &= (codes != 0) | (values == 0)
+        return found
+
+    def _wide_floats(self, values: np.ndarray) -> np.ndarray:
+        # In the array's own type where float64 holds both bounds, and so it does: its
+        # exponents reach past every code within them, so scaling is exact but where a
+        # nonzero value scaled below 1 underflows to 0.
+        least, greatest = self.bounds()
+        if not (_float64_exact(least) and _float64_exact(greatest)):
+            return super()._wide_floats(values)
+        low, high = values.dtype.type(float(least)), values.dtype.type(float(greatest))
+        codes = values * np.ldexp(values.dtype.type(1), self._fraction())
+        found = (np.rint(codes) == codes) & (values >= low) & (values <= high)
+        if self._fraction() < 0:
+            found &= (codes != 0) | (values == 0)
+        return found
 
     def is_integer(self) -> bool:
         return False
