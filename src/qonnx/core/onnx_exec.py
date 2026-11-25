@@ -31,7 +31,6 @@ from __future__ import annotations
 import copy
 import numpy as np
 import onnx.helper as helper
-import onnxruntime as rt
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -41,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 import qonnx.analysis.topology as ta
 import qonnx.core.execute_custom_node as ex_cu_node
+from qonnx.core import _sessions
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.util.basic import get_preferred_qonnx_opset, get_sanitize_quant_tensors, qonnx_make_model, sanitize_quant_values
 
@@ -100,6 +100,33 @@ def exact_integers(enabled: bool = True) -> Iterator[None]:
     yields inside the block leaves the setting in force for its caller until it is
     resumed past the block or closed; yielding inside the block is unsupported."""
     with _switched(enabled):
+        yield
+
+
+@contextmanager
+def reuse_sessions(threads: int | None = None) -> Iterator[None]:
+    """Reuses ONNX Runtime sessions in every execution the block runs, nested ones
+    included. By default each standard node runs a fresh session, with ONNX Runtime's
+    default thread pools; inside the block, the session of a stateless node model is
+    retained and reused while the same model runs again, and where threads is given,
+    every session the execution constructs (custom ops' own included) caps both of
+    ONNX Runtime's thread pools at threads.
+
+    One session is retained in all, released before another is constructed and on
+    leaving an outermost block; concurrent blocks (other threads, other tasks) share
+    it. So reuse pays only for repeated runs of one node model: a graph of several
+    distinct node models constructs a session at each node, as it does without the
+    block. The thread cap applies to every session either way. Random and seeded ops
+    (Dropout among them), and any node whose schema cannot show it keeps no state, run
+    a fresh session every time. threads must be an int in [1, 2147483647] (TypeError,
+    ValueError).
+
+    The setting belongs to the current context, as any context variable's does: each
+    thread and each asyncio task has its own, a generator does not. A generator that
+    yields inside the block leaves the setting in force, and the session retained, for
+    its caller until it is resumed past the block or closed; yielding inside the block
+    is unsupported."""
+    with _sessions.reusing(threads):
         yield
 
 
@@ -597,7 +624,7 @@ def execute_node(
             input_dict[inp] = value
 
         try:
-            sess = rt.InferenceSession(node_model.SerializeToString())
+            sess = _sessions.session(node_model)
         except RuntimeNotImplemented as error:
             if not widened:
                 raise

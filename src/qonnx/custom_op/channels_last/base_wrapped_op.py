@@ -27,11 +27,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
-import onnxruntime as rt
 from copy import deepcopy
-from onnx import TensorProto, helper
+from onnx import GraphProto, TensorProto, helper
 from onnx.helper import make_opsetid
+from typing import Any
 
+from qonnx.core import _sessions
 from qonnx.custom_op.base import CustomOp
 from qonnx.util.basic import qonnx_make_model
 
@@ -85,7 +86,7 @@ class ChannelsLastWrappedOp(CustomOp):
 
         return result
 
-    def execute_node(self, context, graph):
+    def execute_node(self, context: dict[str, Any], graph: GraphProto) -> None:
         node = self.onnx_node
 
         # Get opset
@@ -132,7 +133,7 @@ class ChannelsLastWrappedOp(CustomOp):
         # using the transposed inputs / outputs
         intermediate_graph = helper.make_graph([intermediate_node], "test_model", input_tensor_list, output_tensor_list)
         intermediate_model = qonnx_make_model(intermediate_graph, **onnx_kwargs)
-        sess = rt.InferenceSession(intermediate_model.SerializeToString())
+        sess = _sessions.session(intermediate_model)
         output_list = sess.run(None, input_dict)
         output_onnx = output_list[0]
 

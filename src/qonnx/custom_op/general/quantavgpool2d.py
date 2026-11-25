@@ -27,10 +27,10 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
-import onnxruntime as rt
 from onnx import GraphProto, TensorProto, helper
 from typing import Any
 
+from qonnx.core import _sessions
 from qonnx.core.datatype import DataType
 from qonnx.core.onnx_exec import exact_integers_enabled
 from qonnx.custom_op.base import CustomOp
@@ -143,7 +143,7 @@ class QuantAvgPool2d(CustomOp):
         onnx_kwargs = {"opset_imports": opset_imports}
         model_avgpool = qonnx_make_model(graph_avgpool, **onnx_kwargs)
         idict = {node.input[0]: inp_values}
-        sess = rt.InferenceSession(model_avgpool.SerializeToString())
+        sess = _sessions.session(model_avgpool)
         result_temp = sess.run(None, idict)
         # remove scaling introduced by average
         result_temp = np.round(result_temp[0] * (k * k))
