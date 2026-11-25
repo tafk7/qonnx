@@ -107,6 +107,15 @@ carried as its codes (``carried_as_codes()``): ``int64`` holding the value times
 ``2**(w - i)``, given to ``codes`` and returned by ``values`` alike. ``to_numpy_dt()``
 keeps its answers (``float32`` for every fixed point); ``FIXED<32,16>.values(16777217)``
 is ``256.0000152587890625``, where float32 holds only ``256.0``.
+
+Rounded conversion
+------------------
+``round_to(target, values)`` rounds each value to the nearest one an IEEE float datatype
+(FLOAT16 or FLOAT32) holds, by IEEE 754's round to nearest, ties to even, applied once to
+the exact value. A magnitude at least the largest finite value plus half its spacing
+becomes the infinity of its sign; an infinity stays; a NaN stays a NaN, its payload not
+kept; a zero keeps its sign. Only an IEEE float datatype is a target. Membership and codes
+never round; rounding is only ever asked for.
 """
 
 import math
@@ -1484,6 +1493,58 @@ def resolve_datatype(name: str) -> BaseDataType:
             raise KeyError("Could not resolve DataType " + name)
     else:
         raise KeyError("Could not resolve DataType " + name)
+
+
+def _ieee_format(target: BaseDataType) -> Optional[FloatFormat]:
+    """The binary format of an IEEE float datatype; None for any other datatype."""
+    if isinstance(target, FloatType):
+        return BINARY32
+    if isinstance(target, Float16Type):
+        return BINARY16
+    return None
+
+
+def round_to(target: BaseDataType, values: object) -> np.ndarray:
+    """Returns each value rounded once, from its exact value, to the nearest value of the
+    IEEE float datatype ``target`` (FLOAT16 or FLOAT32), in ``target.container()``: IEEE
+    754's round to nearest, ties to even. A magnitude at least the largest finite value
+    plus half its spacing becomes the infinity of its sign; an infinity stays; a NaN stays
+    a NaN, its payload not kept; a zero keeps its sign. Raises ValueError for a target that
+    is no IEEE float datatype, and TypeError for a value that is no number."""
+    fmt = _ieee_format(target)
+    if fmt is None:
+        raise ValueError(f"{target} is no IEEE float datatype to round to")
+    container = target.container()
+    array = values if isinstance(values, np.ndarray) else np.asarray(values, dtype=object)
+    kind = array.dtype.kind
+    if kind == "f" and array.dtype.itemsize <= 8:
+        # float16 and float32 widen to float64 exactly; numpy rounds float64 to the
+        # target once. A wider float (longdouble) is rounded from its exact value below.
+        with np.errstate(over="ignore"):
+            return array.astype(np.float64).astype(container)
+    if kind in "iu" and (not array.size or max(-int(array.min()), int(array.max())) <= 1 << 53):
+        with np.errstate(over="ignore"):
+            return array.astype(np.float64).astype(container)
+    if kind not in "iufO":
+        raise TypeError(f"round_to takes numbers, not {array.dtype}")
+    found = np.empty(array.shape, dtype=container)
+    for index, value in np.ndenumerate(array):
+        found[index] = _nearest(fmt, value)
+    return found
+
+
+def _nearest(fmt: FloatFormat, value: object) -> float:
+    """One value rounded into an IEEE format, as a float (its sign kept on a zero)."""
+    number = _exact(value)
+    if number is None:
+        raise TypeError(f"round_to takes numbers, not {value!r}")
+    if isinstance(number, float):  # an infinity or NaN
+        return number
+    rounded = fmt.nearest(number)
+    if rounded == 0:
+        negative = number < 0 or (isinstance(value, (float, np.floating)) and math.copysign(1, value) < 0)
+        return -0.0 if negative else 0.0
+    return float(Fraction(rounded)) if not isinstance(rounded, float) else rounded
 
 
 class DataTypeMeta(EnumMeta):
