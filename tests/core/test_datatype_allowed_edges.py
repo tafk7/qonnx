@@ -222,7 +222,7 @@ def test_what_allowed_keeps() -> None:
     assert not DataType["BIPOLAR"].allowed("1")
     assert DataType["FLOAT32"].allowed(0.1) and DataType["FLOAT16"].allowed(1e10)
     assert bool(DataType["FLOAT<4,3>"].allowed(1.875)) and not bool(DataType["FLOAT<4,3>"].allowed(1.8))
-    assert DataType["INT5000"].allowed(5)
+    assert IntType(5000, True).allowed(5)
 
 
 class _Byte(IntType):

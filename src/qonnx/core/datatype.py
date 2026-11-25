@@ -116,16 +116,41 @@ the exact value. A magnitude at least the largest finite value plus half its spa
 becomes the infinity of its sign; an infinity stays; a NaN stays a NaN, its payload not
 kept; a zero keeps its sign. Only an IEEE float datatype is a target. Membership and codes
 never round; rounding is only ever asked for.
+
+Names
+-----
+``resolve_datatype(name)`` and ``DataType[name]`` read a name as a source spells it:
+``UINT1`` is ``BINARY``, ``FLOAT<5,10>`` is ``FLOAT<5,10,15>`` and ``FIXED<8, 4>`` is
+``FIXED<8,4>``. A parameter's leading zeros are not significant, however many there are.
+An explicit exponent bias of 0 is kept: ``FLOAT<5,10,0>`` is not ``FLOAT<5,10,15>``.
+
+A name with a zero or negative width or parameter (``INT0``, ``INT-3``, ``FLOAT<0,3>``),
+or one past the envelope (``INT5000``; see "Bounds"), still resolves, with a
+``DataTypeWarning``. It is a ``FutureWarning``, shown by default, because such names
+reach users through their model files rather than their code. A later release refuses
+them.
+
+``resolve_datatype(name, canonical=True)`` resolves only the canonical name of a datatype
+within the envelope, the one ``get_canonical_name()`` gives, as a stored annotation holds
+it. Any other name raises ``KeyError``: another spelling (``UINT1``, ``FLOAT<5,10>``), a
+nonsense width, a name past the envelope, or a malformed name.
 """
 
 import math
 import numpy as np
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from fractions import Fraction
 from functools import lru_cache
 from typing import Callable, Optional, Union
+
+
+class DataTypeWarning(FutureWarning):
+    """A datatype name was resolved that a later release refuses: a zero or negative
+    width or parameter, or a datatype past the envelope (see the module's docstring)."""
+
 
 # The envelope: the widest INT, UINT, FIXED, SCALEDINT or FLOAT<e,m,b>, and a FIXED's
 # most fraction bits and integer bits (float64's exponents).
@@ -814,8 +839,8 @@ class ArbPrecFloatType(BaseDataType):
         self._exponent_bits = exponent_bits
         self._mantissa_bits = mantissa_bits
 
-        if not exponent_bias:
-            # default (IEEE-style) exponent bias
+        if exponent_bias is None:
+            # default (IEEE-style) exponent bias; an explicit 0 is a bias of 0
             exponent_bias = (2.0 ** (exponent_bits - 1)) - 1
         self._exponent_bias = exponent_bias
 
@@ -1442,12 +1467,23 @@ class ScaledIntType(IntType):
         return "SCALEDINT<%d>" % (self.bitwidth())
 
 
-def resolve_datatype(name: str) -> BaseDataType:
-    if not isinstance(name, str):
-        raise TypeError(
-            f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'"
-        )
+def _parameter(text: str) -> int:
+    """``int(text)``; a parameter with more digits than ``int`` reads is read by its
+    significant digits, its leading zeros dropped."""
+    try:
+        return int(text)
+    except ValueError:
+        digits = text.strip()
+        sign = digits[:1] if digits[:1] in ("+", "-") else ""
+        digits = digits[len(sign) :]
+        significant = digits.lstrip("0") or "0"
+        if not (digits.isascii() and digits.isdigit() and len(significant) < len(digits)):
+            raise
+    return int(sign + significant)
 
+
+def _construct(name: str) -> BaseDataType:
+    """The datatype a name spells, parsed as resolve_datatype always has."""
     _special_types = {
         "BINARY": IntType(1, False),
         "BIPOLAR": BipolarType(),
@@ -1458,41 +1494,95 @@ def resolve_datatype(name: str) -> BaseDataType:
     if name in _special_types.keys():
         return _special_types[name]
     elif name.startswith("UINT"):
-        bitwidth = int(name.replace("UINT", ""))
+        bitwidth = _parameter(name.replace("UINT", ""))
         return IntType(bitwidth, False)
     elif name.startswith("INT"):
-        bitwidth = int(name.replace("INT", ""))
+        bitwidth = _parameter(name.replace("INT", ""))
         return IntType(bitwidth, True)
     elif name.startswith("FIXED"):
         name = name.replace("FIXED<", "")
         name = name.replace(">", "")
         nums = name.split(",")
-        bitwidth = int(nums[0].strip())
-        intwidth = int(nums[1].strip())
+        bitwidth = _parameter(nums[0].strip())
+        intwidth = _parameter(nums[1].strip())
         return FixedPointType(bitwidth, intwidth)
     elif name.startswith("SCALEDINT"):
         name = name.replace("SCALEDINT<", "")
         name = name.replace(">", "")
         nums = name.split(",")
-        bitwidth = int(nums[0].strip())
+        bitwidth = _parameter(nums[0].strip())
         return ScaledIntType(bitwidth)
     elif name.startswith("FLOAT<"):
         name = name.replace("FLOAT<", "")
         name = name.replace(">", "")
         nums = name.split(",")
         if len(nums) == 2:
-            exp_bits = int(nums[0].strip())
-            mant_bits = int(nums[1].strip())
+            exp_bits = _parameter(nums[0].strip())
+            mant_bits = _parameter(nums[1].strip())
             return ArbPrecFloatType(exp_bits, mant_bits)
         elif len(nums) == 3:
-            exp_bits = int(nums[0].strip())
-            mant_bits = int(nums[1].strip())
-            exp_bias = int(nums[2].strip())
+            exp_bits = _parameter(nums[0].strip())
+            mant_bits = _parameter(nums[1].strip())
+            exp_bias = _parameter(nums[2].strip())
             return ArbPrecFloatType(exp_bits, mant_bits, exp_bias)
         else:
             raise KeyError("Could not resolve DataType " + name)
     else:
         raise KeyError("Could not resolve DataType " + name)
+
+
+def _nonsense(datatype: BaseDataType) -> Optional[str]:
+    """Why a resolved datatype is one a later release refuses (a zero or negative width
+    or parameter, or past the envelope); None for any other."""
+    try:
+        if isinstance(datatype, ScaledIntType):
+            _valued_width(datatype, datatype.bitwidth())
+        else:
+            datatype.bounds()
+    except ValueError as reason:
+        return str(reason)
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _nonsense_name(name: str) -> Optional[str]:
+    """_nonsense of the datatype a name spells, kept per name: resolution is frequent."""
+    return _nonsense(_construct(name))
+
+
+def _resolve(name: str, canonical: bool, stacklevel: int) -> BaseDataType:
+    """The one resolution path of resolve_datatype and DataType[name]."""
+    if not isinstance(name, str):
+        raise TypeError(f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'")
+    if not canonical:
+        found = _construct(name)
+        reason = _nonsense_name(name)
+        if reason is not None:
+            warnings.warn(
+                f"DataType {name!r} is deprecated ({reason}); a later release refuses it",
+                DataTypeWarning,
+                stacklevel=stacklevel,
+            )
+        return found
+    try:
+        found = _construct(name)
+    except (KeyError, IndexError, AssertionError, ValueError, OverflowError) as error:
+        raise KeyError(f"{name!r} is no canonical DataType name") from error
+    reason = _nonsense_name(name)
+    if reason is not None:
+        raise KeyError(f"{name!r} is no canonical DataType name: {reason}")
+    if found.get_canonical_name() != name:
+        raise KeyError(f"{name!r} is not a canonical DataType name; it denotes {found.get_canonical_name()}")
+    return found
+
+
+def resolve_datatype(name: str, canonical: bool = False) -> BaseDataType:
+    """Returns the datatype a name denotes. By default the name is read as a source
+    spells it (UINT1 is BINARY, FLOAT<5,10> is FLOAT<5,10,15>), and a name a later release
+    refuses resolves with a DataTypeWarning. With canonical=True only the canonical name of
+    a datatype within the envelope resolves, as a stored annotation holds it; any other
+    name raises KeyError (see the module's docstring)."""
+    return _resolve(name, canonical, stacklevel=3)
 
 
 def _ieee_format(target: BaseDataType) -> Optional[FloatFormat]:
@@ -1549,7 +1639,7 @@ def _nearest(fmt: FloatFormat, value: object) -> float:
 
 class DataTypeMeta(EnumMeta):
     def __getitem__(self, name: str) -> BaseDataType:
-        return resolve_datatype(name)
+        return _resolve(name, False, stacklevel=3)
 
 
 class DataType(Enum, metaclass=DataTypeMeta):

@@ -94,7 +94,7 @@ def test_the_float64_edge() -> None:
     assert edge.bounds()[1] == 2**1024 - 2**971
     assert edge.max() == 1.7976931348623157e308 and edge.min() == -1.7976931348623157e308
     with pytest.raises(ValueError):
-        DataType["FLOAT<1,53,-1022>"].bounds()
+        ArbPrecFloatType(1, 53, -1022).bounds()
 
 
 def test_a_scaled_integer_has_no_bounds() -> None:

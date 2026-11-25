@@ -212,10 +212,13 @@ def test_refusals() -> None:
         DataType["TERNARY"].values(2)
     with pytest.raises(ValueError):
         DataType["FLOAT32"].codes(0.1)
-    for name in ("INT65", "FIXED<65,1>", "FLOAT<5,10,15>", "SCALEDINT<8>", "INT5000"):
-        for operation in (DataType[name].codes, DataType[name].values):
+    for found in (DataType["INT65"], DataType["FIXED<65,1>"], DataType["FLOAT<5,10,15>"], DataType["SCALEDINT<8>"]):
+        for operation in (found.codes, found.values):
             with pytest.raises(ValueError):
                 operation(0)
+    for operation in (IntType(5000, True).codes, IntType(5000, True).values):
+        with pytest.raises(ValueError):
+            operation(0)
 
 
 def test_bipolar_and_ternary_codes() -> None:
@@ -283,11 +286,13 @@ def test_to_numpy_dt_keeps_its_answers() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["INT65", "UINT128", "INT5000", "FIXED<65,1>", "SCALEDINT<8>", "FLOAT<8,24,127>", "FLOAT<9,7,255>"],
+    ["INT65", "UINT128", "FIXED<65,1>", "SCALEDINT<8>", "FLOAT<8,24,127>", "FLOAT<9,7,255>"],
 )
 def test_no_container_where_none_is_exact(name: str) -> None:
     with pytest.raises(ValueError):
         DataType[name].container()
+    with pytest.raises(ValueError):
+        IntType(5000, True).container()
 
 
 @pytest.mark.parametrize(
