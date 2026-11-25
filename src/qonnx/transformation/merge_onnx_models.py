@@ -29,6 +29,7 @@ import copy
 import warnings
 from onnx import helper
 
+from qonnx.core import metadata
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.general import (
@@ -48,7 +49,10 @@ class MergeONNXModels(Transformation):
     the model the transformation is applied on, the resulting model is returned.
     This transformation will try to connect graph.output[0] of the pre model and
     graph.input[0] of the post model.
-    If more than one input or output exists, a warning is raised."""
+    If more than one input or output exists, a warning is raised.
+    The merged graph keeps both graphs' metadata: on a key both state, the post
+    model's value wins, but a typed metadata key (qonnx.core.metadata) the two
+    state differently raises MetadataError."""
 
     def __init__(self, pre_model):
         super().__init__()
@@ -56,7 +60,7 @@ class MergeONNXModels(Transformation):
         # the other model to ensure that it stays unchanged
         self.pre_model = copy.deepcopy(pre_model)
 
-    def apply(self, model):
+    def apply(self, model: ModelWrapper) -> tuple[ModelWrapper, bool]:
         graph_modified = False
         pre_model = self.pre_model
         post_model = copy.deepcopy(model)
@@ -160,6 +164,11 @@ class MergeONNXModels(Transformation):
             new_model.graph.initializer.append(i)
         for qa in qa_new:
             new_model.graph.quantization_annotation.append(qa)
+        # graph metadata: both models', the main model's winning on an untyped key
+        # both state; a typed key (qonnx.core.metadata) stated differently refuses
+        new_model.graph.metadata_props.extend(
+            metadata.merge(post_model.graph.metadata_props, pre_model.graph.metadata_props)
+        )
 
         # tidy-up new model
         model = new_model
