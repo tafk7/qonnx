@@ -289,26 +289,95 @@ def _resolve_version(
     )
 
 
-def add_op_to_domain(domain: str, op_class: Type[CustomOp]) -> None:
+def _checked_op_type(op_type: object, owner: str = "") -> str:
+    """op_type where it is a nonempty str; ValueError naming it otherwise."""
+    if not isinstance(op_type, str) or not op_type:
+        raise ValueError(f"{owner}op_type must be a nonempty string, not {op_type!r}")
+    return op_type
+
+
+def _checked_op_version(op_version: object, owner: str = "") -> int:
+    """op_version where it is a positive int; ValueError naming it otherwise."""
+    if type(op_version) is not int or op_version < 1:
+        raise ValueError(f"{owner}op_version must be a positive integer, not {op_version!r}")
+    return op_version
+
+
+def op_identity(cls: Type[CustomOp], op_type: Optional[str] = None, op_version: Optional[int] = None) -> Tuple[str, int]:
+    """The (op_type, since-version) a class is registered under by the explicit
+    registration paths: op_type and op_version where given, else what the class
+    states, else what its name gives.
+
+    A class may state ``op_type`` and ``op_version`` in its own body
+    (``op_type = "MatMul"``, ``op_version = 6``). A statement is not inherited: a
+    subclass that states neither is identified by its own name. What a class does
+    not state comes from its name, by the rule ``add_op_to_domain`` uses (``Op_v2``
+    is op type ``Op`` at version 2; a name without that suffix is the op type, at
+    version 1).
+
+    This is the rule of the explicit registration paths only. A domain module's
+    exports are discovered by their names alone, and a class body is never read
+    there.
+
+    A field given is not read from the class, so a class whose body holds something
+    else under that name (an op_type property, say) can be registered by giving it.
+
+    Raises:
+        ValueError: If op_type or op_version is given malformed, or if the class
+            states one that is not given and it is not a nonempty string or a
+            positive integer
+    """
+    own = vars(cls)
+    owner = f"{cls.__name__}."
+    if op_type is not None:
+        op_type = _checked_op_type(op_type)
+    elif "op_type" in own:
+        op_type = _checked_op_type(own["op_type"], owner)
+    else:
+        op_type = _get_op_type_for_class(cls)
+    if op_version is not None:
+        op_version = _checked_op_version(op_version)
+    elif "op_version" in own:
+        op_version = _checked_op_version(own["op_version"], owner)
+    else:
+        op_version = _get_op_version_for_class(cls)
+    return op_type, op_version
+
+
+def add_op_to_domain(
+    domain: str, op_class: Type[CustomOp], op_type: Optional[str] = None, op_version: Optional[int] = None
+) -> None:
     """Register a custom op directly to a domain at runtime.
 
-    The op_type and version are automatically derived from the class name.
-    Useful for testing and experimentation. For production, define CustomOps
-    in the appropriate module file.
+    The op_type and version are derived from the class name, unless given as
+    op_type and op_version. Useful for testing and experimentation. For production,
+    define CustomOps in the appropriate module file.
+
+    A registered op type is served from the registry: the domain's module is not
+    imported for it. A later registration of the same op type and version replaces
+    the earlier one; its other versions stay.
 
     Args:
         domain: ONNX domain name (e.g., "qonnx.custom_op.general")
         op_class: CustomOp subclass (version inferred from name)
+        op_type: The op type to register op_class as, instead of the one its name gives
+        op_version: The since-version to register op_class at, instead of the one its
+            name gives
+
+    Raises:
+        ValueError: If op_class is not a CustomOp subclass, op_type is not a nonempty
+            string, or op_version is not a positive integer
 
     Example:
         add_op_to_domain("qonnx.custom_op.general", MyTestOp)      # v1
         add_op_to_domain("qonnx.custom_op.general", MyTestOp_v2)  # v2
+        add_op_to_domain("my.domain", MyOp, op_type="Op", op_version=3)
     """
     if not issubclass(op_class, CustomOp):
         raise ValueError(f"{op_class} must be a subclass of CustomOp")
 
-    op_type = _get_op_type_for_class(op_class)
-    op_version = _get_op_version_for_class(op_class)
+    op_type = _get_op_type_for_class(op_class) if op_type is None else _checked_op_type(op_type)
+    op_version = _get_op_version_for_class(op_class) if op_version is None else _checked_op_version(op_version)
 
     with _REGISTRY_LOCK:
         # Ensure nested dict structure exists
@@ -456,6 +525,62 @@ def hasCustomOp(domain: str, op_type: str) -> bool:
     return is_custom_op(domain, op_type)
 
 
+def _exported_versions(module: object) -> List[Tuple[str, int]]:
+    """The (op_type, since-version) of each CustomOp class a domain module exports,
+    read as get_ops_in_domain reads them: its ``__all__`` entries, else its classes,
+    each by its class name."""
+    if hasattr(module, "__all__"):
+        candidates = [getattr(module, name, None) for name in getattr(module, "__all__")]
+    else:
+        candidates = [obj for _, obj in inspect.getmembers(module, inspect.isclass)]
+    return [
+        (_get_op_type_for_class(obj), _get_op_version_for_class(obj))
+        for obj in candidates
+        if inspect.isclass(obj) and issubclass(obj, CustomOp) and obj is not CustomOp
+    ]
+
+
+def get_domain_opset_version(domain: str) -> int:
+    """The opset version of a custom op domain: the version a model using the
+    domain's newest ops imports it at.
+
+    A domain module may state it (``opset_version = N``). Otherwise it is the
+    highest since-version among the ops registered to the domain and those its
+    module exports. The module's exports are all read, as get_ops_in_domain reads
+    them.
+
+    Args:
+        domain: ONNX domain name
+
+    Returns:
+        The domain's opset version
+
+    Raises:
+        KeyError: If the domain has no module and no registered op
+        ValueError: If a stated opset_version is not an integer or is below an op's
+            since-version
+    """
+    with _REGISTRY_LOCK:
+        versions = [max(found) for found in _OP_REGISTRY.get(domain, {}).values() if found]
+        try:
+            module = importlib.import_module(resolve_domain(domain))
+        except ModuleNotFoundError:
+            module = None
+        if module is None and not versions:
+            raise KeyError(f"Domain '{domain}' has no module and no registered op")
+        stated = getattr(module, "opset_version", None)
+        if module is not None:
+            versions += [version for _, version in _exported_versions(module)]
+        highest = max(versions, default=1)
+        if stated is None:
+            return highest
+        if type(stated) is not int or stated < highest:
+            raise ValueError(
+                f"{domain}.opset_version = {stated!r}: an integer at least its ops' highest since-version {highest}"
+            )
+        return stated
+
+
 def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
     """Get all CustomOp classes available in a domain.
 
@@ -478,6 +603,8 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
     """
     module_path = resolve_domain(domain)
     ops_dict = {}
+    # the version each listed class is listed at: a registered one's registry key
+    listed_versions: Dict[str, int] = {}
 
     with _REGISTRY_LOCK:
         # Strategy 1: Get cached ops (fast path) - use highest version
@@ -486,6 +613,7 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
                 if versions:
                     highest_version = max(versions.keys())
                     ops_dict[op_type] = versions[highest_version]
+                    listed_versions[op_type] = highest_version
 
         # Strategy 2: Discover from module (for uncached ops)
         # This uses full scan since we want ALL ops
@@ -512,11 +640,13 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
                 # Keep highest version only
                 if op_type not in ops_dict:
                     ops_dict[op_type] = obj
+                    listed_versions[op_type] = version
                 else:
                     # Check if this version is higher
-                    existing_version = _get_op_version_for_class(ops_dict[op_type])
+                    existing_version = listed_versions[op_type]
                     if version > existing_version:
                         ops_dict[op_type] = obj
+                        listed_versions[op_type] = version
 
         except ModuleNotFoundError:
             pass  # Domain doesn't exist as module, return cached ops only
