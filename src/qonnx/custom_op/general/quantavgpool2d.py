@@ -32,7 +32,6 @@ from typing import Any
 
 from qonnx.core import _sessions
 from qonnx.core.datatype import DataType
-from qonnx.core.onnx_exec import exact_integers_enabled
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.general.maxpoolnhwc import compute_pool_output_dim
 from qonnx.util.basic import get_preferred_onnx_opset, qonnx_make_model
@@ -113,9 +112,7 @@ class QuantAvgPool2d(CustomOp):
         k = self.get_nodeattr("kernel")
         s = self.get_nodeattr("stride")
         inp_values = context[node.input[0]]
-        if exact_integers_enabled():
-            # Exact integers may give the input in float64; the pooling stays float32,
-            # for ONNX Runtime has no float64 AveragePool.
+        if np.issubdtype(inp_values.dtype, np.floating):
             inp_values = inp_values.astype(np.float32)
         oshape = context[node.output[0]].shape
         if self.get_nodeattr("data_layout") == "NHWC":
