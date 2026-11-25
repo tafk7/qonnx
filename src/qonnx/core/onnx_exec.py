@@ -41,11 +41,29 @@ from typing import TYPE_CHECKING, Any, Iterator, Literal, Mapping, overload
 import qonnx.analysis.topology as ta
 import qonnx.core.execute_custom_node as ex_cu_node
 from qonnx.core import _sessions
+from qonnx.core.findings import Refusal
 from qonnx.custom_op.registry import is_custom_op
 from qonnx.util.basic import get_preferred_qonnx_opset, get_sanitize_quant_tensors, qonnx_make_model, sanitize_quant_values
 
 if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
+
+
+class ExecutionRefused(Refusal):
+    """An execution request whose inputs or settings cannot be admitted."""
+
+
+class ExecutionArithmeticRefused(ExecutionRefused, ArithmeticError):
+    """Exact integer arithmetic exceeds what the float containers can hold."""
+
+
+class ExecutionUnsupported(ExecutionRefused, NotImplementedError):
+    """The requested exact execution has no supported proof or kernel."""
+
+
+class ExecutionValueRefused(ExecutionRefused, ValueError):
+    """An execution value or setting cannot be admitted."""
+
 
 # Whether integers are computed exactly: set by the exact_integers context and the
 # exact_integers= arguments, read by every node executed inside them.
@@ -449,9 +467,11 @@ def _widened(
         if bound <= container:
             return set(), True, {}
         if bound > _DOUBLE:
-            raise ArithmeticError(
+            raise ExecutionArithmeticRefused.of(
+                "exact-beyond-float64",
+                "execute_node",
                 f"{node.name} ({node.op_type}): a bound on its operands, products and partial sums, {bound}, "
-                "passes 2**53, beyond which float64 does not hold every integer exactly"
+                "passes 2**53, beyond which float64 does not hold every integer exactly",
             )
         return set(floats), True, {}
     inputs = [name for name in floats if name in given]
@@ -460,7 +480,7 @@ def _widened(
         return (set() if all(own) else set(floats)), True, {}
     past = [name for name in inputs if _past(given[name], limits[name])]
     if past:
-        raise NotImplementedError(_unproved(node, f"{past[0]} is given a value"))
+        raise ExecutionUnsupported.of("exact-unsupported", "execute_node", _unproved(node, f"{past[0]} is given a value"))
     return set(), True, {name: limits[name] for name in floats if name in node.output}
 
 
@@ -485,9 +505,11 @@ def _read(node: NodeProto, name: str, value: Any, np_type: np.dtype, checked: bo
     read = given.astype(np_type, copy=False)
     if checked and read.dtype != given.dtype and given.dtype.kind in "biuf":
         if not _kept(given, read):
-            raise ArithmeticError(
+            raise ExecutionArithmeticRefused.of(
+                "exact-beyond-float64",
+                "execute_node",
                 f"{node.name} ({node.op_type}): {name} holds a value that {np_type}, the type the node reads it in, "
-                "does not hold exactly"
+                "does not hold exactly",
             )
     return read
 
@@ -500,7 +522,11 @@ def _cast_exact(node: NodeProto, given: Any, produced: np.ndarray, concerned: bo
     if produced.dtype.kind != "f" or not (given.dtype.kind in "biu" or (concerned and given.dtype.kind == "f")):
         return
     if not _kept(given, produced):
-        raise ArithmeticError(f"{node.name} ({node.op_type}): {produced.dtype} does not hold every value of {node.input[0]}")
+        raise ExecutionArithmeticRefused.of(
+            "exact-beyond-float64",
+            "execute_node",
+            f"{node.name} ({node.op_type}): {produced.dtype} does not hold every value of {node.input[0]}",
+        )
 
 
 def _as_double(info: ValueInfoProto) -> ValueInfoProto:
@@ -599,7 +625,11 @@ def execute_node(
         judged: dict[str, int] = {}
         if exact:
             if model is None:
-                raise ValueError(f"{node.name} ({node.op_type}): exact integers read the model's annotations; pass model")
+                raise ExecutionValueRefused.of(
+                    "exact-needs-model",
+                    "execute_node",
+                    f"{node.name} ({node.op_type}): exact integers read the model's annotations; pass model",
+                )
             widened, concerned, judged = _widened(node, node_inputs + node_outputs, model, context, opset_version)
             node_inputs = [_as_double(x) if x.name in widened else x for x in node_inputs]
             node_outputs = [_as_double(x) if x.name in widened else x for x in node_outputs]
@@ -628,16 +658,20 @@ def execute_node(
         except RuntimeNotImplemented as error:
             if not widened:
                 raise
-            raise NotImplementedError(
+            raise ExecutionUnsupported.of(
+                "exact-unsupported",
+                "execute_node",
                 f"{node.name} ({node.op_type}): ONNX Runtime has no float64 kernel for {node.op_type}, "
-                "which this node computes in to keep its integers exact"
+                "which this node computes in to keep its integers exact",
             ) from error
         output_list = sess.run(None, input_dict)
         if exact and node.op_type in ("Cast", "CastLike"):
             _cast_exact(node, input_dict[node.input[0]], output_list[0], concerned)
         for info, value in zip(node_outputs, output_list):
             if info.name in judged and _past(value, judged[info.name]):
-                raise NotImplementedError(_unproved(node, f"its result {info.name} holds a value"))
+                raise ExecutionUnsupported.of(
+                    "exact-unsupported", "execute_node", _unproved(node, f"its result {info.name} holds a value")
+                )
 
         for output_ind in range(len(node.output)):
             # get the name of the target buffer from node.output
@@ -733,7 +767,7 @@ def execute_onnx(
         with _switched(exact_integers):
             return execute_onnx(model, input_dict, return_full_exec_context, start_node, end_node)
     if not model.check_all_tensor_shapes_specified():
-        raise Exception("Found unspecified tensor shapes, try infer_shapes")
+        raise ExecutionRefused.of("shapes-unspecified", "execute_onnx", "Found unspecified tensor shapes, try infer_shapes")
     ret = model.analysis(ta.nodes_topologically_sorted)
     assert (
         ret["nodes_topologically_sorted"] is True
@@ -753,13 +787,15 @@ def execute_onnx(
             if execution_context[inp_name].shape == input_dict[inp_name].shape:
                 execution_context[inp_name] = input_dict[inp_name]
             else:
-                raise Exception(
+                raise ExecutionRefused.of(
+                    "input-shape",
+                    "execute_onnx",
                     "Shape mismatch for provided input %s: found %s expected %s "
                     % (
                         inp_name,
                         str(execution_context[inp_name].shape),
                         str(input_dict[inp_name].shape),
-                    )
+                    ),
                 )
         # else:
         # raise Exception("Provided input not found in graph context: %s" % inp_name)
@@ -796,7 +832,9 @@ def execute_onnx(
                 # round output values to quantization annotation
                 execution_context = sanitize_quant_values(model, node.output, execution_context)
     else:
-        raise Exception('Metadata property "exec_mode" is set to an unknown value.')
+        raise ExecutionRefused.of(
+            "exec-mode-unknown", "execute_onnx", 'Metadata property "exec_mode" is set to an unknown value.'
+        )
 
     if return_full_exec_context:
         return execution_context

@@ -40,7 +40,7 @@ A range is one fact with its datatype: ``ModelWrapper.set_tensor_datatype`` writ
 both, and a datatype written without a range clears the range. Only a range that says
 more than the datatype is stored; the datatype's full range (``ranges.full``) is not.
 Nothing coerces: stored text in any other form, or a stored range its datatype does
-not hold, is a ``MetadataError`` naming the entry and the text. A writer stating a
+not hold, is a ``MetadataRefused`` naming the entry and the text. A writer stating a
 range its own datatype does not hold contradicts itself: the range is not stored, and
 a ``RangeContradiction`` warning names the tensor and its writer (once per tensor in
 an inference pass, ``one_pass``).
@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 from qonnx.core import metadata
 from qonnx.core.datatype import BaseDataType
-from qonnx.core.metadata import Codec, Key, MetadataError, Namespace
+from qonnx.core.metadata import Codec, Key, MetadataRefused, Namespace
 from qonnx.core.ranges import Endpoint, Range, full, holds
 from qonnx.util.basic import get_by_name
 
@@ -215,7 +215,7 @@ def _annotation(model: ModelWrapper, tensor: str) -> Optional[TensorAnnotation]:
 
 
 def stated(model: ModelWrapper, tensor: str) -> Optional[Range]:
-    """The range stored on ``tensor``, None if it stores none. MetadataError when it
+    """The range stored on ``tensor``, None if it stores none. MetadataRefused when it
     is stored malformed."""
     found = _annotation(model, tensor)
     if found is None:
@@ -224,7 +224,7 @@ def stated(model: ModelWrapper, tensor: str) -> Optional[Range]:
 
 
 def tensor_range(model: ModelWrapper, tensor: str, *, numeric_text: bool = False) -> Range:
-    """The range ``tensor`` states, or its datatype's full range. MetadataError for a
+    """The range ``tensor`` states, or its datatype's full range. MetadataRefused for a
     stored range that is malformed or that its datatype does not hold; the message
     shows the range as stored (``"3*2^-3"``), or as ``qonnx.core.ranges`` does
     (``3/8``) with ``numeric_text``. An initializer's values are not read here
@@ -235,8 +235,10 @@ def tensor_range(model: ModelWrapper, tensor: str, *, numeric_text: bool = False
         return full(stated_type)
     if not holds(stated_type, found):
         shown = str(found) if numeric_text else _range_text(found)
-        raise MetadataError(
-            f"{RANGE.entry} of tensor {tensor!r}: stored {shown} is not held by its datatype {stated_type.name}"
+        raise MetadataRefused.of(
+            "metadata-invalid",
+            TENSOR.name,
+            f"{RANGE.entry} of tensor {tensor!r}: stored {shown} is not held by its datatype {stated_type.name}",
         )
     return found
 
@@ -269,7 +271,7 @@ def prepare(model: ModelWrapper, tensor: str, datatype: BaseDataType, value: Ran
     """The range to store for ``tensor`` with ``datatype``, checked before either is
     written: ``value``; None for the datatype's full range; None, and a
     ``RangeContradiction`` naming it, for one the datatype does not hold.
-    MetadataError for a value that is not a Range. It writes nothing, so a
+    MetadataRefused for a value that is not a Range. It writes nothing, so a
     refusal, or the warning raised as an error, leaves the model as it was."""
     RANGE.encode(value)
     if value == full(datatype):
@@ -285,13 +287,22 @@ def write(model: ModelWrapper, tensor: str, value: Optional[Range]) -> None:
     nothing for None or the datatype's full range (a range stored before is
     cleared); nothing, and a ``RangeContradiction`` naming it, for one the datatype
     does not hold. ``ModelWrapper.set_tensor_datatype`` calls it after writing the
-    datatype, with a range ``prepare`` checked before. MetadataError for a value that is not a Range; ValueError for a range
+    datatype, with a range ``prepare`` checked before. MetadataRefused
+    for a value that is not a Range; ValueError for a range
     on a tensor that states no datatype."""
     found = _annotation(model, tensor)
     if value is not None:
         text = RANGE.encode(value)
         if not model.has_tensor_datatype(tensor):
-            raise ValueError(f"{RANGE.entry} of tensor {tensor!r}: a range is stated with a datatype; it states none")
+            from qonnx.core.modelwrapper import TensorFactRefused
+
+            raise TensorFactRefused.of(
+                "fact-invalid",
+                "tensor_ranges.write",
+                f"{RANGE.entry} of tensor {tensor!r}: a range is stated with a datatype; it states none",
+                tensor=tensor,
+                fact="element",
+            )
         stated_type = model.get_tensor_datatype(tensor)
         if value == full(stated_type):
             value = None
@@ -306,7 +317,7 @@ def write(model: ModelWrapper, tensor: str, value: Optional[Range]) -> None:
         return
     try:
         current = metadata.read(props, TENSOR, tensor=True)
-    except MetadataError:
+    except MetadataRefused:
         current = {}
     if RANGE.name in current:
         for prop in props:

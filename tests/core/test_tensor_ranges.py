@@ -42,7 +42,7 @@ from onnx import StringStringEntryProto, TensorProto, helper
 
 from qonnx.core import metadata, tensor_ranges
 from qonnx.core.datatype import DataType
-from qonnx.core.metadata import MetadataError
+from qonnx.core.metadata import MetadataRefused
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.core.ranges import Range
 from qonnx.core.tensor_ranges import RANGE, TENSOR, RangeContradiction, one_pass
@@ -182,21 +182,21 @@ def test_a_malformed_range_is_a_metadata_error_naming_the_entry(text: str) -> No
     store(model, "x", text)
     loaded = ModelWrapper(model.model.SerializeToString())
     for read in (loaded.get_tensor_range, loaded.get_stated_tensor_range, loaded.get_tensor_annotation_range):
-        with pytest.raises(MetadataError, match="qonnx.tensor/range: stored"):
+        with pytest.raises(MetadataRefused, match="qonnx.tensor/range: stored"):
             read("x")
 
 
 def test_a_stored_range_its_datatype_does_not_hold_is_a_metadata_error() -> None:
     model = chain()
     model.set_metadata(RANGE, Range(-100, 100), tensor="x")  # x is INT4; written past the datatype
-    with pytest.raises(MetadataError, match=r"tensor 'x': stored \[-100, 100\] is not held by its datatype INT4"):
+    with pytest.raises(MetadataRefused, match=r"tensor 'x': stored \[-100, 100\] is not held by its datatype INT4"):
         model.get_tensor_range("x")
     assert model.get_stated_tensor_range("x") == Range(-100, 100)
 
 
 def test_a_range_that_is_not_a_range_is_refused_on_writing() -> None:
     model = chain()
-    with pytest.raises(MetadataError, match="qonnx.tensor/range: cannot store"):
+    with pytest.raises(MetadataRefused, match="qonnx.tensor/range: cannot store"):
         model.set_tensor_datatype("m", DataType["INT8"], range=(1, 2))
     with pytest.raises(TypeError):
         model.set_tensor_datatype("m", DataType["INT8"], Range(1, 2))
@@ -343,7 +343,7 @@ def test_a_range_refused_or_raised_as_an_error_leaves_the_model_unchanged() -> N
     assert model.get_tensor_range("m") == Range(-300, 300)
     for name in ("m", "y"):
         before = model.model.SerializeToString(deterministic=True)
-        with pytest.raises(MetadataError, match="qonnx.tensor/range: cannot store"):
+        with pytest.raises(MetadataRefused, match="qonnx.tensor/range: cannot store"):
             model.set_tensor_datatype(name, DataType["INT8"], range=(1, 2))
         assert model.model.SerializeToString(deterministic=True) == before
     assert get_by_name(model.graph.quantization_annotation, "y", "tensor_name") is None
@@ -393,14 +393,17 @@ def test_saved_dyadic_range_diagnostics_keep_their_text() -> None:
     model.set_tensor_datatype("x", DataType["FIXED<8,4>"], range=Range(0, 1))
     annotation = model.graph.quantization_annotation[0].quant_parameter_tensor_names
     next(p for p in annotation if p.key == RANGE.entry).value = '{"nan":false,"range":["3*2^-3","65*2^-3"]}'
-    with pytest.raises(MetadataError) as raw:
+    with pytest.raises(MetadataRefused) as raw:
         model.get_tensor_range("x")
-    assert str(raw.value) == (
+    assert raw.value.findings[0].message == (
         "qonnx.tensor/range of tensor 'x': stored [3*2^-3, 65*2^-3] is not held by its datatype FIXED<8,4>"
     )
-    with pytest.raises(MetadataError) as shown:
+    with pytest.raises(MetadataRefused) as shown:
         model.get_tensor_annotation_range("x")
-    assert str(shown.value) == "qonnx.tensor/range of tensor 'x': stored [3/8, 65/8] is not held by its datatype FIXED<8,4>"
+    assert (
+        shown.value.findings[0].message
+        == "qonnx.tensor/range of tensor 'x': stored [3/8, 65/8] is not held by its datatype FIXED<8,4>"
+    )
 
 
 # -- the range with its tensor

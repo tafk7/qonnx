@@ -140,11 +140,13 @@ import math
 import numpy as np
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, EnumMeta
 from fractions import Fraction
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, Union
+
+from qonnx.core import Refusal
 
 
 class DataTypeWarning(FutureWarning):
@@ -168,6 +170,28 @@ _MAX_INTEGER_BITS = 1024
 _Endpoint = Union[int, Fraction, float]
 
 # A number read exactly: an int, a non-integer ``Fraction``, or a float infinity or NaN.
+
+
+class NumericRefused(Refusal):
+    """The family of datatype, name and numeric-value refusals."""
+
+
+class NumericValueRefused(NumericRefused, ValueError):
+    """A value outside a numeric operation's domain."""
+
+
+class DataTypeNameRefused(NumericRefused):
+    """The family of datatype-name refusals."""
+
+
+class DataTypeNameUnknown(DataTypeNameRefused, KeyError):
+    """A datatype name whose family is unknown."""
+
+
+class DataTypeNameMalformed(DataTypeNameRefused, ValueError):
+    """A datatype name whose parameters cannot be read."""
+
+
 _Exact = Union[int, Fraction, float]
 
 
@@ -214,13 +238,13 @@ def _endpoint(value: Union[int, float, Fraction]) -> _Endpoint:
         return value
     if isinstance(value, float):
         if math.isnan(value):
-            raise ValueError("an endpoint is not NaN")
+            raise NumericValueRefused.of("range-invalid", "endpoint", "an endpoint is not NaN")
         if math.isinf(value):
             return value
         value = Fraction(value)
     if isinstance(value, Fraction):
         if value.denominator & (value.denominator - 1):
-            raise ValueError(f"an endpoint is dyadic (m * 2**e), not {value}")
+            raise NumericValueRefused.of("range-invalid", "endpoint", f"an endpoint is dyadic (m * 2**e), not {value}")
         return _rational(value)
     raise TypeError(f"an endpoint is an int, a dyadic Fraction or an infinity, not {value!r}")
 
@@ -240,9 +264,11 @@ class FloatFormat:
             if type(value) is not int:
                 raise TypeError(f"a float format's parameters are ints, not {value!r}")
         if self.mantissa < 0 or self.emin > self.emax:
-            raise ValueError(
+            raise NumericValueRefused.of(
+                "format-invalid",
+                "FloatFormat",
                 f"no binary float format has {self.mantissa} fraction bits and normal "
-                f"exponents {self.emin} to {self.emax}"
+                f"exponents {self.emin} to {self.emax}",
             )
 
     @property
@@ -257,7 +283,7 @@ class FloatFormat:
         endpoint does not tell -0 from +0). ``ValueError`` for NaN."""
         if isinstance(value, float):
             if math.isnan(value):
-                raise ValueError("NaN has no nearest value in a format")
+                raise NumericValueRefused.of("format-invalid", "FloatFormat.nearest", "NaN has no nearest value in a format")
             if math.isinf(value):
                 return value
         value = Fraction(value)
@@ -372,9 +398,13 @@ def _valued_width(datatype: "BaseDataType", bits: int) -> int:
     message names the class and width alone: a huge width's name is costly to build.)"""
     family = type(datatype).__name__
     if bits < 1:
-        raise ValueError(f"{family} with a width of {bits} bits has no values")
+        raise NumericValueRefused.of("undefined", "DataType.bounds", f"{family} with a width of {bits} bits has no values")
     if bits > _MAX_BITS:
-        raise ValueError(f"{family} with a width of {bits} bits is past the envelope: wider than {_MAX_BITS} bits")
+        raise NumericValueRefused.of(
+            "beyond-envelope",
+            "DataType.bounds",
+            f"{family} with a width of {bits} bits is past the envelope: wider than {_MAX_BITS} bits",
+        )
     return int(bits)
 
 
@@ -497,19 +527,19 @@ def _code_array(codes: object) -> np.ndarray:
         return array.astype(np.uint64)
     if array.dtype.kind == "i":
         if (array < 0).any():
-            raise ValueError("a code is not negative")
+            raise NumericValueRefused.of("code-outside", "DataType.values", "a code is not negative")
         return array.astype(np.uint64)
     if array.dtype.kind == "O":
         found = np.empty(array.shape, dtype=np.uint64)
         for index, code in np.ndenumerate(array):
             value = _exact(code)
             if not isinstance(value, int) or isinstance(code, (float, np.floating, Fraction)):
-                raise ValueError(f"a code is an integer, not {code!r}")
+                raise NumericValueRefused.of("code-outside", "DataType.values", f"a code is an integer, not {code!r}")
             if not 0 <= value < 1 << 64:
-                raise ValueError(f"{code} is no 64-bit code")
+                raise NumericValueRefused.of("code-outside", "DataType.values", f"{code} is no 64-bit code")
             found[index] = value
         return found
-    raise ValueError(f"codes are integers, not {array.dtype}")
+    raise NumericValueRefused.of("code-outside", "DataType.values", f"codes are integers, not {array.dtype}")
 
 
 def _signed_codes(codes: np.ndarray, bits: int) -> np.ndarray:
@@ -619,7 +649,7 @@ class BaseDataType(ABC):
         reads min() and max() exactly."""
         least, greatest = _exact(self.min()), _exact(self.max())
         if not (_finite(least) and _finite(greatest)):
-            raise ValueError(f"{self} has no finite bounds")
+            raise NumericValueRefused.of("undefined", "DataType.bounds", f"{self} has no finite bounds")
         return least, greatest
 
     def contains(self, values: object) -> Union[bool, np.ndarray]:
@@ -644,7 +674,7 @@ class BaseDataType(ABC):
         members = self._container_members(array)
         if not members.all():
             bad = array.flat[int(np.flatnonzero(~members.reshape(-1))[0])]
-            raise ValueError(f"{bad!r} is not a {self} value")
+            raise NumericValueRefused.of("not-member", "DataType.codes", f"{bad!r} is not a {self} value")
         return self._encode(array)
 
     def values(self, codes: object) -> np.ndarray:
@@ -655,14 +685,14 @@ class BaseDataType(ABC):
         raw = _code_array(codes)
         bits = int(self.bitwidth())
         if bits < 64 and (raw >> np.uint64(bits)).any():
-            raise ValueError(f"a code wider than {self}'s {bits} bits")
+            raise NumericValueRefused.of("code-outside", "DataType.values", f"a code wider than {self}'s {bits} bits")
         return self._decode(raw)
 
     def container(self) -> np.dtype:
         """Returns the numpy type codes() takes values in and values() returns them in,
         exact for every value. Raises ValueError where there is none. to_numpy_dt() keeps
         its answers."""
-        raise ValueError(f"{self} has no exact numpy container")
+        raise NumericValueRefused.of("undefined", "DataType.container", f"{self} has no exact numpy container")
 
     def carried_as_codes(self) -> bool:
         """Returns whether container() holds this datatype's codes, not its values (a
@@ -671,7 +701,7 @@ class BaseDataType(ABC):
 
     def _require_codes(self) -> None:
         """Raises ValueError for a datatype that has no codes."""
-        raise ValueError(f"{self} has no codes")
+        raise NumericValueRefused.of("undefined", "DataType.codes", f"{self} has no codes")
 
     def _container_members(self, values: np.ndarray) -> np.ndarray:
         """Whether each element is a value codes() takes."""
@@ -811,7 +841,7 @@ class FloatType(BaseDataType):
         return True
 
     def get_num_possible_values(self) -> int:
-        raise Exception("Undefined for FloatType")
+        raise NumericValueRefused.of("undefined", "DataType.get_num_possible_values", "Undefined for FloatType")
 
     def is_integer(self) -> bool:
         return False
@@ -888,17 +918,27 @@ class ArbPrecFloatType(BaseDataType):
         if isinstance(bias, float) and bias.is_integer():
             bias = int(bias)
         if exponent_bits < 1 or mantissa_bits < 0 or not isinstance(bias, (int, np.integer)):
-            raise ValueError(f"{self} has no values: exponent bits >= 1, mantissa bits >= 0, an integer bias")
+            raise NumericValueRefused.of(
+                "undefined",
+                "DataType.bounds",
+                f"{self} has no values: exponent bits >= 1, mantissa bits >= 0, an integer bias",
+            )
         _valued_width(self, self.bitwidth())
         bias = int(bias)
         emax = (1 << exponent_bits) - 1 - bias
         if emax > 1023 or 1 - bias - mantissa_bits < -1074:
-            raise ValueError(f"{self} is past the envelope: its exponents are beyond float64's")
+            raise NumericValueRefused.of(
+                "beyond-envelope", "DataType.bounds", f"{self} is past the envelope: its exponents are beyond float64's"
+            )
         found = FloatFormat(int(mantissa_bits), 1 - bias, emax)
         try:
             float(found.largest)
         except OverflowError:
-            raise ValueError(f"{self} is past the envelope: its greatest value rounds past float64's") from None
+            raise NumericValueRefused.of(
+                "beyond-envelope",
+                "DataType.bounds",
+                f"{self} is past the envelope: its greatest value rounds past float64's",
+            ) from None
         return found
 
     def _holds(self, value: Optional[_Exact]) -> bool:
@@ -914,7 +954,9 @@ class ArbPrecFloatType(BaseDataType):
         fmt = self._format()
         if fmt.mantissa <= 23 and fmt.emax <= 127 and fmt.emin - fmt.mantissa >= -149:
             return np.dtype(np.float32)
-        raise ValueError(f"{self} has no exact numpy container: float32 does not hold every value")
+        raise NumericValueRefused.of(
+            "undefined", "DataType.container", f"{self} has no exact numpy container: float32 does not hold every value"
+        )
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         # fp32 format parameters
@@ -951,7 +993,9 @@ class ArbPrecFloatType(BaseDataType):
         return False
 
     def get_hls_datatype_str(self) -> str:
-        assert False, "get_hls_datatype_str() not yet implemented for ArbPrecFloatType"
+        raise NumericValueRefused.of(
+            "undefined", "DataType.get_hls_datatype_str", "get_hls_datatype_str() not yet implemented for ArbPrecFloatType"
+        )
 
     def to_numpy_dt(self) -> np.dtype:
         return np.dtype(np.float32)
@@ -1093,11 +1137,13 @@ class IntType(BaseDataType):
         for width in (8, 16, 32, 64):
             if bits <= width:
                 return np.dtype(f"{'i' if self._signed else 'u'}{width // 8}")
-        raise ValueError(f"{self} has no exact numpy container: wider than 64 bits")
+        raise NumericValueRefused.of(
+            "undefined", "DataType.container", f"{self} has no exact numpy container: wider than 64 bits"
+        )
 
     def _require_codes(self) -> None:
         if _valued_width(self, self.bitwidth()) > 64:
-            raise ValueError(f"{self} has no codes: wider than 64 bits")
+            raise NumericValueRefused.of("undefined", "DataType.codes", f"{self} has no codes: wider than 64 bits")
 
     def _encode(self, values: np.ndarray) -> np.ndarray:
         return _integer_codes(values, int(self.bitwidth()), self._signed)
@@ -1132,7 +1178,7 @@ class IntType(BaseDataType):
         elif self.bitwidth() <= 64:
             return np.dtype(np.int64 if self.signed() else np.uint64)
         else:
-            raise Exception("Unknown numpy dtype for " + str(self))
+            raise NumericValueRefused.of("undefined", "DataType.to_numpy_dt", "Unknown numpy dtype for " + str(self))
 
     def get_canonical_name(self) -> str:
         if self.bitwidth() == 1 and (not self.signed()):
@@ -1240,7 +1286,7 @@ class TernaryType(BaseDataType):
 
     def _decode(self, codes: np.ndarray) -> np.ndarray:
         if (codes == 2).any():
-            raise ValueError("code 2 is no TERNARY value")
+            raise NumericValueRefused.of("code-outside", "DataType.values", "code 2 is no TERNARY value")
         return _signed_codes(codes, 2).astype(np.int8)
 
     def get_num_possible_values(self) -> int:
@@ -1265,7 +1311,14 @@ class TernaryType(BaseDataType):
 class FixedPointType(IntType):
     def __init__(self, bitwidth: int, intwidth: int) -> None:
         super().__init__(bitwidth=bitwidth, signed=True)
-        assert intwidth < bitwidth, "FixedPointType violates intwidth < bitwidth"
+        if intwidth >= bitwidth:
+            raise DataTypeNameMalformed.of(
+                "name-malformed",
+                "DataType",
+                "FixedPointType violates intwidth < bitwidth",
+                bitwidth=int(bitwidth),
+                intwidth=int(intwidth),
+            )
         self._intwidth = intwidth
 
     def int_bits(self) -> int:
@@ -1294,9 +1347,11 @@ class FixedPointType(IntType):
         bits = _valued_width(self, self.bitwidth())
         fraction = self._fraction()
         if fraction > _MAX_FRACTION_BITS or self.int_bits() > _MAX_INTEGER_BITS:
-            raise ValueError(
+            raise NumericValueRefused.of(
+                "beyond-envelope",
+                "DataType.bounds",
                 f"{self} is past the envelope: at most {_MAX_FRACTION_BITS} fraction bits "
-                f"and {_MAX_INTEGER_BITS} integer bits"
+                f"and {_MAX_INTEGER_BITS} integer bits",
             )
         return _fixed_point_bounds(bits, fraction)
 
@@ -1365,12 +1420,14 @@ class FixedPointType(IntType):
             return np.dtype(np.float64)
         if self.bitwidth() <= 64:
             return np.dtype(np.int64)
-        raise ValueError(f"{self} has no exact numpy container: wider than 64 bits")
+        raise NumericValueRefused.of(
+            "undefined", "DataType.container", f"{self} has no exact numpy container: wider than 64 bits"
+        )
 
     def _require_codes(self) -> None:
         self.bounds()
         if self.bitwidth() > 64:
-            raise ValueError(f"{self} has no codes: wider than 64 bits")
+            raise NumericValueRefused.of("undefined", "DataType.codes", f"{self} has no codes: wider than 64 bits")
 
     def _container_members(self, values: np.ndarray) -> np.ndarray:
         if not self.carried_as_codes():
@@ -1430,19 +1487,23 @@ class ScaledIntType(IntType):
         super().__init__(bitwidth=bitwidth, signed=True)
 
     def min(self) -> int:
-        raise Exception("Undefined for ScaledIntType")
+        raise NumericValueRefused.of("undefined", "DataType.min", "Undefined for ScaledIntType")
 
     def max(self) -> int:
         raise Exception("Undefined for ScaledIntType")
 
     def bounds(self) -> tuple[Union[int, Fraction], Union[int, Fraction]]:
-        raise ValueError(f"{self} has no value set: a scaled integer's scale is not stated")
+        raise NumericValueRefused.of(
+            "undefined", "DataType.bounds", f"{self} has no value set: a scaled integer's scale is not stated"
+        )
 
     def container(self) -> np.dtype:
-        raise ValueError(f"{self} has no exact numpy container: it has no value set")
+        raise NumericValueRefused.of(
+            "undefined", "DataType.container", f"{self} has no exact numpy container: it has no value set"
+        )
 
     def _require_codes(self) -> None:
-        raise ValueError(f"{self} has no codes: it has no value set")
+        raise NumericValueRefused.of("undefined", "DataType.codes", f"{self} has no codes: it has no value set")
 
     def allowed(self, value: Union[int, float, np.ndarray]) -> Union[bool, np.ndarray]:
         raise Exception("Undefined for ScaledIntType")
@@ -1482,7 +1543,7 @@ def _parameter(text: str) -> int:
     return int(sign + significant)
 
 
-def _construct(name: str) -> BaseDataType:
+def _construct_unchecked(name: str) -> BaseDataType:
     """The datatype a name spells, parsed as resolve_datatype always has."""
     _special_types = {
         "BINARY": IntType(1, False),
@@ -1531,6 +1592,42 @@ def _construct(name: str) -> BaseDataType:
         raise KeyError("Could not resolve DataType " + name)
 
 
+def _construct(name: str, owner: str = "DataType") -> BaseDataType:
+    """Read a source spelling, preserving unknown-name and malformed-name signals."""
+    try:
+        return _construct_unchecked(name)
+    except DataTypeNameRefused as error:
+        error.findings = tuple(replace(found.about(name=name), owner=owner) for found in error.findings)
+        if error._default_message:
+            error.args = ("\n".join(map(str, error.findings)),)
+        raise
+    except KeyError as error:
+        raise DataTypeNameUnknown.of("name-unknown", owner, str(error.args[0]), name=name) from error
+    except (ValueError, IndexError) as error:
+        raise DataTypeNameMalformed.of("name-malformed", owner, str(error), name=name) from error
+    except OverflowError as error:
+        raise DataTypeNameMalformed.of(
+            "beyond-envelope", owner, f"{name} is past the envelope: its default exponent bias overflows", name=name
+        ) from error
+
+
+def _nonsense_refusal(datatype: BaseDataType, name: str) -> DataTypeNameMalformed:
+    """The name refusal a deprecated value set will give after its warning period."""
+    try:
+        if isinstance(datatype, ScaledIntType):
+            _valued_width(datatype, datatype.bitwidth())
+        else:
+            datatype.bounds()
+    except NumericValueRefused as error:
+        code = error.findings[0].code
+        if datatype.bitwidth() == 0:
+            code = "width-zero"
+        elif code != "beyond-envelope":
+            code = "name-malformed"
+        return DataTypeNameMalformed.of(code, "DataType", error.findings[0].message, name=name)
+    raise AssertionError("a deprecated datatype has a reason")
+
+
 def _nonsense(datatype: BaseDataType) -> Optional[str]:
     """Why a resolved datatype is one a later release refuses (a zero or negative width
     or parameter, or past the envelope); None for any other."""
@@ -1539,8 +1636,8 @@ def _nonsense(datatype: BaseDataType) -> Optional[str]:
             _valued_width(datatype, datatype.bitwidth())
         else:
             datatype.bounds()
-    except ValueError as reason:
-        return str(reason)
+    except NumericValueRefused as reason:
+        return reason.findings[0].message
     return None
 
 
@@ -1550,12 +1647,12 @@ def _nonsense_name(name: str) -> Optional[str]:
     return _nonsense(_construct(name))
 
 
-def _resolve(name: str, canonical: bool, stacklevel: int) -> BaseDataType:
+def _resolve(name: str, canonical: bool, stacklevel: int, owner: str = "DataType") -> BaseDataType:
     """The one resolution path of resolve_datatype and DataType[name]."""
     if not isinstance(name, str):
         raise TypeError(f"Input 'name' must be of type 'str', but got type '{type(name).__name__}'")
     if not canonical:
-        found = _construct(name)
+        found = _construct(name, owner)
         reason = _nonsense_name(name)
         if reason is not None:
             warnings.warn(
@@ -1565,14 +1662,33 @@ def _resolve(name: str, canonical: bool, stacklevel: int) -> BaseDataType:
             )
         return found
     try:
-        found = _construct(name)
-    except (KeyError, IndexError, AssertionError, ValueError, OverflowError) as error:
-        raise KeyError(f"{name!r} is no canonical DataType name") from error
+        found = _construct(name, owner)
+    except DataTypeNameRefused as error:
+        raise DataTypeNameUnknown.of(
+            "name-not-canonical",
+            "resolve_datatype",
+            f"{name!r} is no canonical DataType name",
+            name=name,
+            reason=error.findings[0].code,
+        ) from error
     reason = _nonsense_name(name)
     if reason is not None:
-        raise KeyError(f"{name!r} is no canonical DataType name: {reason}")
+        plain = _nonsense_refusal(found, name)
+        raise DataTypeNameUnknown.of(
+            "name-not-canonical",
+            "resolve_datatype",
+            f"{name!r} is no canonical DataType name: {reason}",
+            name=name,
+            reason=plain.findings[0].code,
+        ) from plain
     if found.get_canonical_name() != name:
-        raise KeyError(f"{name!r} is not a canonical DataType name; it denotes {found.get_canonical_name()}")
+        raise DataTypeNameUnknown.of(
+            "name-not-canonical",
+            "resolve_datatype",
+            f"{name!r} is not a canonical DataType name; it denotes {found.get_canonical_name()}",
+            name=name,
+            reason=found.get_canonical_name(),
+        )
     return found
 
 
@@ -1582,7 +1698,7 @@ def resolve_datatype(name: str, canonical: bool = False) -> BaseDataType:
     refuses resolves with a DataTypeWarning. With canonical=True only the canonical name of
     a datatype within the envelope resolves, as a stored annotation holds it; any other
     name raises KeyError (see the module's docstring)."""
-    return _resolve(name, canonical, stacklevel=3)
+    return _resolve(name, canonical, stacklevel=3, owner="resolve_datatype")
 
 
 def _ieee_format(target: BaseDataType) -> Optional[FloatFormat]:
@@ -1603,7 +1719,7 @@ def round_to(target: BaseDataType, values: object) -> np.ndarray:
     is no IEEE float datatype, and TypeError for a value that is no number."""
     fmt = _ieee_format(target)
     if fmt is None:
-        raise ValueError(f"{target} is no IEEE float datatype to round to")
+        raise NumericValueRefused.of("undefined", "round_to", f"{target} is no IEEE float datatype to round to")
     container = target.container()
     array = values if isinstance(values, np.ndarray) else np.asarray(values, dtype=object)
     kind = array.dtype.kind
@@ -1683,4 +1799,6 @@ else:
                 dt = DataType[cand]
                 if (dt.min() <= value) and (value <= dt.max()):
                     return dt
-            raise Exception("Could not find a suitable int datatype for " + str(value))
+            raise NumericValueRefused.of(
+                "undefined", "DataType.get_smallest_possible", "Could not find a suitable int datatype for " + str(value)
+            )

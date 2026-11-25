@@ -34,6 +34,7 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple, Type
 from onnx import NodeProto
+from qonnx.core.findings import Refusal
 from qonnx.custom_op.base import CustomOp
 
 # Nested registry for O(1) lookups: domain -> op_type -> version -> CustomOp class
@@ -112,6 +113,14 @@ RENAMED: Mapping[str, Callable[[NodeProto], Optional[str]]] = MappingProxyType(
         "finn.custom_op.general": lambda node: "qonnx.custom_op.general",
     }
 )
+
+
+class CustomOpRefused(Refusal, KeyError):
+    """A custom op lookup has no admitted name or suitable version."""
+
+
+class CustomOpUnsupported(Refusal):
+    """A shape, datatype or execution entry cannot find a custom implementation."""
 
 
 class Registration:
@@ -239,13 +248,20 @@ def _retirement(domain: str, op_type: Optional[str]) -> Optional[str]:
     return _RETIRED.get((domain, None))
 
 
-def _refuse_retired(label: Optional[str], domain: str, op_type: Optional[str]) -> None:
+def _refuse_retired(label: Optional[str], domain: str, op_type: Optional[str], owner: str = "getCustomOp") -> None:
     """KeyError where a provider retired the name, with its reason."""
     reason = _retirement(domain, op_type)
     if reason is not None:
         name = domain if op_type is None else f"{domain}.{op_type}"
         prefix = f"{label}: " if label else ""
-        raise KeyError(f"{prefix}stored identity {name} is retired; {reason}")
+        raise CustomOpRefused.of(
+            "domain-retired",
+            owner,
+            f"{prefix}stored identity {name} is retired; {reason}",
+            domain=domain,
+            op_type=op_type,
+            node=label or "",
+        )
 
 
 def retired(domain: str, op_type: Optional[str] = None) -> Optional[str]:
@@ -458,7 +474,7 @@ def _resolve_version(
         KeyError: If no suitable version found
     """
     if not available_versions:
-        raise KeyError("No versions available")
+        raise CustomOpRefused.of("version-unsuitable", "getCustomOp", "No versions available")
 
     # Strategy 1: If no specific version requested, use highest
     if requested_version is None:
@@ -477,9 +493,11 @@ def _resolve_version(
 
     # Strategy 4: No suitable version found
     available_list = sorted(available_versions.keys())
-    raise KeyError(
+    raise CustomOpRefused.of(
+        "version-unsuitable",
+        "getCustomOp",
         f"No suitable version found. Requested: {requested_version}, "
-        f"Available: {available_list}. Lowest available version is {available_list[0]}."
+        f"Available: {available_list}. Lowest available version is {available_list[0]}.",
     )
 
 
@@ -628,9 +646,11 @@ def getCustomOp(node: NodeProto, onnx_opset_version: int | None = None) -> Custo
 
             if not cached_versions:
                 module_path = resolve_domain(domain)
-                raise KeyError(
+                raise CustomOpRefused.of(
+                    "op-unknown",
+                    "getCustomOp",
                     f"Op '{op_type}' not found in domain '{domain}' (module: {module_path}). "
-                    f"Ensure it's defined in the module with proper naming (OpName or OpName_vN)."
+                    f"Ensure it's defined in the module with proper naming (OpName or OpName_vN).",
                 )
 
             # Cache it in nested structure
@@ -662,7 +682,7 @@ def get_supported_versions(domain: str, op_type: str) -> List[int]:
     """
     with _REGISTRY_LOCK:
         _provide(domain)
-        _refuse_retired(op_type, domain, op_type)
+        _refuse_retired(op_type, domain, op_type, "get_supported_versions")
         # O(1) check if cached
         if domain in _OP_REGISTRY and op_type in _OP_REGISTRY[domain]:
             return sorted(_OP_REGISTRY[domain][op_type].keys())
@@ -671,7 +691,9 @@ def get_supported_versions(domain: str, op_type: str) -> List[int]:
         versions_dict = _discover_custom_op_versions(domain, op_type)
 
         if not versions_dict:
-            raise KeyError(f"Op '{op_type}' not found in domain '{domain}'")
+            raise CustomOpRefused.of(
+                "op-unknown", "get_supported_versions", f"Op '{op_type}' not found in domain '{domain}'"
+            )
 
         # Cache discovered versions
         if domain not in _OP_REGISTRY:
@@ -784,7 +806,7 @@ def get_domain_opset_version(domain: str) -> int:
     """
     with _REGISTRY_LOCK:
         _provide(domain)
-        _refuse_retired(None, domain, None)
+        _refuse_retired(None, domain, None, "get_domain_opset_version")
         versions = [max(found) for found in _OP_REGISTRY.get(domain, {}).values() if found]
         if domain in _DECLARED:
             declared = _DECLARED[domain]
@@ -799,7 +821,12 @@ def get_domain_opset_version(domain: str) -> int:
         except ModuleNotFoundError:
             module = None
         if module is None and not versions:
-            raise KeyError(f"Domain '{domain}' has no module and no registered op")
+            raise CustomOpRefused.of(
+                "domain-unknown",
+                "get_domain_opset_version",
+                f"Domain '{domain}' has no module and no registered op",
+                domain=domain,
+            )
         stated = getattr(module, "opset_version", None)
         if module is not None:
             # an op type a provider declared is not read from the module
@@ -845,7 +872,7 @@ def get_ops_in_domain(domain: str) -> List[Tuple[str, Type[CustomOp]]]:
 
     with _REGISTRY_LOCK:
         _provide(domain)
-        _refuse_retired(None, domain, None)
+        _refuse_retired(None, domain, None, "get_ops_in_domain")
         # An op type the providers declared is listed from its bound versions alone
         declared_ops = _PROVIDER_OPS.get(domain, set())
         # Strategy 1: Get cached ops (fast path) - use highest version

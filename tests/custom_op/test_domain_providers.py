@@ -49,6 +49,8 @@ from qonnx.core.onnx_exec import execute_onnx
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import (
     PROVIDERS,
+    CustomOpRefused,
+    CustomOpUnsupported,
     Registration,
     add_op_to_domain,
     get_domain_opset_version,
@@ -120,7 +122,7 @@ class Providers:
         setattr(self.module, attribute, function)
         entry = EntryPoint(name=domain, value=f"{self.module_name}:{attribute}", group=PROVIDERS)
         if distribution is not None:
-            entry.dist = types.SimpleNamespace(name=distribution)
+            entry = entry._for(types.SimpleNamespace(name=distribution))
         self.entries.setdefault(domain, []).append(entry)
         return attribute
 
@@ -210,6 +212,10 @@ def test_a_retired_domain_refuses_every_lookup(providers):
     for lookup in lookups:
         with pytest.raises(KeyError, match="is retired; this domain is gone"):
             lookup()
+    with pytest.raises(CustomOpRefused) as caught:
+        get_ops_in_domain(domain)
+    assert caught.value.findings[0].owner == "get_ops_in_domain"
+    assert caught.value.findings[0].code == "domain-retired"
 
 
 def test_loading_a_model_with_a_retired_name_refuses_nothing(providers):
@@ -582,7 +588,7 @@ def test_a_retired_name_is_refused_with_its_reason_by_every_pass_and_execution(p
 
     providers.add(domain, provide)
     for name, (kind, message) in through_every_route(domain, "OldThing").items():
-        assert kind is KeyError, name
+        assert kind is CustomOpRefused and issubclass(kind, KeyError), name
         assert f"stored identity {domain}" in message and "rebuild the model with Thing" in message, name
 
 
@@ -590,9 +596,11 @@ def test_an_unknown_op_is_refused_by_every_pass_and_execution_as_before():
     domain = fresh_domain()
     add_op_to_domain(domain, make_op("Thing"))
     raised = through_every_route(domain, "Absent")
-    unsupported = (Exception, "Custom op_type Absent is currently not supported.")
-    assert raised["InferShapes"] == unsupported
-    assert raised["InferDataTypes"] == unsupported
+    for name in ("InferShapes", "InferDataTypes"):
+        kind, message = raised[name]
+        assert kind is CustomOpUnsupported and issubclass(kind, Exception)
+        assert not issubclass(kind, KeyError)
+        assert message == f"{name}: op-unsupported: Custom op_type Absent is currently not supported."
     # execution sends an op its domain does not have to ONNX Runtime, which refuses it
     for name in ("FoldConstants", "calc_monotonic_range", "execute_onnx"):
         assert raised[name][0] is not KeyError and "INVALID_GRAPH" in raised[name][1], name

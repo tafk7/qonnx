@@ -29,7 +29,7 @@
 import pytest
 from onnx import TensorProto, helper
 
-from qonnx.core.metadata import MetadataError, Namespace
+from qonnx.core.metadata import MetadataRefused, Namespace
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.merge_onnx_models import MergeONNXModels
 from qonnx.util.basic import qonnx_make_model
@@ -67,5 +67,5 @@ def test_merge_onnx_models_refuses_a_typed_key_stated_differently() -> None:
     pre, post = make_relu_model("pre"), make_relu_model("post")
     pre.set_metadata(PERIOD, 4.0)
     post.set_metadata(PERIOD, 5.0)
-    with pytest.raises(MetadataError, match="test.board/period_ns: the graphs merged state '5.0' and '4.0'"):
+    with pytest.raises(MetadataRefused, match="test.board/period_ns: the graphs merged state '5.0' and '4.0'"):
         post.transform(MergeONNXModels(pre))

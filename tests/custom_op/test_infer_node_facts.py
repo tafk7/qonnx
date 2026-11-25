@@ -37,7 +37,7 @@ import numpy as np
 from onnx import TensorProto, helper
 
 from qonnx.core.datatype import DataType
-from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.core.modelwrapper import ModelWrapper, TensorFactRefused
 from qonnx.core.ranges import Range
 from qonnx.custom_op.base import CustomOp
 from qonnx.custom_op.registry import add_op_to_domain, getCustomOp
@@ -151,16 +151,22 @@ def test_an_input_without_a_shape_is_refused_and_nothing_is_written(info):
     model = model_of(nodes, [("x", TensorProto.FLOAT, [2])], value_info=[info] if info is not None else [])
     model.set_tensor_datatype("y", DataType["INT2"])
     before = copy.deepcopy(model.model)
-    with pytest.raises(ValueError, match="^copy: h has no shape yet$"):
+    with pytest.raises(TensorFactRefused) as caught:
         getCustomOp(model.graph.node[0]).infer_node_facts(model)
+    assert isinstance(caught.value, ValueError)
+    finding = caught.value.findings[0]
+    assert finding.code == "fact-invalid" and finding.owner == "CustomOp.infer_node_facts"
+    assert finding.message == "copy: h has no shape yet"
     assert model.model == before
 
 
 def test_a_refusal_names_the_op_when_its_node_has_no_name():
     domain, _ = registered("Copy")
     model = model_of([helper.make_node("Copy", ["h"], ["y"], domain=domain)], [("x", TensorProto.FLOAT, [2])])
-    with pytest.raises(ValueError, match="^Copy: h has no shape yet$"):
+    with pytest.raises(TensorFactRefused) as caught:
         getCustomOp(model.graph.node[0]).infer_node_facts(model)
+    assert isinstance(caught.value, ValueError)
+    assert caught.value.findings[0].message == "Copy: h has no shape yet"
 
 
 def test_a_stand_in_that_is_not_a_standard_op_leaves_the_shapes():

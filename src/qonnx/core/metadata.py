@@ -53,7 +53,7 @@ Nothing coerces. A stored value that does not parse as its key's type, a value
 of the wrong type on writing, a stored key the namespace does not declare, a
 namespace stored without a version or at a version the reader cannot upgrade
 from, and a tensor's namespace whose ``@follow`` disagrees with its declaration
-at its version raise ``MetadataError``, naming the entry, the text and the
+at its version raise ``MetadataRefused``, naming the entry, the text and the
 expectation.
 
 Versions are upgraded, never downgraded: a namespace at version N may register
@@ -79,6 +79,8 @@ from enum import Enum
 from onnx import StringStringEntryProto
 from typing import Any, Callable, Generic, Iterable, MutableSequence, TypeVar, overload
 
+from qonnx.core.findings import Refusal
+
 T = TypeVar("T")
 E = TypeVar("E", bound=Enum)
 
@@ -87,7 +89,7 @@ VERSION = "@version"
 FOLLOW = "@follow"
 
 
-class MetadataError(ValueError):
+class MetadataRefused(Refusal, ValueError):
     """A metadata entry that cannot be read or written as its namespace declares."""
 
 
@@ -209,19 +211,34 @@ class Key(Generic[T]):
         return self.codec.expect if self.check is None else f"{self.codec.expect}, {self.expect or 'admitted by its check'}"
 
     def encode(self, value: T) -> str:
-        """The canonical text of a value; MetadataError if the key does not admit it."""
+        """The canonical text of a value; MetadataRefused if the key does not admit it."""
         if not self.codec.admits(value) or (self.check is not None and not self.check(value)):
-            raise MetadataError(f"{self.entry}: cannot store {value!r}: expected {self._expectation()}")
-        return self.codec.encode(value)
+            raise MetadataRefused.of(
+                "metadata-invalid",
+                self.namespace.name,
+                f"{self.entry}: cannot store {value!r}: expected {self._expectation()}",
+            )
+        try:
+            return self.codec.encode(value)
+        except (ValueError, KeyError) as error:
+            raise MetadataRefused.of(
+                "metadata-invalid",
+                self.namespace.name,
+                f"{self.entry}: cannot store {value!r}: expected {self._expectation()}",
+            ) from error
 
     def decode(self, text: str) -> T:
-        """The value stored as ``text``; MetadataError if it is not one of the key's values."""
+        """The value stored as ``text``; MetadataRefused if it is not one of the key's values."""
         try:
             value = self.codec.decode(text)
-        except (ValueError, KeyError):
-            raise MetadataError(f"{self.entry}: stored {text!r} is not {self._expectation()}") from None
+        except (ValueError, KeyError) as error:
+            raise MetadataRefused.of(
+                "metadata-invalid", self.namespace.name, f"{self.entry}: stored {text!r} is not {self._expectation()}"
+            ) from error
         if self.check is not None and not self.check(value):
-            raise MetadataError(f"{self.entry}: stored {text!r} is not {self._expectation()}")
+            raise MetadataRefused.of(
+                "metadata-invalid", self.namespace.name, f"{self.entry}: stored {text!r} is not {self._expectation()}"
+            )
         return value
 
 
@@ -309,9 +326,11 @@ class Namespace:
     def _current(self, version: int, entries: dict[str, str]) -> dict[str, str]:
         """Stored entries brought from ``version`` to the current version."""
         if version > self.version or any(v not in self._upgrades for v in range(version, self.version)):
-            raise MetadataError(
+            raise MetadataRefused.of(
+                "metadata-version",
+                self.name,
                 f"{self.name}: stored at version {version}, which a reader of version {self.version} cannot upgrade from"
-                + (f" (it upgrades from {sorted(self._upgrades)})" if self._upgrades else " (it has no upgrade)")
+                + (f" (it upgrades from {sorted(self._upgrades)})" if self._upgrades else " (it has no upgrade)"),
             )
         for v in range(version, self.version):
             entries = self._upgrades[v](dict(entries))
@@ -320,8 +339,11 @@ class Namespace:
     def _decoded(self, entries: dict[str, str]) -> dict[str, Any]:
         undeclared = sorted(set(entries) - set(self.keys))
         if undeclared:
-            raise MetadataError(
-                f"{self.name}: stored keys {undeclared} are not declared (version {self.version} declares {list(self.keys)})"
+            raise MetadataRefused.of(
+                "metadata-invalid",
+                self.name,
+                f"{self.name}: stored keys {undeclared} are not declared "
+                f"(version {self.version} declares {list(self.keys)})",
             )
         return {name: key.decode(entries[name]) for name, key in self.keys.items() if name in entries}
 
@@ -344,28 +366,38 @@ def _stored(
         name = prop.key[len(prefix) :]
         if name == VERSION:
             if version_text is not None:
-                raise MetadataError(f"{prop.key}: stored twice")
+                raise MetadataRefused.of("metadata-duplicate", namespace.name, f"{prop.key}: stored twice")
             version_text = prop.value
         elif name == FOLLOW:
             if follow_text is not None:
-                raise MetadataError(f"{prop.key}: stored twice")
+                raise MetadataRefused.of("metadata-duplicate", namespace.name, f"{prop.key}: stored twice")
             follow_text = prop.value
         elif name in entries:
-            raise MetadataError(f"{prop.key}: stored twice")
+            raise MetadataRefused.of("metadata-duplicate", namespace.name, f"{prop.key}: stored twice")
         else:
             entries[name] = prop.value
     if follow_text is not None:
         if not tensor:
-            raise MetadataError(f"{prefix}{FOLLOW}: stored on a graph; only a tensor's namespace states it")
+            raise MetadataRefused.of(
+                "metadata-invalid",
+                namespace.name,
+                f"{prefix}{FOLLOW}: stored on a graph; only a tensor's namespace states it",
+            )
         if follow_text != "true":
-            raise MetadataError(f"{prefix}{FOLLOW}: stored {follow_text!r}, not 'true'")
+            raise MetadataRefused.of(
+                "metadata-invalid", namespace.name, f"{prefix}{FOLLOW}: stored {follow_text!r}, not 'true'"
+            )
     if version_text is None:
         if entries or follow_text is not None:
             stored = sorted(entries) + ([FOLLOW] if follow_text is not None else [])
-            raise MetadataError(f"{namespace.name}: keys {stored} are stored without {prefix}{VERSION}")
+            raise MetadataRefused.of(
+                "metadata-version", namespace.name, f"{namespace.name}: keys {stored} are stored without {prefix}{VERSION}"
+            )
         return None, False, entries
     if not re.fullmatch(r"[1-9][0-9]*", version_text):
-        raise MetadataError(f"{prefix}{VERSION}: stored {version_text!r} is not a positive int")
+        raise MetadataRefused.of(
+            "metadata-version", namespace.name, f"{prefix}{VERSION}: stored {version_text!r} is not a positive int"
+        )
     return int(version_text), follow_text is not None, entries
 
 
@@ -374,9 +406,11 @@ def _load(props: Iterable[StringStringEntryProto], namespace: Namespace, tensor:
     current version must state ``@follow`` as the namespace declares it."""
     version, follows, entries = _stored(props, namespace, tensor)
     if tensor and version == namespace.version and follows != namespace.follow:
-        raise MetadataError(
+        raise MetadataRefused.of(
+            "metadata-invalid",
+            namespace.name,
             f"{namespace.name}{SEPARATOR}{FOLLOW}: stored {'with' if follows else 'without'} it at version {version}, "
-            f"which declares follow={namespace.follow}"
+            f"which declares follow={namespace.follow}",
         )
     return version, entries
 
@@ -384,7 +418,7 @@ def _load(props: Iterable[StringStringEntryProto], namespace: Namespace, tensor:
 def read(props: Iterable[StringStringEntryProto], namespace: Namespace, *, tensor: bool = False) -> dict[str, Any]:
     """The keys of ``namespace`` stored in ``props`` (a tensor's entries when
     ``tensor``), decoded (upgraded from an earlier stored version), in declaration
-    order; MetadataError as the module describes."""
+    order; MetadataRefused as the module describes."""
     version, entries = _load(props, namespace, tensor)
     if version is None:
         return {}
@@ -471,7 +505,7 @@ def merge(main: Iterable[StringStringEntryProto], other: Iterable[StringStringEn
     """The entries of two graphs merged into one: all of ``main``'s, then those of
     ``other`` that ``main`` does not state. A key both state with different text is
     taken from ``main``, unless it belongs to a typed namespace (one either graph
-    stores with a version): then MetadataError, as the two graphs disagree on a fact
+    stores with a version): then MetadataRefused, as the two graphs disagree on a fact
     (a namespace stored at two versions disagrees on its version entry)."""
     main, other = list(main), list(other)
     typed = {prop.key[: -len(SEPARATOR + VERSION)] for prop in main + other if prop.key.endswith(SEPARATOR + VERSION)}
@@ -482,7 +516,11 @@ def merge(main: Iterable[StringStringEntryProto], other: Iterable[StringStringEn
             merged.append(StringStringEntryProto(key=prop.key, value=prop.value))
             stated[prop.key] = prop.value
         elif stated[prop.key] != prop.value and prop.key.split(SEPARATOR, 1)[0] in typed:
-            raise MetadataError(f"{prop.key}: the graphs merged state {stated[prop.key]!r} and {prop.value!r}")
+            raise MetadataRefused.of(
+                "metadata-conflict",
+                prop.key.split(SEPARATOR, 1)[0],
+                f"{prop.key}: the graphs merged state {stated[prop.key]!r} and {prop.value!r}",
+            )
     return merged
 
 
@@ -493,7 +531,7 @@ __all__ = [
     "INT",
     "JSON",
     "Key",
-    "MetadataError",
+    "MetadataRefused",
     "Namespace",
     "STR",
     "clear",

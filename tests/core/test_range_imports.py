@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""The numeric range modules import only the standard library, numpy and each other."""
+"""The numeric range modules import only the standard library, numpy and their refusal bases."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ import sys
 from pathlib import Path
 
 numeric = {"qonnx.core.datatype", "qonnx.core.ranges", "qonnx.core.range_rules"}
+refusals = {"qonnx.core.findings", "qonnx.core.Refusal", "qonnx.core.Finding"}
 blocked: list[str] = []
 
 class Blocked(importlib.abc.MetaPathFinder):
@@ -53,7 +54,7 @@ class Blocked(importlib.abc.MetaPathFinder):
         if name.split(".")[0] in ("onnx", "onnxruntime", "onnxscript", "google"):
             blocked.append(name)
             raise ImportError(f"{name} is blocked")
-        if name.startswith("qonnx.") and name not in numeric | {"qonnx.core"}:
+        if name.startswith("qonnx.") and name not in numeric | refusals | {"qonnx.core"}:
             blocked.append(name)
             raise ImportError(f"non-numeric module {name} is blocked")
         return None
@@ -69,7 +70,7 @@ foreign = sorted(root for root in roots - cython if root not in sys.stdlib_modul
 assert not foreign, foreign
 
 # Inspect every import statement, including imports deferred inside functions.
-for name in sorted(numeric & set(sys.modules)):
+for name in sorted((numeric | {"qonnx.core", "qonnx.core.findings"}) & set(sys.modules)):
     item = sys.modules[name]
     source = Path(item.__file__).read_text()
     if item is module:
@@ -85,7 +86,10 @@ for name in sorted(numeric & set(sys.modules)):
             imports = [base + "." + alias.name for alias in node.names] if base in ("qonnx", "qonnx.core") else [base]
         for imported in imports:
             root = imported.split(".")[0]
-            allowed = imported in numeric if root == "qonnx" else root in sys.stdlib_module_names or root == "numpy"
+            if root == "qonnx":
+                allowed = imported in numeric | refusals
+            else:
+                allowed = root in sys.stdlib_module_names or root == "numpy"
             assert allowed, f"non-numeric import statement: {imported}"
 """
     subprocess.run([sys.executable, "-c", code, module, extra_source], check=True, capture_output=True, text=True)

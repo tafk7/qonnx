@@ -29,8 +29,8 @@
 import onnx.shape_inference as si
 from onnx import NodeProto, TensorProto, TypeProto, defs, helper
 
-from qonnx.core.modelwrapper import ModelWrapper, _custom_op_for
-from qonnx.custom_op.registry import is_custom_op, retired
+from qonnx.core.modelwrapper import ModelWrapper, TensorFactRefused, _custom_op_for
+from qonnx.custom_op.registry import CustomOpUnsupported, is_custom_op, retired
 from qonnx.transformation.base import Transformation
 from qonnx.util.basic import get_by_name, get_preferred_onnx_opset
 
@@ -44,16 +44,20 @@ def _make_shape_compatible_op(node: NodeProto, model: ModelWrapper) -> NodeProto
         # the op at the version the model imports for its domain, given the model
         # where it wants it
         inst = _custom_op_for(model, node)
-        return inst.make_shape_compatible_op(model)
-    except KeyError:
+    except KeyError as error:
         if retired(node.domain, op_type) is not None:
             # a name the domain's provider retired: its refusal, with the reason
             raise
         # exception if op_type is not supported
-        raise Exception("Custom op_type %s is currently not supported." % op_type)
+        raise CustomOpUnsupported.of(
+            "op-unsupported", "InferShapes", "Custom op_type %s is currently not supported." % op_type
+        ) from error
+    return inst.make_shape_compatible_op(model)
 
 
-def _node_output_shapes(model: ModelWrapper, node: NodeProto) -> dict[str, tuple[list[int], int]]:
+def _node_output_shapes(
+    model: ModelWrapper, node: NodeProto, *, owner: str = "CustomOp.infer_node_facts"
+) -> dict[str, tuple[list[int], int]]:
     """The outputs of the standard ONNX node ``node`` whose shapes ONNX's inference of
     that one node knows fully, each with its shape and element type (0 where ONNX
     states none). The node's inputs are read from ``model``: an initializer with its
@@ -81,7 +85,14 @@ def _node_output_shapes(model: ModelWrapper, node: NodeProto) -> dict[str, tuple
             continue
         info = model.get_tensor_valueinfo(name)
         if info is None or not (info.type.HasField("tensor_type") and info.type.tensor_type.HasField("shape")):
-            raise ValueError(f"{node.name or node.op_type}: {name} has no shape yet")
+            raise TensorFactRefused.of(
+                "fact-invalid",
+                owner,
+                f"{node.name or node.op_type}: {name} has no shape yet",
+                node=node.name or node.op_type,
+                tensor=name,
+                fact="shape",
+            )
         types[name] = info.type
     inferred = si.infer_node_outputs(schema, node, types, values, opset_imports=list(model.model.opset_import))
     shapes = {}

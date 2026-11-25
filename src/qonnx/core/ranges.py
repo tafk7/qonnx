@@ -44,7 +44,15 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
 
-from qonnx.core.datatype import BaseDataType, FixedPointType, ScaledIntType, _Endpoint, _endpoint, _exact
+from qonnx.core.datatype import (
+    BaseDataType,
+    FixedPointType,
+    NumericValueRefused,
+    ScaledIntType,
+    _Endpoint,
+    _endpoint,
+    _exact,
+)
 
 Endpoint = _Endpoint
 endpoint = _endpoint
@@ -80,7 +88,9 @@ class Range:
     def __post_init__(self) -> None:
         least, greatest = endpoint(self.least), endpoint(self.greatest)
         if not least <= greatest:
-            raise ValueError(f"a range's least end exceeds its greatest: [{least}, {greatest}]")
+            raise NumericValueRefused.of(
+                "range-invalid", "Range", f"a range's least end exceeds its greatest: [{least}, {greatest}]"
+            )
         if not isinstance(self.nan, bool):
             raise TypeError(f"a range's NaN flag is a bool, not {self.nan!r}")
         object.__setattr__(self, "least", least)
@@ -97,7 +107,7 @@ class Range:
     def integers(self) -> tuple[int, int]:
         """The ends of an integer range (``is_integer``); ``ValueError`` for any other."""
         if not (isinstance(self.least, int) and isinstance(self.greatest, int) and not self.nan):
-            raise ValueError(f"{self} is no range of integers")
+            raise NumericValueRefused.of("range-invalid", "Range.integers", f"{self} is no range of integers")
         return self.least, self.greatest
 
     def within(self, outer: Range) -> bool:
@@ -117,8 +127,10 @@ def unbounded(nan: bool) -> Range:
 
 def hull(*ranges: Range) -> Range:
     """The least range holding each of ``ranges`` (one at least)."""
+    if any(not isinstance(item, Range) for item in ranges):
+        raise TypeError("hull takes Range values")
     if not ranges:
-        raise ValueError("the hull of no range")
+        raise NumericValueRefused.of("range-invalid", "hull", "the hull of no range")
     return Range(
         min(item.least for item in ranges),
         max(item.greatest for item in ranges),
@@ -134,6 +146,8 @@ def full(datatype: BaseDataType) -> Range:
     """A datatype's own range: an integer or fixed-point datatype's bounds; a scaled
     integer's unbounded (its scale is not part of it), without NaN; a float's unbounded,
     with NaN."""
+    if not isinstance(datatype, BaseDataType):
+        raise TypeError("full takes a BaseDataType")
     if datatype.is_integer() or isinstance(datatype, FixedPointType):
         least, greatest = datatype.bounds()
         return Range(least, greatest)
@@ -147,6 +161,8 @@ def holds(datatype: BaseDataType, value: Range) -> bool:
     range without NaN; an integer datatype a range of integers within its bounds; a fixed
     point a range without NaN within its bounds. A range bounds a tensor's values; which
     of its numbers the tensor holds, its datatype says."""
+    if not isinstance(datatype, BaseDataType) or not isinstance(value, Range):
+        raise TypeError("holds takes a BaseDataType and a Range")
     if _float(datatype):
         return True
     if value.nan:
@@ -176,7 +192,7 @@ def values_range(values: npt.NDArray[Any]) -> Range:
         return Range(endpoint(float(numbers.min())), endpoint(float(numbers.max())), nan)
     found = [_exact(value) for value in flat]
     if any(value is None for value in found):
-        raise ValueError("a range is of numbers")
+        raise NumericValueRefused.of("range-invalid", "values_range", "a range is of numbers")
     nan = any(isinstance(value, float) and math.isnan(value) for value in found)
     exact_numbers = [
         value if isinstance(value, float) else Fraction(value)  # type: ignore[arg-type]

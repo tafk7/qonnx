@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from qonnx.core.datatype import _MAX_BITS, IntType
+from qonnx.core.datatype import _MAX_BITS, IntType, NumericValueRefused
 from qonnx.core.ranges import Range
 
 __all__ = ["integer_width", "range_dtype", "operand_range", "dot_range", "column_range", "gemm_result"]
@@ -49,7 +49,7 @@ def _ends(least: int, greatest: int) -> None:
     if type(least) is not int or type(greatest) is not int:
         raise TypeError(f"a rule's ends are ints, not {least!r} and {greatest!r}")
     if least > greatest:
-        raise ValueError(f"[{least}, {greatest}] is an empty range")
+        raise NumericValueRefused.of("rule-domain", "integer_width", f"[{least}, {greatest}] is an empty range")
 
 
 def integer_width(least: int, greatest: int, signed: bool) -> int:
@@ -64,7 +64,9 @@ def integer_width(least: int, greatest: int, signed: bool) -> int:
             (~least).bit_length() if least < 0 else 0,
         )
     if least < 0:
-        raise ValueError(f"[{least}, {greatest}] has negative values: no UINT holds it")
+        raise NumericValueRefused.of(
+            "rule-domain", "integer_width", f"[{least}, {greatest}] has negative values: no UINT holds it"
+        )
     return max(1, greatest.bit_length())
 
 
@@ -76,7 +78,11 @@ def range_dtype(least: int, greatest: int) -> IntType:
     signed = least < 0
     bits = integer_width(least, greatest, signed)
     if bits > _MAX_BITS:
-        raise ValueError(f"[{least}, {greatest}] needs {bits} bits, past the datatype envelope of {_MAX_BITS} bits")
+        raise NumericValueRefused.of(
+            "beyond-envelope",
+            "range_dtype",
+            f"[{least}, {greatest}] needs {bits} bits, past the datatype envelope of {_MAX_BITS} bits",
+        )
     return IntType(bits, signed)
 
 
@@ -93,7 +99,7 @@ def _length(k: int) -> None:
     if type(k) is not int:
         raise TypeError(f"a dot product's length is an int, not {k!r}")
     if k < 1:
-        raise ValueError(f"a dot product has a positive length, not {k!r}")
+        raise NumericValueRefused.of("rule-domain", "dot_range", f"a dot product has a positive length, not {k!r}")
 
 
 def dot_range(k: int, x: Range, w: Range) -> tuple[int, int]:
@@ -118,12 +124,14 @@ def column_range(x: Range, columns: Sequence[tuple[int, int]]) -> tuple[int, int
     if not isinstance(columns, Sequence) or isinstance(columns, (str, bytes)):
         raise TypeError(f"columns are a sequence of weight sums, not {columns!r}")
     if not columns:
-        raise ValueError("no column to range over")
+        raise NumericValueRefused.of("rule-domain", "column_range", "no column to range over")
     for positive, negative in columns:
         if type(positive) is not int or type(negative) is not int:
             raise TypeError(f"a column's sums are ints, not {positive!r}, {negative!r}")
         if positive < 0 or negative > 0:
-            raise ValueError(f"a column's sums are P >= 0 and N <= 0, not {positive}, {negative}")
+            raise NumericValueRefused.of(
+                "rule-domain", "column_range", f"a column's sums are P >= 0 and N <= 0, not {positive}, {negative}"
+            )
     return (
         min(low * positive + high * negative for positive, negative in columns),
         max(high * positive + low * negative for positive, negative in columns),

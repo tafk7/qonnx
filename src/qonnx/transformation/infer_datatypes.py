@@ -55,7 +55,7 @@ from qonnx.core.modelwrapper import _custom_op_for
 from qonnx.core.range_rules import column_range, dot_range, range_dtype
 from qonnx.core.ranges import Range
 from qonnx.core.tensor_ranges import RANGE, element_type, inferring, one_pass, stated, tensor_range
-from qonnx.custom_op.registry import is_custom_op, retired
+from qonnx.custom_op.registry import CustomOpUnsupported, is_custom_op, retired
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.qcdq_to_qonnx import extract_elem_type
 from qonnx.util.basic import get_by_name
@@ -723,13 +723,15 @@ def _exact_node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_d
             # the op at the version the model imports for its domain, given the model
             # where it wants it
             inst = _custom_op_for(model, node)
-            inst.infer_node_datatype(model)
-        except KeyError:
+        except KeyError as error:
             if retired(node.domain, node.op_type) is not None:
                 # a name the domain's provider retired: its refusal, with the reason
                 raise
             # exception if op_type is not supported
-            raise Exception("Custom op_type %s is currently not supported." % node.op_type)
+            raise CustomOpUnsupported.of(
+                "op-unsupported", "InferDataTypes", "Custom op_type %s is currently not supported." % node.op_type
+            ) from error
+        inst.infer_node_datatype(model)
         facts: _Facts = {}
         for out in node.output:
             if out and not allow_scaledint_dtypes and "SCALEDINT" in model.get_tensor_datatype(out).get_canonical_name():
@@ -858,13 +860,15 @@ def _node_datatype(model: ModelWrapper, node: NodeProto, allow_scaledint_dtypes:
             # the op at the version the model imports for its domain, given the model
             # where it wants it
             inst = _custom_op_for(model, node)
-            inst.infer_node_datatype(model)
-        except KeyError:
+        except KeyError as error:
             if retired(node.domain, op_type) is not None:
                 # a name the domain's provider retired: its refusal, with the reason
                 raise
             # exception if op_type is not supported
-            raise Exception("Custom op_type %s is currently not supported." % op_type)
+            raise CustomOpUnsupported.of(
+                "op-unsupported", "InferDataTypes", "Custom op_type %s is currently not supported." % op_type
+            ) from error
+        inst.infer_node_datatype(model)
     else:
         if node.op_type == "Sign":
             # always produces bipolar outputs

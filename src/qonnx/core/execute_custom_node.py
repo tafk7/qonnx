@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import qonnx.custom_op.registry as registry
 from qonnx.core.modelwrapper import _custom_op_for
+from qonnx.custom_op.registry import CustomOpUnsupported
 
 if TYPE_CHECKING:
     from qonnx.core.modelwrapper import ModelWrapper
@@ -69,10 +70,12 @@ def execute_custom_node(
             inst = registry.getCustomOp(node, onnx_opset_version=onnx_opset_version)
         else:
             inst = _custom_op_for(model, node)
-        inst.execute_node(context, graph)
-    except KeyError:
+    except KeyError as error:
         if registry.retired(node.domain, op_type) is not None:
             # a name the domain's provider retired: its refusal, with the reason
             raise
         # exception if op_type is not supported
-        raise Exception("Custom op_type %s is currently not supported." % op_type)
+        raise CustomOpUnsupported.of(
+            "op-unsupported", "execute_custom_node", "Custom op_type %s is currently not supported." % op_type
+        ) from error
+    inst.execute_node(context, graph)

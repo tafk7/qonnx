@@ -42,11 +42,11 @@ from fractions import Fraction
 from onnx import TensorProto, ValueInfoProto, helper, numpy_helper
 
 from qonnx.core import tensor_facts, tensor_ranges
-from qonnx.core.datatype import DataType
-from qonnx.core.metadata import MetadataError
-from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.core.datatype import DataType, DataTypeNameUnknown
+from qonnx.core.metadata import MetadataRefused
+from qonnx.core.modelwrapper import ModelWrapper, TensorFactRefused
 from qonnx.core.ranges import Range
-from qonnx.core.tensor_facts import FactRefused, NonTensor, TensorFacts
+from qonnx.core.tensor_facts import NonTensor, TensorFacts
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.util.basic import qonnx_make_model
@@ -125,27 +125,23 @@ def test_fact_writes_keep_scalar_zero_extent_and_missing_shape_distinct() -> Non
     assert isinstance(facts, TensorFacts) and facts.shape is None
 
 
-def test_the_reader_refuses_an_unknown_datatype_or_malformed_range_with_its_text() -> None:
+def test_the_reader_carries_datatype_and_metadata_refusals_with_the_tensor() -> None:
     m = model()
     annotation = m.graph.quantization_annotation.add(tensor_name="x")
     entry = annotation.quant_parameter_tensor_names.add(key="finn_datatype", value="unknown-type")
-    with pytest.raises(KeyError) as unknown:
+    with pytest.raises(DataTypeNameUnknown) as unknown:
         DataType[entry.value]
-    with pytest.raises(FactRefused) as translated:
+    with pytest.raises(DataTypeNameUnknown) as carried:
         m.facts("x")
-    assert translated.value.code == "fact-invalid"
-    assert translated.value.message == unknown.value.args[0]
-    assert translated.value.owner == "facts"
+    assert carried.value.findings[0] == unknown.value.findings[0].about(tensor="x")
     entry.value = "INT8"
     annotation.quant_parameter_tensor_names.add(key="qonnx.tensor/@version", value="1")
     annotation.quant_parameter_tensor_names.add(key="qonnx.tensor/range", value="malformed")
-    with pytest.raises(MetadataError) as metadata:
+    with pytest.raises(MetadataRefused) as metadata:
         m.get_stated_tensor_range("x")
-    with pytest.raises(FactRefused) as invalid:
+    with pytest.raises(MetadataRefused) as carried_metadata:
         m.facts("x")
-    assert invalid.value.message == str(metadata.value)
-    assert invalid.value.owner == "facts"
-    assert str(invalid.value) == f"facts of tensor 'x': {metadata.value}"
+    assert carried_metadata.value.findings[0] == metadata.value.findings[0].about(tensor="x")
 
 
 def test_float16_chain_keeps_its_rounding_and_states_no_intermediate_value_info() -> None:
@@ -181,9 +177,9 @@ def test_unnamed_range_cannot_be_cleared_by_conflicting_element() -> None:
     m = model()
     m.state("x", element=DataType["INT16"], range=Range(-300, 300))
     before = saved(m)
-    with pytest.raises(FactRefused) as error:
+    with pytest.raises(TensorFactRefused) as error:
         m.state("x", element=DataType["INT8"])
-    assert error.value.code == "fact-conflict"
+    assert error.value.findings[0].code == "fact-conflict"
     assert saved(m) == before
     m.unstate("x", "element")
     assert m.get_stated_tensor_range("x") == Range(-300, 300)
@@ -193,9 +189,9 @@ def test_initializer_replacement_unstate_and_forget_keep_source_coherent() -> No
     m = model()
     m.set_initializer("w", np.ones((2, 3), np.float32))
     before = saved(m)
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("w", shape=(3, 2))
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("w", container=TensorProto.DOUBLE)
     assert saved(m) == before
     m.set_initializer("w", np.zeros((3, 2), np.float64))
@@ -218,9 +214,9 @@ def test_interface_shape_can_be_unstated_but_membership_cannot_be_forgotten() ->
     m.graph.input.append(helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3]))
     m.unstate("x", "shape")
     before = saved(m)
-    with pytest.raises(FactRefused) as error:
+    with pytest.raises(TensorFactRefused) as error:
         m.forget("x")
-    assert error.value.owner == "forget"
+    assert error.value.findings[0].owner == "ModelWrapper.forget"
     assert saved(m) == before
     assert [x.name for x in m.graph.input] == ["x"]
 
@@ -255,11 +251,11 @@ def test_structural_write_never_switches_a_non_tensor_oneof(kind: str) -> None:
     found = m.facts("s")
     assert isinstance(found, NonTensor) and found.kind == kind
     assert saved(m) == before
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("s", shape=(1,))
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("s", container=TensorProto.FLOAT, element=DataType["FLOAT32"])
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.unstate("s", "shape")
     assert saved(m) == before
 
@@ -276,7 +272,7 @@ def test_sequence_survives_actual_shape_inference_and_container_refusal() -> Non
     onnx.checker.check_model(m.model)
     assert m.facts("s") == NonTensor("sequence_type")
     before = saved(m)
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("s", container=TensorProto.FLOAT)
     assert saved(m) == before
 
@@ -295,7 +291,7 @@ def test_sparse_source_is_not_read_as_a_dense_initializer_or_removed_by_forget(t
     assert m.facts("s") == NonTensor("sparse_tensor_type")
     assert m.get_initializer("s") is None
     before = saved(m)
-    with pytest.raises(FactRefused):
+    with pytest.raises(TensorFactRefused):
         m.state("s", shape=(2, 3))
     assert saved(m) == before
     m.forget("s")
@@ -335,9 +331,9 @@ def test_the_empty_name_is_refused_where_the_setters_admit_it(operation: str) ->
         "unstate": lambda: m.unstate("", "element"),
         "forget": lambda: m.forget(""),
     }[operation]
-    with pytest.raises(FactRefused) as error:
+    with pytest.raises(TensorFactRefused) as error:
         call()
-    assert (error.value.owner, error.value.code) == (operation, "fact-invalid")
+    assert (error.value.findings[0].owner, error.value.findings[0].code) == ("ModelWrapper." + operation, "fact-invalid")
     assert saved(m) == before
 
 
@@ -345,12 +341,12 @@ def test_state_refuses_an_unknown_fact() -> None:
     m = model()
     with pytest.raises(TypeError):
         m.state("x", dtype=DataType["INT8"])
-    with pytest.raises(FactRefused) as error:
+    with pytest.raises(TensorFactRefused) as error:
         tensor_facts.state(m, "x", dtype=DataType["INT8"])
-    assert (error.value.owner, error.value.code) == ("state", "fact-invalid")
-    with pytest.raises(FactRefused) as error:
+    assert (error.value.findings[0].owner, error.value.findings[0].code) == ("ModelWrapper.state", "fact-invalid")
+    with pytest.raises(TensorFactRefused) as error:
         m.unstate("x", "dtype")
-    assert (error.value.owner, error.value.code) == ("unstate", "fact-invalid")
+    assert (error.value.findings[0].owner, error.value.findings[0].code) == ("ModelWrapper.unstate", "fact-invalid")
     assert m.facts("x") == TensorFacts(None, None, None, None, None)
 
 

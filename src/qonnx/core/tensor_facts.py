@@ -33,8 +33,10 @@ info, else its initializer; its datatype (``element``), range and layout, from i
 quantization annotation. ``read`` answers all of them, each None where the model
 states none, validating what it reads; ``state`` writes only the facts it is given,
 all or none of them; ``unstate`` removes one; ``forget`` removes a tensor's value
-info and annotation. A refusal is a ``FactRefused``, which leaves the model as it
-was.
+info and annotation. A refusal is a ``TensorFactRefused``, which leaves the model as it
+was. Datatype-name and metadata refusals propagate with their original classes;
+unknown stored datatype names are KeyError, and malformed names or metadata are
+ValueError. Every carried finding names its tensor.
 
 ``state`` and ModelWrapper's setters (``set_tensor_datatype``, ``set_tensor_shape``,
 ``set_tensor_layout``) share the writes below (``write_entry``, ``place_valueinfo``)
@@ -58,7 +60,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, Optional, Union, cast
 
 from qonnx.core import metadata
 from qonnx.core.datatype import BaseDataType, DataType
-from qonnx.core.metadata import MetadataError
+from qonnx.core.findings import Refusal
 from qonnx.core.ranges import Range, full, holds
 from qonnx.core.tensor_ranges import RANGE, TENSOR, _contradiction, stated
 from qonnx.util.basic import get_by_name
@@ -68,7 +70,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Fact",
-    "FactRefused",
     "NonTensor",
     "NonTensorKind",
     "TensorFacts",
@@ -110,20 +111,6 @@ class NonTensor:
     kind: NonTensorKind
 
 
-class FactRefused(ValueError):
-    """A fact operation's refusal: the operation (``owner``), the tensor, a ``code``
-    ("fact-invalid", "fact-conflict", "fact-non-tensor", "fact-source",
-    "container-initializer"), the message, and details (such as the fact)."""
-
-    def __init__(self, owner: str, tensor: str, code: str, message: str, details: dict[str, Any]) -> None:
-        super().__init__(f"{owner} of tensor {tensor!r}: {message}")
-        self.owner = owner
-        self.tensor = tensor
-        self.code = code
-        self.message = message
-        self.details = details
-
-
 class _Omitted:
     """A fact not given to ``state``."""
 
@@ -132,24 +119,27 @@ _OMITTED = _Omitted()
 
 
 def _refuse(owner: str, name: str, code: str, message: str, **details: Any) -> NoReturn:
-    raise FactRefused(owner, name, code, message, details)
+    from qonnx.core.modelwrapper import TensorFactRefused
+
+    raise TensorFactRefused.of(code, "ModelWrapper." + owner, message, tensor=name, **details)
 
 
 @contextmanager
 def _refusing(owner: str, name: str) -> Iterator[None]:
-    """Refuse the empty name, and translate what the reads below raise into a
-    FactRefused with its text."""
+    """Carry a refusal unchanged, adding its tensor; translate other value errors."""
+    from qonnx.core.modelwrapper import TensorFactRefused
+
     if not name:
         _refuse(owner, name, "fact-invalid", "an empty name identifies no tensor")
     try:
         yield
-    except FactRefused:
+    except Refusal as error:
+        error.findings = tuple(found.about(tensor=name) for found in error.findings)
         raise
-    except KeyError as error:  # an unknown datatype name
-        message = str(error.args[0]) if error.args else str(error)
-        raise FactRefused(owner, name, "fact-invalid", message, {"source": "KeyError"}) from error
-    except (MetadataError, ValueError) as error:
-        raise FactRefused(owner, name, "fact-invalid", str(error), {"source": type(error).__name__}) from error
+    except ValueError as error:
+        raise TensorFactRefused.of(
+            "fact-invalid", "ModelWrapper." + owner, str(error), tensor=name, source=type(error).__name__
+        ) from error
 
 
 # -- the writes shared with the setters
@@ -243,7 +233,11 @@ def _entry_value(annotation: Optional[TensorAnnotation], key: str) -> Optional[s
         return None
     entries = [x for x in annotation.quant_parameter_tensor_names if x.key == key]
     if len(entries) > 1:
-        raise MetadataError(f"duplicate {key} annotation")
+        from qonnx.core.modelwrapper import TensorFactRefused
+
+        raise TensorFactRefused.of(
+            "fact-conflict", "ModelWrapper.state", f"duplicate {key} annotation", tensor=annotation.tensor_name, fact=key
+        )
     return entries[0].value if entries else None
 
 
@@ -267,7 +261,7 @@ def _layout(model: ModelWrapper, name: str, annotation: Optional[TensorAnnotatio
 
 def read(model: ModelWrapper, name: str) -> Union[TensorFacts, NonTensor]:
     """The facts the model states of the tensor ``name`` (ModelWrapper.facts), or the
-    kind of a value that is not a tensor. It changes nothing. FactRefused where they
+    kind of a value that is not a tensor. It changes nothing. TensorFactRefused where they
     contradict each other (a shape or container its initializer does not have, a
     range its datatype does not hold), where one is stored more than once, or where
     one is malformed. A shape with a symbolic or unknown extent is None."""
@@ -296,7 +290,7 @@ def read(model: ModelWrapper, name: str) -> Union[TensorFacts, NonTensor]:
             if shape is not None and shape != tuple(source.dims):
                 _refuse("facts", name, "fact-conflict", "shape contradicts initializer", fact="shape")
             if container is not None and container != source.data_type:
-                _refuse("facts", name, "container-initializer", "container contradicts initializer", fact="container")
+                _refuse("facts", name, "fact-conflict", "container contradicts initializer", fact="container")
         annotation = _annotation(model, name, "facts")
         if annotation is not None:
             keys = [x.key for x in annotation.quant_parameter_tensor_names if x.key in (_DATATYPE, _LAYOUT, RANGE.entry)]
@@ -353,7 +347,7 @@ def _structure(
             if source is not None and tuple(shape) != tuple(source.dims):
                 _refuse(owner, name, "fact-conflict", "shape contradicts initializer", fact="shape")
     if source is not None and tensor.HasField("elem_type") and tensor.elem_type != source.data_type:
-        _refuse(owner, name, "container-initializer", "container contradicts initializer", fact="container")
+        _refuse(owner, name, "fact-conflict", "container contradicts initializer", fact="container")
     if old is None and patch.get("shape") is None and patch.get("container") is None:
         return None
     return info
@@ -448,7 +442,7 @@ def _prepare(
 def state(model: ModelWrapper, name: str, **patch: Any) -> None:
     """State the facts given (``shape``, ``element``, ``range``, ``layout``,
     ``container``; None removes one) of the tensor ``name``, keeping the others: all
-    of them, or none and a FactRefused. A range its datatype does not hold is not
+    of them, or none and a TensorFactRefused. A range its datatype does not hold is not
     stored, and is named (RangeContradiction), as by set_tensor_datatype; a datatype
     that does not hold the range the tensor states is refused. An annotation-only
     write makes no value info. The five fields ``read`` answers for a tensor are
@@ -482,7 +476,7 @@ def unstate(model: ModelWrapper, name: str, fact: Fact) -> None:
 
 def forget(model: ModelWrapper, name: str) -> None:
     """Remove the value info and the annotation of the tensor ``name``; its
-    initializer stays. FactRefused for a graph input or output."""
+    initializer stays. TensorFactRefused for a graph input or output."""
     with _refusing("forget", name):
         if any(x.name == name for x in (*model.graph.input, *model.graph.output)):
             _refuse("forget", name, "fact-source", "forget would remove a graph interface member")

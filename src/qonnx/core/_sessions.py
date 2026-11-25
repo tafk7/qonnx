@@ -83,7 +83,14 @@ def reusing(threads: Optional[int]) -> Iterator[None]:
         if isinstance(threads, bool) or not isinstance(threads, int):
             raise TypeError(f"threads must be an int or None, not {type(threads).__name__}")
         if not 1 <= threads <= _MAX_THREADS:
-            raise ValueError(f"threads must be in [1, {_MAX_THREADS}], not {threads}")
+            from qonnx.core.onnx_exec import ExecutionValueRefused
+
+            raise ExecutionValueRefused.of(
+                "setting-invalid",
+                "reuse_sessions",
+                f"threads must be in [1, {_MAX_THREADS}], not {threads}",
+                threads=threads,
+            )
     token = _REUSE.set(_Reuse(threads))
     try:
         yield

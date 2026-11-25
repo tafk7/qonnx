@@ -169,11 +169,11 @@ A graph's ``metadata_props`` hold string keys and string values (``get_metadata_
   model.metadata_namespace(BOARD)           # {"period_ns": 5.0}
   model.delete_metadata(PERIOD_NS)
 
-A key's type is ``str``, ``int``, ``float``, ``bool``, an ``Enum`` subclass (stored by member name) or ``JSON``; each key is one entry ``<namespace>/<key>`` holding the type's canonical text, so the metadata stays readable in ONNX tools. Nothing coerces: a malformed stored value, a value of the wrong type, a stored key the namespace does not declare, or a version the reader cannot upgrade from raises ``MetadataError``. A namespace changed incompatibly raises its version and registers an upgrade from the earlier one (``BOARD.upgrade(1, function)``); readers upgrade what they read, and writers rewrite the namespace at the current version.
+A key's type is ``str``, ``int``, ``float``, ``bool``, an ``Enum`` subclass (stored by member name) or ``JSON``; each key is one entry ``<namespace>/<key>`` holding the type's canonical text, so the metadata stays readable in ONNX tools. Nothing coerces: a malformed stored value, a value of the wrong type, a stored key the namespace does not declare, or a version the reader cannot upgrade from raises ``MetadataRefused``. A namespace changed incompatibly raises its version and registers an upgrade from the earlier one (``BOARD.upgrade(1, function)``); readers upgrade what they read, and writers rewrite the namespace at the current version.
 
-Transformations that edit the graph in place keep its metadata; ``MergeONNXModels`` keeps both graphs' (a typed key the two state differently raises ``MetadataError``). A subgraph body (a graph attribute) holds metadata of its own. A namespace declared with ``inherit=True`` reaches into bodies: a body opened with ``make_subgraph_modelwrapper`` (as ``transform(..., apply_to_subgraphs=True)`` does) reads a key it does not state itself from the model it is a body of. A body read alone has only its own keys, so code that extracts a body to stand alone copies them in first with ``body.inherit_metadata(namespace)`` (or ``inherit_metadata(namespace, parent=model)`` for a model built apart from its parent).
+Transformations that edit the graph in place keep its metadata; ``MergeONNXModels`` keeps both graphs' (a typed key the two state differently raises ``MetadataRefused``). A subgraph body (a graph attribute) holds metadata of its own. A namespace declared with ``inherit=True`` reaches into bodies: a body opened with ``make_subgraph_modelwrapper`` (as ``transform(..., apply_to_subgraphs=True)`` does) reads a key it does not state itself from the model it is a body of. A body read alone has only its own keys, so code that extracts a body to stand alone copies them in first with ``body.inherit_metadata(namespace)`` (or ``inherit_metadata(namespace, parent=model)`` for a model built apart from its parent).
 
-A tensor has typed metadata of its own: ``get_metadata``, ``set_metadata``, ``delete_metadata`` and ``metadata_namespace`` take ``tensor=`` (a tensor name; without it they are the graph's), for any tensor, initializers included. A tensor the graph does not have raises ``MetadataError``. A tensor's keys are stored as the graph's are, in its entry of the graph's ``quantization_annotation`` (beside its ``finn_datatype`` and ``tensor_layout``), so they survive ``set_tensor_shape`` and ``set_initializer``, are renamed with the tensor (``rename_tensor``) and removed with it (``RemoveUnusedTensors``). A body's tensor keys are its own (``inherit`` concerns graph keys).
+A tensor has typed metadata of its own: ``get_metadata``, ``set_metadata``, ``delete_metadata`` and ``metadata_namespace`` take ``tensor=`` (a tensor name; without it they are the graph's), for any tensor, initializers included. A tensor the graph does not have raises ``MetadataRefused``. A tensor's keys are stored as the graph's are, in its entry of the graph's ``quantization_annotation`` (beside its ``finn_datatype`` and ``tensor_layout``), so they survive ``set_tensor_shape`` and ``set_initializer``, are renamed with the tensor (``rename_tensor``) and removed with it (``RemoveUnusedTensors``). A body's tensor keys are its own (``inherit`` concerns graph keys).
 ::
 
   STREAM = Namespace("mytool.stream", version=1, follow=True)
@@ -202,3 +202,26 @@ Transformation Pass
 ===================
 
 A transformation passes changes (transforms) the given model, it gets the model in the ModelWrapper as input and returns the changed model (ModelWrapper) to the QONNX flow. Additional the flag *model_was_changed* which indicates if a transformation has to be performed more than once, is returned. If you are interested in how to write a transformation pass for QONNX, please take a look at the Jupyter notebook about how to write a transformation pass, see chapter :ref:`tutorials` for details. For more information about existing transformation passes in QONNX, see module :py:mod:`qonnx.transformation`.
+
+Refusals
+--------
+
+A refusal carries the findings that explain why a request could not be admitted.
+Import the shared types from ``qonnx.core.findings``. A finding gives its ``code``,
+public ``owner``, ``message`` and immutable ``details``; ``record()`` gives JSON
+values. Read an exception's reasons through ``error.findings``::
+
+  from qonnx.core.findings import Refusal
+
+  try:
+      model.state("activation", shape=(-1,))
+  except Refusal as error:
+      for finding in error.findings:
+          print(finding.subject_line())
+
+Operation families define their classes beside their implementations. Datatype
+names preserve the lookup's ``KeyError`` for unknown names and ``ValueError`` for
+malformed parameters. Numeric-value, tensor-fact and metadata refusals are also
+``ValueError``. Exact-execution refusals keep their ``ArithmeticError``,
+``NotImplementedError`` or ``ValueError`` bases, so existing handlers still work.
+Refusals and their findings can be pickled, including a subclass's extra state.

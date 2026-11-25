@@ -42,7 +42,7 @@ from typing import Callable, Sequence
 
 from qonnx.core import metadata
 from qonnx.core.datatype import DataType
-from qonnx.core.metadata import MetadataError, Namespace
+from qonnx.core.metadata import MetadataRefused, Namespace
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.transformation.create_generic_partitions import PartitionFromDict, PartitionFromLambda
@@ -175,11 +175,11 @@ def test_a_tensor_states_its_own_keys_apart_from_the_graph(kind: str) -> None:
 
 def test_a_tensor_key_refuses_what_its_namespace_refuses() -> None:
     model = make_model()
-    with pytest.raises(MetadataError, match="test.stream/depth: cannot store 0: expected an int, a depth > 0"):
+    with pytest.raises(MetadataRefused, match="test.stream/depth: cannot store 0: expected an int, a depth > 0"):
         model.set_metadata(DEPTH, 0, tensor="h")
     assert entries(model, "h") is None  # nothing written, no annotation left
     store(model, "r", **{"test.stream/@version": "1", "test.stream/@follow": "true", "test.stream/style": "WIDE"})
-    with pytest.raises(MetadataError, match="test.stream/style: stored 'WIDE' is not a Style"):
+    with pytest.raises(MetadataRefused, match="test.stream/style: stored 'WIDE' is not a Style"):
         model.get_metadata(DEPTH, tensor="r")  # a namespace is read whole
 
 
@@ -196,7 +196,7 @@ def test_a_tensor_key_refuses_what_its_namespace_refuses() -> None:
 )
 def test_a_tensor_the_graph_does_not_have_is_refused_by_name(call: Callable[[ModelWrapper], object]) -> None:
     model = make_model()
-    with pytest.raises(MetadataError, match="tensor 'nope': the graph has no tensor of that name"):
+    with pytest.raises(MetadataRefused, match="tensor 'nope': the graph has no tensor of that name"):
         call(model)
     assert len(model.graph.quantization_annotation) == 0
 
@@ -239,7 +239,7 @@ def test_clear_removes_a_namespace_from_one_tensor_or_from_every_tensor_as_store
     assert model.get_metadata(DEPTH) is None
     # a namespace stored malformed, or at a version the reader cannot read, is cleared too
     store(model, "r", **{"test.stream/@version": "5", "test.stream/width": "x"})
-    with pytest.raises(MetadataError):
+    with pytest.raises(MetadataRefused):
         model.metadata_namespace(STREAM, tensor="r")
     model.clear_metadata(STREAM, tensor="r")
     assert model.metadata_namespace(STREAM, tensor="r") == {}
@@ -270,7 +270,7 @@ def test_a_tensor_key_is_renamed_with_its_tensor(kind: str) -> None:
         model.metadata_namespace(STREAM, tensor="renamed") == stream
         and model.metadata_namespace(NOTES, tensor="renamed") == notes
     )
-    with pytest.raises(MetadataError, match=f"tensor '{tensor}'"):
+    with pytest.raises(MetadataRefused, match=f"tensor '{tensor}'"):
         model.get_metadata(DEPTH, tensor=tensor)
     assert_annotated(model)
 
@@ -417,20 +417,22 @@ def test_a_version_may_change_whether_its_namespace_follows() -> None:
 def test_a_tensor_namespace_stored_unlike_its_declaration_is_refused(raw: dict[str, str], refusal: str) -> None:
     model = make_model()
     store(model, "r", **raw)
-    with pytest.raises(MetadataError, match=refusal):
+    with pytest.raises(MetadataRefused, match=refusal):
         model.metadata_namespace(STREAM, tensor="r")
-    with pytest.raises(MetadataError, match=refusal):
+    with pytest.raises(MetadataRefused, match=refusal):
         model.set_metadata(DEPTH, 1, tensor="r")
 
 
 def test_follow_is_a_tensor_s_and_must_match_the_declaration() -> None:
     model = make_model()
     store(model, "r", **{"test.notes/@version": "1", "test.notes/@follow": "true", "test.notes/note": "n"})
-    with pytest.raises(MetadataError, match="test.notes/@follow: stored with it at version 1, which declares follow=False"):
+    with pytest.raises(
+        MetadataRefused, match="test.notes/@follow: stored with it at version 1, which declares follow=False"
+    ):
         model.get_metadata(NOTE, tensor="r")
     model.set_metadata_prop("test.stream/@version", "1")
     model.set_metadata_prop("test.stream/@follow", "true")
-    with pytest.raises(MetadataError, match="test.stream/@follow: stored on a graph"):
+    with pytest.raises(MetadataRefused, match="test.stream/@follow: stored on a graph"):
         model.get_metadata(DEPTH)
     # a following namespace stored on the graph states no @follow
     model.clear_metadata(STREAM)

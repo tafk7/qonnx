@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from qonnx.core import metadata
-from qonnx.core.metadata import JSON, MetadataError, Namespace
+from qonnx.core.datatype import DataType, DataTypeNameUnknown
+from qonnx.core.metadata import JSON, MetadataRefused, Namespace
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.general import GiveUniqueNodeNames
@@ -61,6 +62,25 @@ def make_namespace(version: int = 1) -> tuple[Namespace, dict[str, metadata.Key[
         table=ns.key("table", JSON),
     )
     return ns, keys
+
+
+@pytest.mark.parametrize("encoding", [False, True])
+def test_datatype_codec_errors_are_chained_from_the_metadata_boundary(encoding: bool) -> None:
+    codec = metadata.Codec(
+        "a datatype name",
+        lambda value: isinstance(value, str),
+        lambda name: DataType[name].name,
+        lambda name: DataType[name].name,
+    )
+    key = Namespace("test.datatype").key("element", codec)
+    with pytest.raises(MetadataRefused) as caught:
+        (key.encode if encoding else key.decode)("FOO")
+    assert isinstance(caught.value, ValueError)
+    assert caught.value.findings[0].code == "metadata-invalid"
+    cause = caught.value.__cause__
+    assert isinstance(cause, DataTypeNameUnknown) and isinstance(cause, KeyError)
+    assert cause.findings[0].code == "name-unknown"
+    assert dict(cause.findings[0].details)["name"] == "FOO"
 
 
 def entries(graph: GraphProto) -> dict[str, str]:
@@ -136,7 +156,7 @@ def test_an_absent_namespace_reads_empty() -> None:
 def test_a_value_of_the_wrong_type_is_refused_on_writing(name: str, value: object) -> None:
     ns, k = make_namespace()
     graph = GraphProto()
-    with pytest.raises(MetadataError, match=f"test.platform/{name}: cannot store"):
+    with pytest.raises(MetadataRefused, match=f"test.platform/{name}: cannot store"):
         metadata.write(graph.metadata_props, k[name], value)
     assert entries(graph) == {}
 
@@ -160,16 +180,16 @@ def test_a_malformed_stored_value_is_refused_naming_entry_text_and_expectation(
     ns, _ = make_namespace()
     graph = GraphProto()
     store(graph, **{"test.platform/@version": "1", f"test.platform/{name}": text})
-    with pytest.raises(MetadataError) as refusal:
+    with pytest.raises(MetadataRefused) as refusal:
         metadata.read(graph.metadata_props, ns)
-    assert str(refusal.value).startswith(f"test.platform/{name}: stored {text!r} is not {expectation}")
+    assert refusal.value.findings[0].message.startswith(f"test.platform/{name}: stored {text!r} is not {expectation}")
 
 
 def test_an_undeclared_stored_key_is_refused() -> None:
     ns, _ = make_namespace()
     graph = GraphProto()
     store(graph, **{"test.platform/@version": "1", "test.platform/clock": "5"})
-    with pytest.raises(MetadataError, match=r"stored keys \['clock'\] are not declared"):
+    with pytest.raises(MetadataRefused, match=r"stored keys \['clock'\] are not declared"):
         metadata.read(graph.metadata_props, ns)
 
 
@@ -177,11 +197,11 @@ def test_keys_without_a_version_and_malformed_versions_are_refused() -> None:
     ns, _ = make_namespace()
     graph = GraphProto()
     store(graph, **{"test.platform/part": "x"})
-    with pytest.raises(MetadataError, match="without test.platform/@version"):
+    with pytest.raises(MetadataRefused, match="without test.platform/@version"):
         metadata.read(graph.metadata_props, ns)
     graph = GraphProto()
     store(graph, **{"test.platform/@version": "v1"})
-    with pytest.raises(MetadataError, match="is not a positive int"):
+    with pytest.raises(MetadataRefused, match="is not a positive int"):
         metadata.read(graph.metadata_props, ns)
 
 
@@ -190,7 +210,7 @@ def test_an_entry_stored_twice_is_refused() -> None:
     graph = GraphProto()
     store(graph, **{"test.platform/@version": "1", "test.platform/part": "x"})
     store(graph, **{"test.platform/part": "y"})
-    with pytest.raises(MetadataError, match="test.platform/part: stored twice"):
+    with pytest.raises(MetadataRefused, match="test.platform/part: stored twice"):
         metadata.read(graph.metadata_props, ns)
 
 
@@ -199,12 +219,12 @@ def test_a_version_the_reader_cannot_upgrade_from_is_refused() -> None:
     graph = GraphProto()
     store(graph, **{"test.platform/@version": "1", "test.platform/part": "x"})
     with pytest.raises(
-        MetadataError, match=r"stored at version 1, which a reader of version 2 cannot upgrade from \(it has no upgrade\)"
+        MetadataRefused, match=r"stored at version 1, which a reader of version 2 cannot upgrade from \(it has no upgrade\)"
     ):
         metadata.read(graph.metadata_props, ns)
     newer = GraphProto()
     store(newer, **{"test.platform/@version": "3", "test.platform/part": "x"})
-    with pytest.raises(MetadataError, match="stored at version 3"):
+    with pytest.raises(MetadataRefused, match="stored at version 3"):
         metadata.read(newer.metadata_props, ns)
 
 
@@ -307,11 +327,11 @@ def test_modelwrapper_reads_and_writes_typed_keys_on_the_graph(tmp_path: Path) -
 def test_modelwrapper_refuses_what_the_namespace_refuses() -> None:
     ns, k = make_namespace()
     model = make_model()
-    with pytest.raises(MetadataError, match="cannot store 'fast'"):
+    with pytest.raises(MetadataRefused, match="cannot store 'fast'"):
         model.set_metadata(k["period"], "fast")
     model.set_metadata_prop("test.platform/@version", "1")
     model.set_metadata_prop("test.platform/period", "fast")
-    with pytest.raises(MetadataError, match="test.platform/period: stored 'fast'"):
+    with pytest.raises(MetadataRefused, match="test.platform/period: stored 'fast'"):
         model.get_metadata(k["part"])  # a namespace is read whole
 
 
@@ -538,5 +558,5 @@ def test_merge_takes_main_then_other_and_refuses_a_namespace_at_two_versions() -
     ]
     newer = GraphProto()
     store(newer, **{"test.platform/@version": "2"})
-    with pytest.raises(MetadataError, match="test.platform/@version: the graphs merged state '1' and '2'"):
+    with pytest.raises(MetadataRefused, match="test.platform/@version: the graphs merged state '1' and '2'"):
         metadata.merge(main.metadata_props, newer.metadata_props)

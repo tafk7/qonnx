@@ -141,6 +141,8 @@ def _check_output(name: str, count: int, scale: Any, bias: Any, container: str) 
     result at some count in [0, count], or, for an integer scale and bias, where the
     container does not hold an exact result. A fractional result declared FLOAT32 is
     not checked against it: it keeps its floating precision."""
+    from qonnx.core.onnx_exec import ExecutionValueRefused
+
     declared = DataType[name] if name else None
     integer = _integral(scale) and _integral(bias)
     carried_as = np.dtype(container)
@@ -152,9 +154,11 @@ def _check_output(name: str, count: int, scale: Any, bias: Any, container: str) 
                 result = (scale * np.asarray([value], dtype=carried_as) + bias)[0]
             floating = not integer and name == "FLOAT32"
             if declared is not None and not floating and not declared.contains(result):
-                raise ValueError(
+                raise ExecutionValueRefused.of(
+                    "threshold-output-range",
+                    "MultiThreshold.execute_node",
                     f"out_dtype {declared.name} cannot hold {result} at count {value} "
-                    f"(scale {scale}, bias {bias}, counts [0, {count}])"
+                    f"(scale {scale}, bias {bias}, counts [0, {count}])",
                 )
             if integer:
                 if carried_as.kind in "iu":
@@ -164,9 +168,11 @@ def _check_output(name: str, count: int, scale: Any, bias: Any, container: str) 
                     carried = np.asarray(result, dtype=carried_as).item()
                     exact = bool(np.isfinite(carried)) and int(carried) == result
                 if not exact:
-                    raise ValueError(
+                    raise ExecutionValueRefused.of(
+                        "threshold-output-container",
+                        "MultiThreshold.execute_node",
                         f"the {carried_as.name} container cannot hold exact result {result} "
-                        f"at count {value} (scale {scale}, bias {bias}, counts [0, {count}])"
+                        f"at count {value} (scale {scale}, bias {bias}, counts [0, {count}])",
                     )
 
 

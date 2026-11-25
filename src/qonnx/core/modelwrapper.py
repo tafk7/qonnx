@@ -32,16 +32,16 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
-from pathlib import Path
+import numpy as np
 import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as np_helper
 import os
 import re
 import warnings
-import numpy as np
-from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence, TypeVar, cast, overload
 from onnx import GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence, TypeVar, cast, overload
 
 if TYPE_CHECKING:
     from qonnx.custom_op.base import CustomOp
@@ -49,7 +49,9 @@ if TYPE_CHECKING:
 
 import qonnx.util.basic as util
 import qonnx.util.onnx as onnxutil
-from qonnx.core.datatype import BaseDataType, DataType
+from qonnx.core import metadata, ranges, tensor_facts, tensor_ranges
+from qonnx.core.datatype import BaseDataType, DataType, DataTypeNameRefused
+from qonnx.core.findings import Refusal
 from qonnx.custom_op.registry import RENAMED, getCustomOp, is_custom_op
 from qonnx.transformation.double_to_single_float import DoubleToSingleFloat
 from qonnx.transformation.general import (
@@ -61,7 +63,8 @@ from qonnx.transformation.general import (
 )
 
 
-from qonnx.core import metadata, ranges, tensor_facts, tensor_ranges
+class TensorFactRefused(Refusal, ValueError):
+    """A model's tensor facts cannot be read or written consistently."""
 
 
 class _AnnotationScalars(ast.NodeTransformer):
@@ -138,7 +141,13 @@ def _literal_annotation(value: str, key: str, tensor_name: str) -> Any:
         tree = ast.parse(value.lstrip(" \t"), mode="eval")
         return ast.literal_eval(_AnnotationScalars().visit(tree))
     except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as e:
-        raise ValueError(f"{key} annotation of tensor {tensor_name} is not a Python literal: {value!r}") from e
+        raise TensorFactRefused.of(
+            "fact-invalid",
+            "ModelWrapper.get_tensor_layout" if key == "tensor_layout" else "ModelWrapper.get_tensor_sparsity",
+            f"{key} annotation of tensor {tensor_name} is not a Python literal: {value!r}",
+            tensor=tensor_name,
+            fact=key,
+        ) from e
 
 
 def _plain_annotation_numbers(value: Any) -> Any:
@@ -437,7 +446,11 @@ class ModelWrapper:
                 ret.quant_parameter_tensor_names, "finn_datatype", "key"
             )
             if ret is not None:
-                return DataType[ret.value]
+                try:
+                    return DataType[ret.value]
+                except DataTypeNameRefused as error:
+                    error.findings = tuple(found.about(tensor=tensor_name) for found in error.findings)
+                    raise
         onnx_dtype_to_qonnx_dtype = {
             TensorProto.FLOAT: "FLOAT32",
             TensorProto.FLOAT16: "FLOAT16",
@@ -476,7 +489,13 @@ class ModelWrapper:
         refusal, or its RangeContradiction raised as an error, leaves the model as it
         was."""
         if datatype is None and range is not None:
-            raise ValueError(f"tensor {tensor_name!r}: a range is stated with a datatype, not with None")
+            raise TensorFactRefused.of(
+                "fact-invalid",
+                "ModelWrapper.set_tensor_datatype",
+                f"tensor {tensor_name!r}: a range is stated with a datatype, not with None",
+                tensor=tensor_name,
+                fact="element",
+            )
         if range is not None:
             # checked, and named if its datatype does not hold it, before anything is written
             range = tensor_ranges.prepare(self, tensor_name, datatype, range)
@@ -487,7 +506,9 @@ class ModelWrapper:
         """The facts the model states of the tensor with given name, in one read
         (qonnx.core.tensor_facts.read): its shape, datatype (``element``), range,
         layout and container, each None where none is stated; NonTensor for a value
-        that is not a tensor. FactRefused (a ValueError) where they contradict each
+        that is not a tensor. A datatype-name refusal keeps KeyError for an unknown
+        name or ValueError for malformed parameters; a metadata refusal keeps ValueError.
+        TensorFactRefused (a ValueError) where the facts contradict each
         other or one is malformed."""
         return tensor_facts.read(self, tensor_name)
 
@@ -506,7 +527,9 @@ class ModelWrapper:
         it admits only non-negative integer extents and a shape and container the
         tensor's initializer agrees with, refuses the empty name, and keeps the rest
         of a value info (doc string, denotations), a graph input's or output's
-        updated in place. FactRefused (a ValueError) for what it refuses.
+        updated in place. TensorFactRefused (a ValueError) for contradictory facts.
+        Datatype-name and metadata refusals propagate with their original class:
+        KeyError for an unknown stored datatype, ValueError for malformed metadata.
         ``container=None`` removes the element type, after which a graph input or
         output does not pass ONNX's checker."""
         given = (("shape", shape), ("element", element), ("range", range), ("layout", layout), ("container", container))
@@ -521,13 +544,13 @@ class ModelWrapper:
 
     def forget(self, tensor_name: str) -> None:
         """Remove the value info and the annotation of the tensor with given name;
-        its initializer stays. FactRefused for a graph input or output."""
+        its initializer stays. TensorFactRefused for a graph input or output."""
         tensor_facts.forget(self, tensor_name)
 
     def get_tensor_range(self, tensor_name: str) -> ranges.Range:
         """The range of the tensor with given name (qonnx.core.ranges): for an
         initializer, the exact range of its values; else the range it states with its
-        datatype, or its datatype's full range. MetadataError for a stored range that
+        datatype, or its datatype's full range. MetadataRefused for a stored range that
         is malformed or that its datatype does not hold."""
         values = self.get_initializer(tensor_name)
         if values is not None:
@@ -536,13 +559,13 @@ class ModelWrapper:
 
     def get_stated_tensor_range(self, tensor_name: str) -> ranges.Range | None:
         """The range stored with the datatype of the tensor with given name, None
-        where it states none; an initializer's values are not read. MetadataError
+        where it states none; an initializer's values are not read. MetadataRefused
         for a stored range that is malformed."""
         return tensor_ranges.stated(self, tensor_name)
 
     def get_tensor_annotation_range(self, tensor_name: str) -> ranges.Range:
         """The range the tensor with given name states, or its datatype's full range,
-        without reading an initializer's values. MetadataError as get_tensor_range,
+        without reading an initializer's values. MetadataRefused as get_tensor_range,
         its message showing the range as qonnx.core.ranges does."""
         return tensor_ranges.tensor_range(self, tensor_name, numeric_text=True)
 
@@ -949,11 +972,13 @@ class ModelWrapper:
         else:
             metadata_prop.value = value
 
-    def _tensor_annotation(self, tensor: str) -> onnx.TensorAnnotation | None:
+    def _tensor_annotation(self, tensor: str, owner: str) -> onnx.TensorAnnotation | None:
         """A tensor's quantization annotation, which holds its metadata entries, if
-        it has one. MetadataError for a name the graph has no tensor of."""
+        it has one. MetadataRefused for a name the graph has no tensor of."""
         if tensor not in self._tensor_names():
-            raise metadata.MetadataError(f"tensor {tensor!r}: the graph has no tensor of that name")
+            raise metadata.MetadataRefused.of(
+                "metadata-tensor", owner, f"tensor {tensor!r}: the graph has no tensor of that name", tensor=tensor
+            )
         return util.get_by_name(self.graph.quantization_annotation, tensor, "tensor_name")
 
     def _tensor_names(self) -> set[str]:
@@ -976,19 +1001,19 @@ class ModelWrapper:
     def get_metadata(self, key: metadata.Key[T], *, tensor: str | None = None) -> T | None:
         """The value of a typed metadata key (:py:mod:`qonnx.core.metadata`) of the
         graph, or of the named tensor, or None when it does not state it. Raises
-        MetadataError when the key's namespace is stored malformed, or for a
+        MetadataRefused when the key's namespace is stored malformed, or for a
         tensor the graph does not have."""
         return self.metadata_namespace(key.namespace, tensor=tensor).get(key.name)
 
     def set_metadata(self, key: metadata.Key[T], value: T, *, tensor: str | None = None) -> None:
         """Store a value under a typed metadata key, with its namespace's version, on
         the graph or on the named tensor (any tensor: an input, an output, an
-        intermediate or an initializer). Raises MetadataError for a value the key
+        intermediate or an initializer). Raises MetadataRefused for a value the key
         does not admit, or for a tensor the graph does not have."""
         if tensor is None:
             metadata.write(self.graph.metadata_props, key, value)
             return
-        annotation = self._tensor_annotation(tensor)
+        annotation = self._tensor_annotation(tensor, key.namespace.name)
         if annotation is not None:
             metadata.write(annotation.quant_parameter_tensor_names, key, value, tensor=True)
             return
@@ -1000,24 +1025,24 @@ class ModelWrapper:
     def delete_metadata(self, key: metadata.Key[Any], *, tensor: str | None = None) -> None:
         """Remove a typed metadata key (and its namespace's version with the last
         key) from the graph or the named tensor; nothing happens when it does not
-        state it. MetadataError for a tensor the graph does not have."""
+        state it. MetadataRefused for a tensor the graph does not have."""
         if tensor is None:
             metadata.delete(self.graph.metadata_props, key)
             return
-        annotation = self._tensor_annotation(tensor)
+        annotation = self._tensor_annotation(tensor, key.namespace.name)
         if annotation is not None:
             metadata.delete(annotation.quant_parameter_tensor_names, key, tensor=True)
             self._drop_empty(annotation)
 
     def clear_metadata(self, namespace: metadata.Namespace, *, tensor: str | None = None) -> None:
         """Remove every entry of a typed metadata namespace from the graph or the
-        named tensor, as stored (it need not be readable). MetadataError for a
+        named tensor, as stored (it need not be readable). MetadataRefused for a
         tensor the graph does not have. For every tensor's, clear each of
         tensors_with_metadata(namespace)."""
         if tensor is None:
             metadata.clear(self.graph.metadata_props, namespace)
             return
-        annotation = self._tensor_annotation(tensor)
+        annotation = self._tensor_annotation(tensor, namespace.name)
         if annotation is not None:
             metadata.clear(annotation.quant_parameter_tensor_names, namespace)
             self._drop_empty(annotation)
@@ -1027,9 +1052,9 @@ class ModelWrapper:
         states, decoded, by key name in declaration order. For a subgraph body
         (make_subgraph_modelwrapper) and an inheriting namespace, a graph key the
         body does not state is read from the model it is a body of; a tensor's keys
-        are its own. MetadataError for a tensor the graph does not have."""
+        are its own. MetadataRefused for a tensor the graph does not have."""
         if tensor is not None:
-            annotation = self._tensor_annotation(tensor)
+            annotation = self._tensor_annotation(tensor, namespace.name)
             return (
                 {} if annotation is None else metadata.read(annotation.quant_parameter_tensor_names, namespace, tensor=True)
             )
@@ -1059,8 +1084,10 @@ class ModelWrapper:
         extracted into a model of its own) carries them this way."""
         source = (None if self._parent is None else self._parent.value) if parent is None else parent
         if source is None:
-            raise ValueError(
-                "inherit_metadata: this model was not opened as a subgraph body (make_subgraph_modelwrapper); pass parent="
+            raise metadata.MetadataRefused.of(
+                "metadata-invalid",
+                "ModelWrapper.inherit_metadata",
+                "inherit_metadata: this model was not opened as a subgraph body (make_subgraph_modelwrapper); pass parent=",
             )
         for namespace in namespaces:
             if not namespace.inherit:

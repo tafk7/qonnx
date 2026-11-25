@@ -52,7 +52,7 @@ class MergeONNXModels(Transformation):
     If more than one input or output exists, a warning is raised.
     The merged graph keeps both graphs' metadata: on a key both state, the post
     model's value wins, but a typed metadata key (qonnx.core.metadata) the two
-    state differently raises MetadataError."""
+    state differently raises MetadataRefused."""
 
     def __init__(self, pre_model):
         super().__init__()
