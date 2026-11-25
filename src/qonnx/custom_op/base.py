@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Sequence, cast
 import numpy.typing as npt
 from onnx import NodeProto, GraphProto, TensorProto
 
+from qonnx.core.tensor_ranges import one_pass
 from qonnx.util.basic import get_by_name, get_preferred_qonnx_opset
 
 if TYPE_CHECKING:
@@ -327,6 +328,38 @@ class CustomOp(ABC):
         range=value)``; None where it is not known. Outside one, state none. A datatype
         stated alone clears the tensor's range."""
         pass
+
+    def infer_node_facts(self, model: "ModelWrapper") -> None:
+        """Write each output's shape, datatype and range, from the facts the model
+        states for this node's inputs now. For a pass that visits nodes in graph order;
+        qonnx's own passes do not call it.
+
+        It always opts into exact ranges (qonnx.core.tensor_ranges.one_pass) for its
+        own datatype step.
+
+        Default: the shape (and ONNX element type) of each of this node's outputs that
+        make_shape_compatible_op's node produces, by ONNX's inference of that one node
+        (ModelWrapper.state); then infer_node_datatype(model) inside the exact-range
+        signal. An output whose shape ONNX cannot infer fully keeps the shape it had;
+        so does every output when the stand-in is not a standard ONNX op. An input with
+        no stated shape is refused (ValueError, "<node>: <input> has no shape yet"),
+        before anything is written. An op that knows its outputs whole overrides it."""
+        from qonnx.transformation.infer_shapes import _node_output_shapes
+
+        stand_in = NodeProto()
+        stand_in.CopyFrom(self.make_shape_compatible_op(model))
+        if stand_in.domain in ("", "ai.onnx"):
+            # a refusal names this node
+            stand_in.name = self.onnx_node.name or self.onnx_node.op_type
+            for name, (shape, container) in _node_output_shapes(model, stand_in).items():
+                if name not in self.onnx_node.output:
+                    continue
+                if container:
+                    model.state(name, shape=shape, container=container)
+                else:
+                    model.state(name, shape=shape)
+        with one_pass(model):
+            self.infer_node_datatype(model)
 
     @abstractmethod
     def execute_node(self, context: dict[str, npt.NDArray], graph: GraphProto) -> None:

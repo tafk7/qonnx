@@ -27,11 +27,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import onnx.shape_inference as si
-from onnx import NodeProto
+from onnx import NodeProto, TensorProto, TypeProto, defs, helper
 
 from qonnx.core.modelwrapper import ModelWrapper, _custom_op_for
 from qonnx.custom_op.registry import is_custom_op, retired
 from qonnx.transformation.base import Transformation
+from qonnx.util.basic import get_by_name, get_preferred_onnx_opset
 
 
 def _make_shape_compatible_op(node: NodeProto, model: ModelWrapper) -> NodeProto:
@@ -50,6 +51,49 @@ def _make_shape_compatible_op(node: NodeProto, model: ModelWrapper) -> NodeProto
             raise
         # exception if op_type is not supported
         raise Exception("Custom op_type %s is currently not supported." % op_type)
+
+
+def _node_output_shapes(model: ModelWrapper, node: NodeProto) -> dict[str, tuple[list[int], int]]:
+    """The outputs of the standard ONNX node ``node`` whose shapes ONNX's inference of
+    that one node knows fully, each with its shape and element type (0 where ONNX
+    states none). The node's inputs are read from ``model``: an initializer with its
+    value (a Reshape's target shape), any other input from its value info. It is
+    inferred at the version the model imports for the node's domain. ValueError for
+    an input the model states no shape of; empty for a node ONNX has no schema of."""
+    imports = model.get_opset_imports()
+    if node.domain in ("", "ai.onnx"):
+        version = imports.get("", imports.get("ai.onnx", get_preferred_onnx_opset()))
+    else:
+        version = imports.get(node.domain, 1)
+    try:
+        schema = defs.get_schema(node.op_type, version, "" if node.domain == "ai.onnx" else node.domain)
+    except defs.SchemaError:
+        return {}
+    types: dict[str, TypeProto] = {}
+    values: dict[str, TensorProto] = {}
+    for name in node.input:
+        if not name:
+            continue
+        initializer = get_by_name(model.graph.initializer, name)
+        if initializer is not None:
+            values[name] = initializer
+            types[name] = helper.make_tensor_type_proto(initializer.data_type, list(initializer.dims))
+            continue
+        info = model.get_tensor_valueinfo(name)
+        if info is None or not (info.type.HasField("tensor_type") and info.type.tensor_type.HasField("shape")):
+            raise ValueError(f"{node.name or node.op_type}: {name} has no shape yet")
+        types[name] = info.type
+    inferred = si.infer_node_outputs(schema, node, types, values, opset_imports=list(model.model.opset_import))
+    shapes = {}
+    for name in node.output:
+        found = inferred.get(name)
+        if not name or found is None or not found.HasField("tensor_type"):
+            continue
+        tensor = found.tensor_type
+        if not tensor.HasField("shape") or not all(dim.HasField("dim_value") for dim in tensor.shape.dim):
+            continue
+        shapes[name] = ([dim.dim_value for dim in tensor.shape.dim], tensor.elem_type)
+    return shapes
 
 
 def _hide_finn_ops(model):
