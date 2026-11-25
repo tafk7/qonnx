@@ -146,6 +146,26 @@ ModelWrapper contains two helper functions for tensor initializers, one to deter
   # get tensor initializer of third tensor in model tensor list
   model.get_initializer(tensor_list[2])
 
+Typed metadata
+--------------
+A graph's ``metadata_props`` hold string keys and string values (``get_metadata_prop``/``set_metadata_prop``). For facts a tool reads back, :py:mod:`qonnx.core.metadata` declares typed keys in a versioned namespace, and ModelWrapper reads and writes them:
+::
+
+  from qonnx.core.metadata import JSON, Namespace
+
+  BOARD = Namespace("mytool.board", version=1)
+  PERIOD_NS = BOARD.key("period_ns", float, check=lambda v: v > 0, expect="a period > 0")
+  PORTS = BOARD.key("ports", JSON)
+
+  model.set_metadata(PERIOD_NS, 5.0)        # entries mytool.board/period_ns = 5.0 and mytool.board/@version = 1
+  model.get_metadata(PERIOD_NS)             # 5.0, or None when the graph does not state it
+  model.metadata_namespace(BOARD)           # {"period_ns": 5.0}
+  model.delete_metadata(PERIOD_NS)
+
+A key's type is ``str``, ``int``, ``float``, ``bool``, an ``Enum`` subclass (stored by member name) or ``JSON``; each key is one entry ``<namespace>/<key>`` holding the type's canonical text, so the metadata stays readable in ONNX tools. Nothing coerces: a malformed stored value, a value of the wrong type, a stored key the namespace does not declare, or a version the reader cannot upgrade from raises ``MetadataError``. A namespace changed incompatibly raises its version and registers an upgrade from the earlier one (``BOARD.upgrade(1, function)``); readers upgrade what they read, and writers rewrite the namespace at the current version.
+
+Transformations that edit the graph in place keep its metadata. A subgraph body (a graph attribute) holds metadata of its own. A namespace declared with ``inherit=True`` reaches into bodies: a body opened with ``make_subgraph_modelwrapper`` (as ``transform(..., apply_to_subgraphs=True)`` does) reads a key it does not state itself from the model it is a body of. A body read alone has only its own keys, so code that extracts a body to stand alone copies them in first with ``body.inherit_metadata(namespace)`` (or ``inherit_metadata(namespace, parent=model)`` for a model built apart from its parent).
+
 ModelWrapper contains more useful functions, if you are interested please have a look at the ModelWrapper module (:py:mod:`qonnx.core.modelwrapper.ModelWrapper`) directly.
 
 
