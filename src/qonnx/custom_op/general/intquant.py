@@ -231,7 +231,7 @@ class IntQuant(CustomOp):
     def get_integer_datatype(self, model):
         signed = self.get_nodeattr("signed")
         bit_width = model.get_initializer(self.onnx_node.input[3])
-        bit_width = int(bit_width)
+        bit_width = int(np.asarray(bit_width).item())
         if bit_width == 1:
             if signed:
                 finn_dt = DataType["BIPOLAR"]
@@ -246,7 +246,7 @@ class IntQuant(CustomOp):
 
     def get_scaled_integer_datatype(self, model):
         bit_width = model.get_initializer(self.onnx_node.input[3])
-        bit_width = int(bit_width)
+        bit_width = int(np.asarray(bit_width).item())
         finn_dt = DataType["SCALEDINT<%d>" % (bit_width)]
         return finn_dt
 
